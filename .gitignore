@@ -1,0 +1,22 @@
+# Python virtualenv
+.venv/
+
+# Environment variables
+.env
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE/editor configs
+.vscode/
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+
+# Local portfolio snapshot and tastytrade cache
+.portfolio_snapshot.json
+.tastytrade_cache.pkl
