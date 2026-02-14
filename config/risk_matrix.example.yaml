@@ -1,0 +1,56 @@
+regimes:
+  low_volatility:
+    condition: "VIX < 15 and term_structure > 1.10"
+    description: "Complacency. Market grinds up. Cheap hedges available."
+    limits:
+      max_beta_delta: 600
+      max_negative_vega: -500
+      min_daily_theta: 100
+      max_gamma: 50
+      recession_probability_threshold: 0.4
+      allowed_strategies:
+        - "Long Calendars"
+        - "Debit Spreads"
+        - "Reverse Iron Condors"
+
+  neutral_volatility:
+    condition: "15 <= VIX <= 22"
+    description: "Standard operating environment."
+    limits:
+      max_beta_delta: 300
+      max_negative_vega: -1200
+      min_daily_theta: 300
+      max_gamma: 35
+      recession_probability_threshold: 0.4
+      allowed_strategies:
+        - "Iron Condors"
+        - "Strangles"
+        - "Credit Spreads"
+
+  high_volatility:
+    condition: "VIX > 22 or recession_probability > 0.40"
+    description: "Fear. Elevated premiums. Fast moves."
+    limits:
+      max_beta_delta: 100
+      max_negative_vega: -2500
+      min_daily_theta: 600
+      max_gamma: 20
+      recession_probability_threshold: 0.4
+      allowed_strategies:
+        - "Ratio Backspreads"
+        - "Short Strangles (Managed)"
+        - "Jade Lizards"
+
+  crisis_mode:
+    condition: "VIX > 35 or vvix > 150"
+    description: "Panic. Liquidity drying up."
+    limits:
+      max_beta_delta: 0
+      max_negative_vega: 0
+      min_daily_theta: 0
+      max_gamma: 10
+      recession_probability_threshold: 0.4
+      allowed_strategies:
+        - "Long Puts"
+        - "Cash"
+        - "Long Volatility"

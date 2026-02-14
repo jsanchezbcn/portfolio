@@ -1,0 +1,15 @@
+[
+  {
+    "symbol": "AAPL  260320C00180000",
+    "instrument-type": "Equity Option",
+    "quantity": -2,
+    "average-open-price": "5.20",
+    "mark": "5.40",
+    "realized-day-gain": "140",
+    "delta": "0.42",
+    "gamma": "0.02",
+    "theta": "-0.11",
+    "vega": "0.16",
+    "iv": "0.28"
+  }
+]

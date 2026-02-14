@@ -1,0 +1,26 @@
+[
+  {
+    "acctId": "U0000000",
+    "contractDesc": "AAPL",
+    "assetClass": "STK",
+    "position": 100,
+    "avgCost": 175.25,
+    "mktValue": 17950.0,
+    "unrealizedPnl": 425.0,
+    "ticker": "AAPL"
+  },
+  {
+    "acctId": "U0000000",
+    "contractDesc": "AAPL 20MAR26 180 C",
+    "assetClass": "OPT",
+    "position": -2,
+    "avgCost": 5.20,
+    "mktValue": -1080.0,
+    "unrealizedPnl": 140.0,
+    "ticker": "AAPL",
+    "undSym": "AAPL",
+    "strike": 180,
+    "expiry": "2026-03-20",
+    "right": "C"
+  }
+]

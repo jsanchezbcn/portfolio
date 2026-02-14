@@ -1,13 +1,24 @@
 # Python virtualenv
 .venv/
+venv/
 
 # Environment variables
 .env
+.env.*
+!.env.example
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyo
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+*.log
+.pytest_cache/
 
 # IDE/editor configs
 .vscode/
@@ -16,7 +27,22 @@ __pycache__/
 
 # OS files
 .DS_Store
+Thumbs.db
+*.tmp
+*.swp
 
 # Local portfolio snapshot and tastytrade cache
 .portfolio_snapshot.json
 .tastytrade_cache.pkl
+.positions_snapshot_*.json
+.greeks_debug_*.json
+.greeks_debug_*.csv
+.greeks_debug_*.log
+.clientportal.log
+
+# Local tooling / external gateway artifacts
+.agents/
+clientportal/
+clientportal-beta/
+clientportal_backup_old/
+clientportal_latest.gw.zip
