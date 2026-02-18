@@ -139,3 +139,22 @@ class TastytradeAdapter(BrokerAdapter):
             option_type=option_type,
             greeks_source="tastytrade" if instrument_type == InstrumentType.OPTION else "none",
         )
+
+    @staticmethod
+    def to_stream_snapshot_payload(position: UnifiedPosition, account_id: str) -> dict[str, Any]:
+        return {
+            "broker": "tastytrade",
+            "account_id": account_id,
+            "contract_key": position.symbol,
+            "underlying": position.underlying,
+            "expiration": position.expiration.isoformat() if position.expiration else None,
+            "strike": position.strike,
+            "option_type": position.option_type,
+            "quantity": position.quantity,
+            "delta": position.delta,
+            "gamma": position.gamma,
+            "theta": position.theta,
+            "vega": position.vega,
+            "iv": position.iv,
+            "event_time": datetime.utcnow().isoformat(),
+        }

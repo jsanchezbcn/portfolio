@@ -1,0 +1,11 @@
+symbol,underlying,expiration,strike,option_type,quantity,native_delta,native_gamma,native_theta,native_vega,native_source,stream_messages,stream_first_greek_latency_ms,stream_delta,stream_gamma,stream_theta,stream_vega
+MES    MAR2026 6975 C (EX1),MES,2026-03-06,6975.0,call,0.0,0.0,0.0,0.0,0.0,none,0,,,,,
+MES    FEB2026 6830 C (X3B),MES,2026-02-17,6830.0,call,0.0,0.0,0.0,0.0,0.0,none,0,,,,,
+MES    FEB2026 7120 C (EX3),MES,2026-02-20,7120.0,call,1.0,0.0,0.0,0.0,0.0,none,0,,,,,
+MES    FEB2026 6815 C (EX3),MES,2026-02-20,6815.0,call,-1.0,-0.0,-0.0,-0.0,-0.0,none,0,,,,,
+ES     FEB2026 7010 C (EW),ES,2026-02-27,7010.0,call,1.0,0.0,0.0,0.0,0.0,none,0,,,,,
+HPQ    FEB2026 20.50 C [HPQ   260220C00020500 100],HPQ,2026-02-20,20.5,call,-2.0,-0.0,-0.0,-0.0,-0.0,none,0,,,,,
+MES    MAR2026 6900 P,MES,2026-03-20,6900.0,put,1.0,0.0,0.0,0.0,0.0,none,0,,,,,
+ES     MAR2026 6700 P (E1C),ES,2026-03-04,6700.0,put,-1.0,-0.0,-0.0,-0.0,-0.0,none,0,,,,,
+MES    FEB2026 6950 C (EX),MES,2026-02-27,6950.0,call,-2.0,-0.0,-0.0,-0.0,-0.0,none,0,,,,,
+ES     FEB2026 7070 C (EW),ES,2026-02-27,7070.0,call,1.0,0.0,0.0,0.0,0.0,none,0,,,,,

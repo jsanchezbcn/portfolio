@@ -46,6 +46,26 @@ def mock_regime_config(tmp_path: Path) -> Path:
     config_file = tmp_path / "risk_matrix.yaml"
     config_file.write_text(
         """
+vix_scalers:
+  - vix_threshold: 20
+    scale: 0.85
+  - vix_threshold: 25
+    scale: 0.70
+  - vix_threshold: 30
+    scale: 0.50
+  - vix_threshold: 35
+    scale: 0.25
+
+term_structure_scalers:
+  - term_structure_threshold: 1.10
+    scale: 1.10
+  - term_structure_threshold: 1.0
+    scale: 1.0
+  - term_structure_threshold: 0.95
+    scale: 0.80
+  - term_structure_threshold: 0.0
+    scale: 0.60
+
 regimes:
   low_volatility:
     condition: "VIX < 15 and term_structure > 1.10"

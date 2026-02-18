@@ -22,6 +22,12 @@ import sys
 import subprocess
 import time
 import json
+import asyncio
+
+from agent_config import load_streaming_environment
+from core.processor import DataProcessor
+from database.db_manager import DBManager
+from streaming.ibkr_ws import IBKRWebSocketClient
 
 # Disable SSL warnings for localhost
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -37,6 +43,10 @@ JAR_FILE_PATH = "clientportal/dist/ibgroup.web.core.iblink.router.clientportal.g
 # Timeouts
 GATEWAY_START_TIMEOUT = 60  # Increased timeout for proper startup
 AUTH_TIMEOUT = 30
+
+_STREAM_PROCESSOR: DataProcessor | None = None
+_STREAM_CLIENT: IBKRWebSocketClient | None = None
+_STREAM_TASK: asyncio.Task | None = None
 
 
 def check_gateway_status():
@@ -269,16 +279,60 @@ def print_positions(positions):
     print("="*80)
     print(f"{'Symbol':<15} {'Quantity':<15} {'Avg Cost':<15} {'Market Value':<15}")
     print("-"*80)
-    
+
     for position in positions:
         symbol = position.get('contractDesc', position.get('ticker', 'Unknown'))
         quantity = position.get('position', 'N/A')
         avg_cost = position.get('avgCost', position.get('avgPrice', 'N/A'))
         market_value = position.get('mktValue', 'N/A')
-        
+
         print(f"{symbol:<15} {quantity:<15} {avg_cost:<15} {market_value:<15}")
-    
+
     print("="*80)
+
+
+async def start_ibkr_stream_lifecycle(account_id: str, contract_keys: list[str]) -> None:
+    global _STREAM_PROCESSOR
+    global _STREAM_CLIENT
+    global _STREAM_TASK
+
+    if _STREAM_TASK and not _STREAM_TASK.done():
+        return
+
+    config = load_streaming_environment()
+    db_manager = await DBManager.get_instance()
+    db_manager.flush_interval_seconds = config.stream_flush_interval_seconds
+    db_manager.flush_batch_size = config.stream_flush_batch_size
+
+    _STREAM_PROCESSOR = DataProcessor(db_manager)
+    await _STREAM_PROCESSOR.start()
+
+    _STREAM_CLIENT = IBKRWebSocketClient(
+        url=config.ibkr_ws_url,
+        account_id=account_id,
+        processor=_STREAM_PROCESSOR,
+        heartbeat_interval_seconds=config.ibkr_heartbeat_seconds,
+        reconnect_max_backoff_seconds=config.ibkr_reconnect_max_backoff_seconds,
+        verify_tls=False,
+    )
+    _STREAM_TASK = asyncio.create_task(_STREAM_CLIENT.run(contract_keys), name="ibkr-stream-client")
+
+
+async def stop_ibkr_stream_lifecycle() -> None:
+    global _STREAM_PROCESSOR
+    global _STREAM_CLIENT
+    global _STREAM_TASK
+
+    if _STREAM_CLIENT is not None:
+        _STREAM_CLIENT.stop()
+    if _STREAM_TASK is not None:
+        _STREAM_TASK.cancel()
+        await asyncio.gather(_STREAM_TASK, return_exceptions=True)
+        _STREAM_TASK = None
+    if _STREAM_PROCESSOR is not None:
+        await _STREAM_PROCESSOR.stop()
+        _STREAM_PROCESSOR = None
+    _STREAM_CLIENT = None
 
 
 def main():

@@ -1,0 +1,4 @@
+symbol,underlying,expiration,strike,option_type,quantity,native_delta,native_gamma,native_theta,native_vega,native_source,stream_messages,stream_first_greek_latency_ms,stream_delta,stream_gamma,stream_theta,stream_vega
+ES     FEB2026 6885 P (E3C),ES,2026-02-18,6885.0,put,-1.0,-0.0,-0.0,-0.0,-0.0,none,0,,,,,
+MES    MAR2026 7100 C (EX1),MES,2026-03-06,7100.0,call,-1.0,-0.0,-0.0,-0.0,-0.0,none,0,,,,,
+MES    APR2026 7450 C (EX3),MES,2026-04-17,7450.0,call,-1.0,-0.0,-0.0,-0.0,-0.0,none,0,,,,,

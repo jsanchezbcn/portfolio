@@ -44,15 +44,15 @@ try:
 except Exception:
     TASTYWORKS_AVAILABLE = False
 
-# Tastytrade SDK integration
+# Tastytrade integration
 try:
     from tastytrade import Session, OAuthSession
     from tastytrade.instruments import get_option_chain, NestedFutureOptionChain
     from tastytrade.dxfeed import Quote, Greeks
     from tastytrade import DXLinkStreamer
-    TASTYTRADE_SDK_AVAILABLE = True
+    TASTYTRADE_AVAILABLE = True
 except ImportError:
-    TASTYTRADE_SDK_AVAILABLE = False
+    TASTYTRADE_AVAILABLE = False
 
 
 @dataclass
@@ -83,7 +83,7 @@ class CacheEntry:
     """Cache entry for options data."""
     data: Dict[str, OptionData]  # key: option_key, value: OptionData
     timestamp: datetime
-    expiry_minutes: int = 5
+    expiry_minutes: int = 1
     
     def is_valid(self) -> bool:
         """Check if cache entry is still valid."""
@@ -128,7 +128,7 @@ class BetaConfig:
 class TastytradeOptionsCache:
     """Cache manager for Tastytrade options data."""
     
-    def __init__(self, cache_file: str = '.tastytrade_cache.pkl', default_expiry_minutes: int = 5):
+    def __init__(self, cache_file: str = '.tastytrade_cache.pkl', default_expiry_minutes: int = 1):
         self.cache_file = cache_file
         self.default_expiry_minutes = default_expiry_minutes
         self.cache: Dict[str, CacheEntry] = {}
@@ -348,7 +348,9 @@ class TastytradeOptionsCache:
         by a simulated prefetch.
         """
         self._cleanup_expired()
-        option_key = self._make_option_key(underlying, expiry, strike, option_type)
+        # Normalize the underlying before lookup so '/MES' and 'MES' resolve to the same key.
+        norm_underlying = self._normalize_underlying_key(underlying)
+        option_key = self._make_option_key(norm_underlying, expiry, strike, option_type)
         for entry in self.cache.values():
             if option_key in entry.data:
                 return entry.data[option_key]
@@ -423,27 +425,28 @@ class TastytradeOptionsCache:
         try:
             # Prefer futures check if symbol is a known futures root
             is_future = underlying.startswith('/') or underlying.upper() in self.futures_roots
-            
+
             if is_future:
                 tasty_sym = underlying if underlying.startswith('/') else self._to_tasty_underlying(underlying)
-                nested_chain = NestedFutureOptionChain.get(session, tasty_sym)
-                return bool(nested_chain and nested_chain.option_chains and 
+                # Use asyncio.to_thread for blocking HTTP calls to avoid freezing the event loop
+                nested_chain = await asyncio.to_thread(NestedFutureOptionChain.get, session, tasty_sym)
+                return bool(nested_chain and nested_chain.option_chains and
                            len(nested_chain.option_chains) > 0 and
                            len(nested_chain.option_chains[0].expirations) > 0)
             else:
-                chain = get_option_chain(session, underlying)
+                chain = await asyncio.to_thread(get_option_chain, session, underlying)
                 if chain and len(chain) > 0:
                     return True
                 # If equity failed but this is a known futures root, try futures path
                 u = underlying.upper()
                 if u in self.futures_roots:
                     tasty_sym = self._to_tasty_underlying(underlying)
-                    nested_chain = NestedFutureOptionChain.get(session, tasty_sym)
-                    return bool(nested_chain and nested_chain.option_chains and 
+                    nested_chain = await asyncio.to_thread(NestedFutureOptionChain.get, session, tasty_sym)
+                    return bool(nested_chain and nested_chain.option_chains and
                                 len(nested_chain.option_chains) > 0 and
                                 len(nested_chain.option_chains[0].expirations) > 0)
                 return False
-                
+
         except Exception as e:
             if retry_auth and ("unauthorized" in str(e).lower() or "401" in str(e)):
                 # Session token can expire mid-run; refresh once and retry.
@@ -493,10 +496,11 @@ class TastytradeOptionsCache:
         try:
             if is_future:
                 tasty_sym = underlying if underlying.startswith('/') else self._to_tasty_underlying(underlying)
-                nested_chain = NestedFutureOptionChain.get(session, tasty_sym)
+                # Use asyncio.to_thread for blocking HTTP call to avoid freezing the event loop
+                nested_chain = await asyncio.to_thread(NestedFutureOptionChain.get, session, tasty_sym)
                 if not nested_chain or not nested_chain.option_chains:
                     return {}
-                
+
                 chain_data = nested_chain.option_chains[0]
                 if not chain_data.expirations:
                     return {}
@@ -511,13 +515,14 @@ class TastytradeOptionsCache:
                         print(f"Futures chain loaded for {tasty_sym}: 0 expirations")
                 except Exception:
                     pass
-                
+
                 # Convert to a format similar to equity options
                 chain = {}
                 for exp in chain_data.expirations:
                     chain[exp.expiration_date] = exp.strikes
             else:
-                chain = get_option_chain(session, underlying)
+                # Use asyncio.to_thread for blocking HTTP call to avoid freezing the event loop
+                chain = await asyncio.to_thread(get_option_chain, session, underlying)
             
             if not chain:
                 return {}
@@ -750,7 +755,7 @@ class TastytradeOptionsCache:
                 return cache_entry.data[option_key]
 
         # Need to fetch fresh data
-        if not TASTYTRADE_SDK_AVAILABLE:
+        if not TASTYTRADE_AVAILABLE:
             return None
 
         session = self._get_session()
@@ -844,6 +849,8 @@ class TastytradeOptionsCache:
 # Control whether external data sources (tastyworks / Yahoo) are allowed.
 # Default: False -> only use IBKR/local placeholders.
 USE_EXTERNAL = False
+STREAM_DB_MANAGER = None
+STREAM_PROCESSOR = None
 
 
 def load_dotenv(env_file: str = '.env') -> None:
@@ -860,8 +867,39 @@ def load_dotenv(env_file: str = '.env') -> None:
                 value = value.strip().strip('"\'')
                 os.environ[key] = value
 
+
+async def initialize_streaming_runtime() -> tuple[Any, Any]:
+    """Initialize async DB manager and stream processor used by realtime ingestion."""
+
+    global STREAM_DB_MANAGER
+    global STREAM_PROCESSOR
+
+    if STREAM_DB_MANAGER is not None and STREAM_PROCESSOR is not None:
+        return STREAM_DB_MANAGER, STREAM_PROCESSOR
+
+    from agent_config import load_streaming_environment
+    from core.processor import DataProcessor
+    from database.db_manager import DBManager
+
+    config = load_streaming_environment()
+    os.environ.setdefault("DB_HOST", config.db_host)
+    os.environ.setdefault("DB_PORT", str(config.db_port))
+    os.environ.setdefault("DB_NAME", config.db_name)
+    os.environ.setdefault("DB_USER", config.db_user)
+    os.environ.setdefault("DB_PASS", config.db_pass)
+    os.environ.setdefault("DB_POOL_MIN", str(config.db_pool_min))
+    os.environ.setdefault("DB_POOL_MAX", str(config.db_pool_max))
+    os.environ.setdefault("DB_COMMAND_TIMEOUT", str(config.db_command_timeout))
+
+    STREAM_DB_MANAGER = await DBManager.get_instance()
+    STREAM_DB_MANAGER.flush_interval_seconds = config.stream_flush_interval_seconds
+    STREAM_DB_MANAGER.flush_batch_size = config.stream_flush_batch_size
+    STREAM_PROCESSOR = DataProcessor(STREAM_DB_MANAGER)
+    await STREAM_PROCESSOR.start()
+    return STREAM_DB_MANAGER, STREAM_PROCESSOR
+
 class IBKRClient:
-    def __init__(self, base_url: str = "https://localhost:5001", cache_expiry_minutes: int = 5):
+    def __init__(self, base_url: str = "https://localhost:5001", cache_expiry_minutes: int = 1):
         self.base_url = base_url
         self.session = requests.Session()
         # Disable SSL verification for localhost
@@ -1715,7 +1753,7 @@ class IBKRClient:
 
         # Fetch Tastytrade Greeks for all option positions concurrently
         option_greeks_data = {}
-        if option_positions and TASTYTRADE_SDK_AVAILABLE:
+        if option_positions and TASTYTRADE_AVAILABLE:
             # Apply skip rules: expired options or zero market value to reduce noise
             filtered_positions = []
             skipped_count = 0
@@ -2094,10 +2132,13 @@ async def main_async():
     """Main async script execution with Tastytrade integration."""
     # Load environment variables
     load_dotenv()
+
+    if str(os.getenv("STREAMING_INGESTION_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+        await initialize_streaming_runtime()
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--skip-greeks', action='store_true', help='Skip Greeks lookup to speed up output')
-    parser.add_argument('--cache-minutes', type=int, default=5, help='Cache expiry time in minutes (default: 5)')
+    parser.add_argument('--cache-minutes', type=int, default=1, help='Cache expiry time in minutes (default: 1)')
     parser.add_argument('--enable-external', action='store_true', help='Enable external data sources (tastyworks / Yahoo). Disabled by default for IBKR-only operation')
     parser.add_argument('--force-refresh', action='store_true', help='Force refresh of options cache for symbols in this run')
     parser.add_argument('--dry-run', action='store_true', help='Dry-run: simulate prefetch and use cached values without external API calls')
@@ -2254,6 +2295,9 @@ async def main_async():
     # Print comprehensive SPX-weighted delta summary
     if account_summaries:
         client.print_portfolio_spx_summary(account_summaries)
+
+    if STREAM_PROCESSOR is not None:
+        await STREAM_PROCESSOR.stop()
 
 
 def main():
