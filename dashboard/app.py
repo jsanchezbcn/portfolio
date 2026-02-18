@@ -276,46 +276,49 @@ def main() -> None:
             else:
                 positions = []
                 data_refresh["positions"] = _safe_iso_now()
+            # Fetch Greeks only when positions are actually refreshed (not on every render)
+            if positions and not ibkr_only_mode:
+                positions = asyncio.run(adapter.fetch_greeks(positions))
+                data_refresh["greeks"] = _safe_iso_now()
+
+                options_count = sum(1 for position in positions if position.instrument_type.name == "OPTION")
+                greeks_status = getattr(adapter, "last_greeks_status", {})
+                cache_miss_count = int(greeks_status.get("cache_miss_count", 0))
+                miss_ratio = (cache_miss_count / options_count) if options_count else 0.0
+
+                previous_positions_list = previous_positions_for_account if isinstance(previous_positions_for_account, list) else []
+                can_reuse_previous = (
+                    refresh
+                    and previous_account == account_id
+                    and use_cached_fallback
+                    and bool(previous_positions_list)
+                )
+
+                if can_reuse_previous and options_count > 0 and miss_ratio >= 0.8:
+                    previous_option_positions = [
+                        p for p in previous_positions_list if p.instrument_type.name == "OPTION"
+                    ]
+                    previous_has_nonzero_greeks = any(
+                        abs(float(getattr(p, "theta", 0.0))) > 0.0
+                        or abs(float(getattr(p, "vega", 0.0))) > 0.0
+                        or abs(float(getattr(p, "gamma", 0.0))) > 0.0
+                        for p in previous_option_positions
+                    )
+                    if previous_has_nonzero_greeks:
+                        positions = previous_positions_list
+                        st.session_state["greeks_refresh_fallback"] = True
+                        st.session_state["greeks_refresh_fallback_reason"] = (
+                            f"Latest refresh had {cache_miss_count}/{options_count} missing option Greeks; "
+                            "reusing previous in-session snapshot."
+                        )
+
             positions = st.session_state["positions"] = positions
             st.session_state["selected_account"] = account_id
             st.session_state["fallback_saved_at"] = fallback_saved_at
         else:
             fallback_saved_at = st.session_state.get("fallback_saved_at")
-
-        if positions and not ibkr_only_mode:
-            positions = asyncio.run(adapter.fetch_greeks(positions))
-            data_refresh["greeks"] = _safe_iso_now()
-
-            options_count = sum(1 for position in positions if position.instrument_type.name == "OPTION")
-            greeks_status = getattr(adapter, "last_greeks_status", {})
-            cache_miss_count = int(greeks_status.get("cache_miss_count", 0))
-            miss_ratio = (cache_miss_count / options_count) if options_count else 0.0
-
-            previous_positions_list = previous_positions_for_account if isinstance(previous_positions_for_account, list) else []
-            can_reuse_previous = (
-                refresh
-                and previous_account == account_id
-                and use_cached_fallback
-                and bool(previous_positions_list)
-            )
-
-            if can_reuse_previous and options_count > 0 and miss_ratio >= 0.8:
-                previous_option_positions = [
-                    p for p in previous_positions_list if p.instrument_type.name == "OPTION"
-                ]
-                previous_has_nonzero_greeks = any(
-                    abs(float(getattr(p, "theta", 0.0))) > 0.0
-                    or abs(float(getattr(p, "vega", 0.0))) > 0.0
-                    or abs(float(getattr(p, "gamma", 0.0))) > 0.0
-                    for p in previous_option_positions
-                )
-                if previous_has_nonzero_greeks:
-                    positions = previous_positions_list
-                    st.session_state["greeks_refresh_fallback"] = True
-                    st.session_state["greeks_refresh_fallback_reason"] = (
-                        f"Latest refresh had {cache_miss_count}/{options_count} missing option Greeks; "
-                        "reusing previous in-session snapshot."
-                    )
+            # Use already-loaded positions (with Greeks) from session state
+            positions = st.session_state.get("positions") or positions
 
         if positions:
             save_positions_snapshot(account_id, positions)
@@ -355,6 +358,79 @@ def main() -> None:
     )
 
     render_regime_banner(regime.name, vix_data, macro_data)
+
+    # Issue 15: Dedicated Risk Status panel — traffic-light for every guardrail
+    with st.container():
+        st.subheader("Risk Status")
+        rs_cols = st.columns(4)
+
+        # Column 0: Greek limit compliance
+        with rs_cols[0]:
+            st.caption("Greek Limits")
+            if violations:
+                st.error(f"⛔ {len(violations)} violation(s)")
+            else:
+                st.success("✓ All limits OK")
+
+        # Column 1: DTE expiry risk
+        with rs_cols[1]:
+            st.caption("DTE Expiry Risk")
+            if positions:
+                _dte_alerts = portfolio_tools.check_dte_expiry_risk(positions)
+                _crit_dte = [a for a in _dte_alerts if a["level"] == "CRITICAL"]
+                _warn_dte = [a for a in _dte_alerts if a["level"] == "WARNING"]
+                if _crit_dte:
+                    st.error(f"⛔ {len(_crit_dte)} expiry critical")
+                elif _warn_dte:
+                    st.warning(f"⚠ {len(_warn_dte)} expiry warning(s)")
+                else:
+                    st.success("✓ No DTE risk")
+            else:
+                st.info("No positions")
+
+        # Column 2: Vega concentration
+        with rs_cols[2]:
+            st.caption("Concentration")
+            if positions:
+                _conc = portfolio_tools.check_concentration_risk(positions, regime)
+                if _conc:
+                    st.warning(f"⚠ {len(_conc)} concentration issue(s)")
+                else:
+                    st.success("✓ Concentration OK")
+            else:
+                st.info("No positions")
+
+        # Column 3: Daily drawdown (requires set_start_of_day_net_liq to be called)
+        with rs_cols[3]:
+            st.caption("Daily Drawdown")
+            _current_nl: float | None = None
+            if ibkr_summary:
+                def _to_float_safe(value: object) -> float | None:
+                    try:
+                        if isinstance(value, dict):
+                            a = value.get("amount")
+                            return float(a) if a not in (None, "", "N/A") else None
+                        return float(str(value).replace(",", "")) if value not in (None, "", "N/A") else None
+                    except (TypeError, ValueError):
+                        return None
+                _current_nl = _to_float_safe(ibkr_summary.get("netliquidation"))
+            if _current_nl is not None:
+                _dd = portfolio_tools.check_daily_drawdown(_current_nl)
+                if _dd:
+                    st.error(f"⛔ {_dd['loss_pct']:.1%} drawdown")
+                else:
+                    st.success("✓ Drawdown OK")
+            else:
+                st.info("Net liq N/A")
+
+        # Show violation details when any exist
+        if violations:
+            with st.expander("Active Risk Violations", expanded=True):
+                for _v in violations:
+                    st.write(
+                        f"• **{_v.get('metric', '?')}**: {_v.get('message', '')} "
+                        f"(current: `{_v.get('current', '?')}`, limit: `{_v.get('limit', '?')}`)"
+                    )
 
     with st.sidebar.expander("Data Freshness", expanded=False):
         data_refresh = st.session_state.get("data_refresh_timestamps", {})

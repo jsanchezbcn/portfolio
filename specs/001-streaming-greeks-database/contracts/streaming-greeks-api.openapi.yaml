@@ -1,0 +1,235 @@
+openapi: 3.0.3
+info:
+  title: Streaming Greeks Control & Query API
+  version: 0.1.0
+  description: |
+    Operational contract for controlling stream ingestion and querying persisted Greek snapshots.
+servers:
+  - url: http://localhost:8000
+paths:
+  /v1/streaming/start:
+    post:
+      summary: Start broker stream ingestion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [brokers]
+              properties:
+                brokers:
+                  type: array
+                  items:
+                    type: string
+                    enum: [ibkr, tastytrade]
+                accountIds:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "202":
+          description: Streaming startup accepted
+  /v1/streaming/stop:
+    post:
+      summary: Stop broker stream ingestion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [brokers]
+              properties:
+                brokers:
+                  type: array
+                  items:
+                    type: string
+                    enum: [ibkr, tastytrade]
+      responses:
+        "202":
+          description: Streaming stop accepted
+  /v1/streaming/status:
+    get:
+      summary: Get runtime stream session status
+      responses:
+        "200":
+          description: Current stream status per broker
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/StreamSession"
+  /v1/greeks/snapshots:
+    get:
+      summary: Query persisted greek snapshots
+      parameters:
+        - in: query
+          name: broker
+          schema:
+            type: string
+            enum: [ibkr, tastytrade]
+        - in: query
+          name: accountId
+          schema:
+            type: string
+        - in: query
+          name: contractKey
+          schema:
+            type: string
+        - in: query
+          name: from
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: to
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 10000
+            default: 1000
+      responses:
+        "200":
+          description: Snapshot records
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/GreekSnapshot"
+  /v1/trades:
+    post:
+      summary: Record a trade/strategy log entry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TradeCreate"
+      responses:
+        "201":
+          description: Trade log recorded
+components:
+  schemas:
+    StreamSession:
+      type: object
+      required: [broker, status, reconnectAttempt, subscriptionCount]
+      properties:
+        broker:
+          type: string
+          enum: [ibkr, tastytrade]
+        status:
+          type: string
+          enum: [connecting, connected, degraded, disconnected]
+        lastHeartbeatAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastMessageAt:
+          type: string
+          format: date-time
+          nullable: true
+        reconnectAttempt:
+          type: integer
+        subscriptionCount:
+          type: integer
+        lastError:
+          type: string
+          nullable: true
+    GreekSnapshot:
+      type: object
+      required: [eventTime, broker, accountId, underlying, contractKey]
+      properties:
+        eventTime:
+          type: string
+          format: date-time
+        receivedAt:
+          type: string
+          format: date-time
+        persistedAt:
+          type: string
+          format: date-time
+        broker:
+          type: string
+          enum: [ibkr, tastytrade]
+        accountId:
+          type: string
+        underlying:
+          type: string
+        contractKey:
+          type: string
+        expiration:
+          type: string
+          format: date
+          nullable: true
+        strike:
+          type: number
+          nullable: true
+        optionType:
+          type: string
+          enum: [call, put]
+          nullable: true
+        quantity:
+          type: number
+          nullable: true
+        delta:
+          type: number
+          nullable: true
+        gamma:
+          type: number
+          nullable: true
+        theta:
+          type: number
+          nullable: true
+        vega:
+          type: number
+          nullable: true
+        rho:
+          type: number
+          nullable: true
+        impliedVolatility:
+          type: number
+          nullable: true
+        underlyingPrice:
+          type: number
+          nullable: true
+    TradeCreate:
+      type: object
+      required: [broker, accountId, symbol, action, quantity]
+      properties:
+        broker:
+          type: string
+          enum: [ibkr, tastytrade]
+        accountId:
+          type: string
+        symbol:
+          type: string
+        contractKey:
+          type: string
+          nullable: true
+        action:
+          type: string
+        quantity:
+          type: number
+        price:
+          type: number
+          nullable: true
+        strategyTag:
+          type: string
+          nullable: true
+        metadata:
+          type: object
+          additionalProperties: true

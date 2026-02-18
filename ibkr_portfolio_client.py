@@ -44,15 +44,15 @@ try:
 except Exception:
     TASTYWORKS_AVAILABLE = False
 
-# Tastytrade SDK integration
+# Tastytrade integration
 try:
     from tastytrade import Session, OAuthSession
     from tastytrade.instruments import get_option_chain, NestedFutureOptionChain
     from tastytrade.dxfeed import Quote, Greeks
     from tastytrade import DXLinkStreamer
-    TASTYTRADE_SDK_AVAILABLE = True
+    TASTYTRADE_AVAILABLE = True
 except ImportError:
-    TASTYTRADE_SDK_AVAILABLE = False
+    TASTYTRADE_AVAILABLE = False
 
 
 @dataclass
@@ -750,7 +750,7 @@ class TastytradeOptionsCache:
                 return cache_entry.data[option_key]
 
         # Need to fetch fresh data
-        if not TASTYTRADE_SDK_AVAILABLE:
+        if not TASTYTRADE_AVAILABLE:
             return None
 
         session = self._get_session()
@@ -844,6 +844,8 @@ class TastytradeOptionsCache:
 # Control whether external data sources (tastyworks / Yahoo) are allowed.
 # Default: False -> only use IBKR/local placeholders.
 USE_EXTERNAL = False
+STREAM_DB_MANAGER = None
+STREAM_PROCESSOR = None
 
 
 def load_dotenv(env_file: str = '.env') -> None:
@@ -859,6 +861,37 @@ def load_dotenv(env_file: str = '.env') -> None:
                 key = key.strip()
                 value = value.strip().strip('"\'')
                 os.environ[key] = value
+
+
+async def initialize_streaming_runtime() -> tuple[Any, Any]:
+    """Initialize async DB manager and stream processor used by realtime ingestion."""
+
+    global STREAM_DB_MANAGER
+    global STREAM_PROCESSOR
+
+    if STREAM_DB_MANAGER is not None and STREAM_PROCESSOR is not None:
+        return STREAM_DB_MANAGER, STREAM_PROCESSOR
+
+    from agent_config import load_streaming_environment
+    from core.processor import DataProcessor
+    from database.db_manager import DBManager
+
+    config = load_streaming_environment()
+    os.environ.setdefault("DB_HOST", config.db_host)
+    os.environ.setdefault("DB_PORT", str(config.db_port))
+    os.environ.setdefault("DB_NAME", config.db_name)
+    os.environ.setdefault("DB_USER", config.db_user)
+    os.environ.setdefault("DB_PASS", config.db_pass)
+    os.environ.setdefault("DB_POOL_MIN", str(config.db_pool_min))
+    os.environ.setdefault("DB_POOL_MAX", str(config.db_pool_max))
+    os.environ.setdefault("DB_COMMAND_TIMEOUT", str(config.db_command_timeout))
+
+    STREAM_DB_MANAGER = await DBManager.get_instance()
+    STREAM_DB_MANAGER.flush_interval_seconds = config.stream_flush_interval_seconds
+    STREAM_DB_MANAGER.flush_batch_size = config.stream_flush_batch_size
+    STREAM_PROCESSOR = DataProcessor(STREAM_DB_MANAGER)
+    await STREAM_PROCESSOR.start()
+    return STREAM_DB_MANAGER, STREAM_PROCESSOR
 
 class IBKRClient:
     def __init__(self, base_url: str = "https://localhost:5001", cache_expiry_minutes: int = 5):
@@ -1715,7 +1748,7 @@ class IBKRClient:
 
         # Fetch Tastytrade Greeks for all option positions concurrently
         option_greeks_data = {}
-        if option_positions and TASTYTRADE_SDK_AVAILABLE:
+        if option_positions and TASTYTRADE_AVAILABLE:
             # Apply skip rules: expired options or zero market value to reduce noise
             filtered_positions = []
             skipped_count = 0
@@ -2094,6 +2127,9 @@ async def main_async():
     """Main async script execution with Tastytrade integration."""
     # Load environment variables
     load_dotenv()
+
+    if str(os.getenv("STREAMING_INGESTION_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+        await initialize_streaming_runtime()
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--skip-greeks', action='store_true', help='Skip Greeks lookup to speed up output')
@@ -2254,6 +2290,9 @@ async def main_async():
     # Print comprehensive SPX-weighted delta summary
     if account_summaries:
         client.print_portfolio_spx_summary(account_summaries)
+
+    if STREAM_PROCESSOR is not None:
+        await STREAM_PROCESSOR.stop()
 
 
 def main():

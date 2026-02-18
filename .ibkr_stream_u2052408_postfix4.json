@@ -1,0 +1,463 @@
+{
+  "account": "U2052408",
+  "ibkr_ws_url": "wss://localhost:5001/v1/api/ws",
+  "requested_ws_url": "wss://localhost:5001/v1/api/ws",
+  "positions_total": 132,
+  "options_total": 10,
+  "subscribed_contracts": 10,
+  "timings_ms": {
+    "fetch_positions": 2325.14,
+    "connect_ws": 39.37,
+    "first_stream_message": 326.21
+  },
+  "connect_error": null,
+  "stream_messages": {
+    "raw_message_count": 4,
+    "unknown_contract_messages": 4,
+    "unknown_contract_keys": {},
+    "message_type_counts": {
+      "<none>": 4
+    },
+    "sample_payloads": [
+      {
+        "topic": "system",
+        "success": "jose2211",
+        "isFT": false,
+        "isPaper": false
+      },
+      {
+        "topic": "act",
+        "args": {
+          "accounts": [
+            "All",
+            "U19664833",
+            "U2052408"
+          ],
+          "acctProps": {
+            "All": {
+              "hasChildAccounts": false,
+              "supportsCashQty": false,
+              "supportsFractions": false
+            },
+            "U2052408": {
+              "hasChildAccounts": false,
+              "supportsCashQty": true,
+              "liteUnderPro": false,
+              "noFXConv": false,
+              "isProp": false,
+              "supportsFractions": true,
+              "allowCustomerTime": false,
+              "autoFx": false
+            },
+            "U19664833": {
+              "hasChildAccounts": false,
+              "supportsCashQty": true,
+              "liteUnderPro": false,
+              "noFXConv": false,
+              "isProp": false,
+              "supportsFractions": true,
+              "allowCustomerTime": false,
+              "autoFx": false
+            }
+          },
+          "aliases": {
+            "All": "All",
+            "U2052408": "U2052408",
+            "U19664833": "IRA post Tax"
+          },
+          "allowFeatures": {
+            "showGFIS": true,
+            "showEUCostReport": false,
+            "allowEventContract": true,
+            "allowFXConv": true,
+            "allowFinancialLens": false,
+            "allowMTA": false,
+            "allowTypeAhead": true,
+            "allowEventTrading": true,
+            "snapshotRefreshTimeout": 30,
+            "liteUser": true,
+            "showWebNews": true,
+            "research": true,
+            "debugPnl": true,
+            "showTaxOpt": true,
+            "showImpactDashboard": true,
+            "allowDynAccount": false,
+            "allowCrypto": true,
+            "allowFA": false,
+            "allowLiteUnderPro": false,
+            "allowedAssetTypes": "STK,CFD,OPT,FOP,WAR,FUT,BAG,PDC,CASH,IND,BOND,BILL,FUND,SLB,News,CMDTY,IOPT,ICU,ICS,PHYSS,CRYPTO",
+            "restrictTradeSubscription": false,
+            "showUkUserLabels": false,
+            "sideBySide": true
+          },
+          "chartPeriods": {
+            "STK": [
+              "*"
+            ],
+            "CFD": [
+              "*"
+            ],
+            "OPT": [
+              "2h",
+              "1d",
+              "2d",
+              "1w",
+              "1m"
+            ],
+            "FOP": [
+              "2h",
+              "1d",
+              "2d",
+              "1w",
+              "1m"
+            ],
+            "WAR": [
+              "*"
+            ],
+            "IOPT": [
+              "*"
+            ],
+            "FUT": [
+              "*"
+            ],
+            "CASH": [
+              "*"
+            ],
+            "IND": [
+              "*"
+            ],
+            "BOND": [
+              "*"
+            ],
+            "FUND": [
+              "*"
+            ],
+            "CMDTY": [
+              "*"
+            ],
+            "PHYSS": [
+              "*"
+            ],
+            "CRYPTO": [
+              "*"
+            ]
+          },
+          "groups": [
+            "All"
+          ],
+          "profiles": [],
+          "selectedAccount": "U19664833",
+          "serverInfo": {
+            "serverName": "JisfN5018",
+            "serverVersion": "Build 10.43.1a, Jan 27, 2026 5:03:20 PM"
+          },
+          "sessionId": "6993f951.0000008b",
+          "isFT": false,
+          "isPaper": false
+        }
+      },
+      {
+        "topic": "sts",
+        "args": {
+          "connected": true,
+          "authenticated": true,
+          "competing": false,
+          "message": "",
+          "fail": "",
+          "serverName": "JisfN5018",
+          "serverVersion": "Build 10.43.1a, Jan 27, 2026 5:03:20 PM",
+          "username": "jose2211"
+        }
+      },
+      {
+        "topic": "system",
+        "hb": 1771376744431
+      }
+    ]
+  },
+  "coverage": {
+    "delta": 0,
+    "gamma": 0,
+    "theta": 0,
+    "vega": 0
+  },
+  "first_greek_latency_ms": {
+    "count": 0,
+    "p50": null,
+    "max": null
+  },
+  "contract_stream_data": {
+    "MES    MAR2026 6975 C (EX1)": {
+      "messages": 0,
+      "first_greek_latency_ms": null,
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "MES    FEB2026 6830 C (X3B)": {
+      "messages": 0,
+      "first_greek_latency_ms": null,
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "MES    FEB2026 7120 C (EX3)": {
+      "messages": 0,
+      "first_greek_latency_ms": null,
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "MES    FEB2026 6815 C (EX3)": {
+      "messages": 0,
+      "first_greek_latency_ms": null,
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "ES     FEB2026 7010 C (EW)": {
+      "messages": 0,
+      "first_greek_latency_ms": null,
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "HPQ    FEB2026 20.50 C [HPQ   260220C00020500 100]": {
+      "messages": 0,
+      "first_greek_latency_ms": null,
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "MES    MAR2026 6900 P": {
+      "messages": 0,
+      "first_greek_latency_ms": null,
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "ES     MAR2026 6700 P (E1C)": {
+      "messages": 0,
+      "first_greek_latency_ms": null,
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "MES    FEB2026 6950 C (EX)": {
+      "messages": 0,
+      "first_greek_latency_ms": null,
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "ES     FEB2026 7070 C (EW)": {
+      "messages": 0,
+      "first_greek_latency_ms": null,
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    }
+  },
+  "positions": [
+    {
+      "symbol": "MES    MAR2026 6975 C (EX1)",
+      "underlying": "MES",
+      "expiration": "2026-03-06",
+      "strike": 6975.0,
+      "option_type": "call",
+      "quantity": 0.0,
+      "native_delta": 0.0,
+      "native_gamma": 0.0,
+      "native_theta": 0.0,
+      "native_vega": 0.0,
+      "native_source": "none",
+      "stream_messages": 0,
+      "stream_first_greek_latency_ms": null,
+      "stream_delta": null,
+      "stream_gamma": null,
+      "stream_theta": null,
+      "stream_vega": null
+    },
+    {
+      "symbol": "MES    FEB2026 6830 C (X3B)",
+      "underlying": "MES",
+      "expiration": "2026-02-17",
+      "strike": 6830.0,
+      "option_type": "call",
+      "quantity": 0.0,
+      "native_delta": 0.0,
+      "native_gamma": 0.0,
+      "native_theta": 0.0,
+      "native_vega": 0.0,
+      "native_source": "none",
+      "stream_messages": 0,
+      "stream_first_greek_latency_ms": null,
+      "stream_delta": null,
+      "stream_gamma": null,
+      "stream_theta": null,
+      "stream_vega": null
+    },
+    {
+      "symbol": "MES    FEB2026 7120 C (EX3)",
+      "underlying": "MES",
+      "expiration": "2026-02-20",
+      "strike": 7120.0,
+      "option_type": "call",
+      "quantity": 1.0,
+      "native_delta": 0.0,
+      "native_gamma": 0.0,
+      "native_theta": 0.0,
+      "native_vega": 0.0,
+      "native_source": "none",
+      "stream_messages": 0,
+      "stream_first_greek_latency_ms": null,
+      "stream_delta": null,
+      "stream_gamma": null,
+      "stream_theta": null,
+      "stream_vega": null
+    },
+    {
+      "symbol": "MES    FEB2026 6815 C (EX3)",
+      "underlying": "MES",
+      "expiration": "2026-02-20",
+      "strike": 6815.0,
+      "option_type": "call",
+      "quantity": -1.0,
+      "native_delta": -0.0,
+      "native_gamma": -0.0,
+      "native_theta": -0.0,
+      "native_vega": -0.0,
+      "native_source": "none",
+      "stream_messages": 0,
+      "stream_first_greek_latency_ms": null,
+      "stream_delta": null,
+      "stream_gamma": null,
+      "stream_theta": null,
+      "stream_vega": null
+    },
+    {
+      "symbol": "ES     FEB2026 7010 C (EW)",
+      "underlying": "ES",
+      "expiration": "2026-02-27",
+      "strike": 7010.0,
+      "option_type": "call",
+      "quantity": 1.0,
+      "native_delta": 0.0,
+      "native_gamma": 0.0,
+      "native_theta": 0.0,
+      "native_vega": 0.0,
+      "native_source": "none",
+      "stream_messages": 0,
+      "stream_first_greek_latency_ms": null,
+      "stream_delta": null,
+      "stream_gamma": null,
+      "stream_theta": null,
+      "stream_vega": null
+    },
+    {
+      "symbol": "HPQ    FEB2026 20.50 C [HPQ   260220C00020500 100]",
+      "underlying": "HPQ",
+      "expiration": "2026-02-20",
+      "strike": 20.5,
+      "option_type": "call",
+      "quantity": -2.0,
+      "native_delta": -0.0,
+      "native_gamma": -0.0,
+      "native_theta": -0.0,
+      "native_vega": -0.0,
+      "native_source": "none",
+      "stream_messages": 0,
+      "stream_first_greek_latency_ms": null,
+      "stream_delta": null,
+      "stream_gamma": null,
+      "stream_theta": null,
+      "stream_vega": null
+    },
+    {
+      "symbol": "MES    MAR2026 6900 P",
+      "underlying": "MES",
+      "expiration": "2026-03-20",
+      "strike": 6900.0,
+      "option_type": "put",
+      "quantity": 1.0,
+      "native_delta": 0.0,
+      "native_gamma": 0.0,
+      "native_theta": 0.0,
+      "native_vega": 0.0,
+      "native_source": "none",
+      "stream_messages": 0,
+      "stream_first_greek_latency_ms": null,
+      "stream_delta": null,
+      "stream_gamma": null,
+      "stream_theta": null,
+      "stream_vega": null
+    },
+    {
+      "symbol": "ES     MAR2026 6700 P (E1C)",
+      "underlying": "ES",
+      "expiration": "2026-03-04",
+      "strike": 6700.0,
+      "option_type": "put",
+      "quantity": -1.0,
+      "native_delta": -0.0,
+      "native_gamma": -0.0,
+      "native_theta": -0.0,
+      "native_vega": -0.0,
+      "native_source": "none",
+      "stream_messages": 0,
+      "stream_first_greek_latency_ms": null,
+      "stream_delta": null,
+      "stream_gamma": null,
+      "stream_theta": null,
+      "stream_vega": null
+    },
+    {
+      "symbol": "MES    FEB2026 6950 C (EX)",
+      "underlying": "MES",
+      "expiration": "2026-02-27",
+      "strike": 6950.0,
+      "option_type": "call",
+      "quantity": -2.0,
+      "native_delta": -0.0,
+      "native_gamma": -0.0,
+      "native_theta": -0.0,
+      "native_vega": -0.0,
+      "native_source": "none",
+      "stream_messages": 0,
+      "stream_first_greek_latency_ms": null,
+      "stream_delta": null,
+      "stream_gamma": null,
+      "stream_theta": null,
+      "stream_vega": null
+    },
+    {
+      "symbol": "ES     FEB2026 7070 C (EW)",
+      "underlying": "ES",
+      "expiration": "2026-02-27",
+      "strike": 7070.0,
+      "option_type": "call",
+      "quantity": 1.0,
+      "native_delta": 0.0,
+      "native_gamma": 0.0,
+      "native_theta": 0.0,
+      "native_vega": 0.0,
+      "native_source": "none",
+      "stream_messages": 0,
+      "stream_first_greek_latency_ms": null,
+      "stream_delta": null,
+      "stream_gamma": null,
+      "stream_theta": null,
+      "stream_vega": null
+    }
+  ]
+}

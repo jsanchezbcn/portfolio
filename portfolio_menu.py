@@ -132,8 +132,8 @@ async def _prefetch_greeks(client: ib.IBKRClient, accounts: List[Dict], position
 
 def refresh_greeks(client: ib.IBKRClient, accounts: List[Dict], positions_map: Dict[str, List[Dict]],
                    cache_minutes: int = 5, force_refresh: bool = True, dry_run: bool = False) -> None:
-    if not ib.TASTYTRADE_SDK_AVAILABLE:
-        print("Tastytrade SDK not available; cannot refresh Greeks.")
+    if not ib.TASTYTRADE_AVAILABLE:
+        print("Tastytrade package not available; cannot refresh Greeks.")
         return
     # Ensure external lookups are enabled
     ib.USE_EXTERNAL = True

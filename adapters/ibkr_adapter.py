@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 from adapters.base_adapter import BrokerAdapter
@@ -15,6 +15,27 @@ from models.unified_position import InstrumentType, UnifiedPosition
 LOGGER = logging.getLogger(__name__)
 
 
+# Issue 9: Complete futures multiplier table (CME/CBOT standard contracts)
+_FUTURES_MULTIPLIERS: dict[str, float] = {
+    "ES": 50.0,
+    "MES": 5.0,
+    "NQ": 20.0,
+    "MNQ": 2.0,
+    "YM": 5.0,
+    "MYM": 0.5,
+    "RTY": 50.0,
+    "M2K": 5.0,
+    "CL": 1_000.0,
+    "NG": 10_000.0,
+    "GC": 100.0,
+    "SI": 5_000.0,
+    "ZB": 1_000.0,
+    "ZN": 1_000.0,
+    "ZF": 1_000.0,
+    "ZT": 2_000.0,
+}
+
+
 class IBKRAdapter(BrokerAdapter):
     """IBKR-backed adapter that normalizes positions and enriches Greeks."""
 
@@ -23,10 +44,18 @@ class IBKRAdapter(BrokerAdapter):
 
         self.client = client or IBKRClient()
         self.last_greeks_status: dict[str, Any] = {}
+        # Issue 10: cache raw IBKR positions so the benchmark avoids a second REST call
+        self._last_raw_positions: list[dict[str, Any]] = []
         disable_cache_raw = str(os.getenv("GREEKS_DISABLE_CACHE", "")).strip().lower()
         self.disable_tasty_cache = disable_cache_raw in {"1", "true", "yes", "on"}
-        force_refresh_raw = str(os.getenv("GREEKS_FORCE_REFRESH_ON_MISS", "1")).strip().lower()
+        force_refresh_raw = str(os.getenv("GREEKS_FORCE_REFRESH_ON_MISS", "0")).strip().lower()
         self.force_refresh_on_miss = force_refresh_raw in {"1", "true", "yes", "on"}
+        # Issue 11 (partial): enable prefetch by default so all options for the same
+        # underlying are batched into a single DXLink websocket session rather than
+        # reconnecting once per option.  Full persistent session pooling is tracked
+        # separately in docs/IMPROVEMENTS.md #11.
+        prefetch_raw = str(os.getenv("GREEKS_PREFETCH", "1")).strip().lower()
+        self.enable_prefetch = prefetch_raw in {"1", "true", "yes", "on"}
 
     async def fetch_positions(self, account_id: str) -> list[UnifiedPosition]:
         """Fetch IBKR positions and convert to unified schema."""
@@ -36,13 +65,19 @@ class IBKRAdapter(BrokerAdapter):
         except Exception as exc:
             raise ConnectionError(f"Unable to fetch IBKR positions for account {account_id}.") from exc
 
+        # Issue 10: cache so callers can reuse without a second HTTP round-trip
+        self._last_raw_positions = raw_positions
         transformed: list[UnifiedPosition] = []
 
         for position in raw_positions:
             try:
                 transformed.append(self._to_unified_position(position))
             except Exception as exc:
-                LOGGER.warning("Skipping unparseable IBKR position payload: %s", exc)
+                message = str(exc)
+                if "Option positions require fields: expiration" in message:
+                    LOGGER.debug("Skipping IBKR option with missing expiration: %s", position)
+                else:
+                    LOGGER.warning("Skipping unparseable IBKR position payload: %s", exc)
                 continue
 
         return transformed
@@ -55,13 +90,13 @@ class IBKRAdapter(BrokerAdapter):
         prefetch_results: dict[str, int] = {}
         missing_greeks_details: list[dict[str, Any]] = []
 
-        if not self.disable_tasty_cache:
+        if self.enable_prefetch and not self.disable_tasty_cache:
             for underlying, request_set in prefetch_targets.items():
                 try:
                     fetched = await self.client.options_cache.fetch_and_cache_options_for_underlying(
                         underlying,
                         only_options=request_set,
-                        force_refresh=True,
+                        force_refresh=self.force_refresh_on_miss,
                     )
                     prefetch_results[underlying] = len(fetched)
                 except Exception as exc:
@@ -169,6 +204,7 @@ class IBKRAdapter(BrokerAdapter):
             "last_session_error": getattr(self.client.options_cache, "last_session_error", None),
             "disable_tasty_cache": self.disable_tasty_cache,
             "force_refresh_on_miss": self.force_refresh_on_miss,
+            "enable_prefetch": self.enable_prefetch,
         }
 
         return updated_positions
@@ -196,6 +232,25 @@ class IBKRAdapter(BrokerAdapter):
                     )
                 )
         return targets
+
+    @staticmethod
+    def to_stream_snapshot_payload(position: UnifiedPosition, account_id: str) -> dict[str, Any]:
+        return {
+            "broker": "ibkr",
+            "account_id": account_id,
+            "contract_key": position.symbol,
+            "underlying": position.underlying,
+            "expiration": position.expiration.isoformat() if position.expiration else None,
+            "strike": position.strike,
+            "option_type": position.option_type,
+            "quantity": position.quantity,
+            "delta": position.delta,
+            "gamma": position.gamma,
+            "theta": position.theta,
+            "vega": position.vega,
+            "iv": position.iv,
+            "event_time": datetime.now(timezone.utc).isoformat(),
+        }
 
     def _candidate_tasty_underlyings(self, position: UnifiedPosition) -> list[str]:
         """Return candidate underlyings used for Tastytrade Greeks lookup."""
@@ -315,6 +370,7 @@ class IBKRAdapter(BrokerAdapter):
         return extracted
 
     def _extract_contract_multiplier(self, position: dict[str, Any]) -> float:
+        # Use IBKR's own multiplier field when present and valid
         raw_multiplier = position.get("multiplier")
         try:
             if raw_multiplier not in (None, ""):
@@ -327,20 +383,39 @@ class IBKRAdapter(BrokerAdapter):
         asset_class = str(position.get("assetClass") or "").upper()
         ticker = str(position.get("ticker") or position.get("undSym") or "").upper().lstrip("/")
 
+        # Issue 9: look up from the comprehensive futures multiplier table
+        if asset_class in {"OPT", "FOP", "FUT"} and ticker in _FUTURES_MULTIPLIERS:
+            return _FUTURES_MULTIPLIERS[ticker]
+
+        # Equity options default
         if asset_class in {"OPT", "FOP"}:
-            if ticker == "ES":
-                return 50.0
-            if ticker == "MES":
-                return 5.0
             return 100.0
 
-        if asset_class == "FUT":
-            if ticker == "ES":
-                return 50.0
-            if ticker == "MES":
-                return 5.0
-
         return 1.0
+
+    async def fetch_account_margin(self, account_id: str) -> dict[str, Any]:
+        """Issue 2: Fetch IBKR account margin / liquidity summary via REST.
+
+        Returns a dict with keys like ``netliquidation``, ``excessliquidity``, and
+        ``cushion`` (ratio of excess liquidity to net liquidation value).  Returns an
+        empty dict if the request fails so callers can degrade gracefully.
+        """
+        try:
+            response = await asyncio.to_thread(
+                self.client.session.get,
+                f"{self.client.base_url}/v1/api/portfolio/{account_id}/summary",
+                timeout=5,
+            )
+            if response.status_code == 200:
+                return dict(response.json())
+            LOGGER.warning(
+                "fetch_account_margin: status %s for account %s",
+                response.status_code,
+                account_id,
+            )
+        except Exception as exc:
+            LOGGER.warning("fetch_account_margin failed for %s: %s", account_id, exc)
+        return {}
 
     @staticmethod
     def _is_futures_option(position: UnifiedPosition) -> bool:
@@ -377,11 +452,25 @@ class IBKRAdapter(BrokerAdapter):
         return 100.0
 
     @staticmethod
-    def _parse_expiration(expiry: str) -> date:
-        normalized = expiry.replace("-", "")
-        if len(normalized) == 8:
-            return datetime.strptime(normalized, "%Y%m%d").date()
-        raise ValueError(f"Unsupported expiration format: {expiry}")
+    def _parse_expiration(expiry: str) -> date | None:
+        raw = str(expiry or "").strip()
+        if not raw:
+            return None
+
+        if raw.isdigit() and len(raw) > 8:
+            try:
+                return datetime.fromtimestamp(int(raw) / 1000).date()
+            except (ValueError, OSError):
+                return None
+
+        normalized = raw.replace("-", "")
+        if len(normalized) == 8 and normalized.isdigit():
+            try:
+                return datetime.strptime(normalized, "%Y%m%d").date()
+            except ValueError:
+                return None
+
+        return None
 
     @staticmethod
     def _safe_float(value: Any) -> float:
