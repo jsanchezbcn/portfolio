@@ -393,6 +393,8 @@ async def main():
                        help='Test authentication without fetching data')
     parser.add_argument('--output', '-o', 
                        help='Output CSV filename (default: {symbol}_options.csv)')
+    parser.add_argument('--stream', action='store_true', help='Start continuous DXLink stream ingestion after fetch')
+    parser.add_argument('--account-id', default='tastytrade-default', help='Account id used for persistence records')
     
     args = parser.parse_args()
     
@@ -423,6 +425,35 @@ async def main():
         
         # Write to CSV
         write_options_csv(options_data, output_file)
+
+        if args.stream:
+            from agent_config import load_streaming_environment
+            from core.processor import DataProcessor
+            from database.db_manager import DBManager
+            from streaming.tasty_dxlink import TastyDXLinkStreamerClient
+
+            config = load_streaming_environment()
+            db_manager = await DBManager.get_instance()
+            db_manager.flush_interval_seconds = config.stream_flush_interval_seconds
+            db_manager.flush_batch_size = config.stream_flush_batch_size
+
+            processor = DataProcessor(db_manager)
+            await processor.start()
+
+            streamer_symbols = [str(item['symbol']) for item in options_data if item.get('symbol')]
+            streamer = TastyDXLinkStreamerClient(
+                session_factory=lambda: session,
+                account_id=args.account_id,
+                processor=processor,
+                reconnect_max_backoff_seconds=config.ibkr_reconnect_max_backoff_seconds,
+            )
+
+            print(f"Starting DXLink stream ingestion for {len(streamer_symbols)} symbols (Ctrl+C to stop)...")
+            try:
+                await streamer.run(streamer_symbols)
+            finally:
+                streamer.stop()
+                await processor.stop()
         
     except TastytradeOptionsError as e:
         print(f"ERROR: {e}")

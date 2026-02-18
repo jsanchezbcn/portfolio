@@ -35,3 +35,11 @@ def setup_logging(logger_name: str | None = None) -> logging.Logger:
     logger.propagate = False
 
     return logger
+
+
+def get_stream_logger() -> logging.Logger:
+    return setup_logging("stream.ingestion")
+
+
+def get_db_ingestion_logger() -> logging.Logger:
+    return setup_logging("db.ingestion")

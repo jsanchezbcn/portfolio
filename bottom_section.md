@@ -1,0 +1,376 @@
+- generic:
+  - generic [ref=e2]:
+    - generic [ref=e7]:
+      - button "keyboard_double_arrow_left" [ref=e692] [cursor=pointer]:
+        - generic [ref=e694]: keyboard_double_arrow_left
+      - generic [ref=e11]:
+        - heading "Inputs" [level=2] [ref=e15]
+        - button "Reload Accounts" [ref=e18] [cursor=pointer]:
+          - paragraph [ref=e22]: Reload Accounts
+        - button "Sign in to IBKR" [ref=e25] [cursor=pointer]:
+          - paragraph [ref=e29]: Sign in to IBKR
+        - generic [ref=e31]:
+          - paragraph [ref=e35]: IBKR Account
+          - generic [ref=e37]:
+            - generic [ref=e38]:
+              - generic [ref=e39]: U19664833
+              - combobox "Selected U19664833. IBKR Account" [ref=e41]
+            - img "open" [ref=e43]
+        - button "Refresh" [ref=e47] [cursor=pointer]:
+          - paragraph [ref=e51]: Refresh
+        - generic [ref=e54] [cursor=pointer]:
+          - checkbox "Show per-position Greeks" [checked]
+          - paragraph [ref=e59]: Show per-position Greeks
+        - generic [ref=e62] [cursor=pointer]:
+          - checkbox "IBKR-style option scaling (x100)" [checked]
+          - paragraph [ref=e67]: IBKR-style option scaling (x100)
+        - generic [ref=e70] [cursor=pointer]:
+          - checkbox "Use latest cached portfolio if IBKR unavailable" [checked]
+          - paragraph [ref=e75]: Use latest cached portfolio if IBKR unavailable
+        - generic [ref=e78] [cursor=pointer]:
+          - checkbox "IBKR-only mode (no external Greeks)"
+          - paragraph [ref=e83]: IBKR-only mode (no external Greeks)
+        - heading "Greeks Diagnostics" [level=3] [ref=e87]
+        - generic [ref=e90] [cursor=pointer]:
+          - checkbox "Disable Tasty cache (live fetch only)"
+          - paragraph [ref=e95]: Disable Tasty cache (live fetch only)
+        - generic [ref=e98] [cursor=pointer]:
+          - checkbox "Force live fetch on cache miss"
+          - paragraph [ref=e103]: Force live fetch on cache miss
+        - group [ref=e106]:
+          - generic "keyboard_arrow_down Data Freshness" [active] [ref=e860] [cursor=pointer]:
+            - generic [ref=e108]:
+              - generic [ref=e862]: keyboard_arrow_down
+              - paragraph [ref=e113]: Data Freshness
+          - generic [ref=e864]:
+            - paragraph [ref=e869]: "Positions: 2026-02-18T02:18:02.650038 UTC (1.1 min old)"
+            - paragraph [ref=e874]: "Greeks: 2026-02-18T02:18:02.650363 UTC (1.1 min old)"
+            - paragraph [ref=e879]: "VIX: 2026-02-18T02:18:02.987855 UTC (1.0 min old)"
+            - paragraph [ref=e884]: "Macro: 2026-02-18T02:18:03.544471 UTC (1.0 min old)"
+            - paragraph [ref=e889]: "IV/HV: 2026-02-18T02:18:03.809736 UTC (1.0 min old)"
+    - generic [ref=e3]:
+      - banner [ref=e116]:
+        - generic [ref=e119]:
+          - button "Deploy" [ref=e121] [cursor=pointer]:
+            - generic [ref=e123]: Deploy
+          - button [ref=e125] [cursor=pointer]:
+            - img [ref=e126]
+      - generic [ref=e129]:
+        - heading "Portfolio Risk Manager" [level=1] [ref=e134]:
+          - text: Portfolio Risk Manager
+          - generic [ref=e135]:
+            - link "Link to heading":
+              - /url: "#portfolio-risk-manager"
+              - img
+        - generic [ref=e140]: "Regime: Neutral Volatility | VIX: 20.29 | Term Structure: 1.065 | Recession Prob: N/A (polymarket) | Macro Ts: 2026-02-18T02:18:03.544471"
+        - generic [ref=e142]:
+          - heading "Risk Status" [level=3] [ref=e147]:
+            - text: Risk Status
+            - generic [ref=e148]:
+              - link "Link to heading":
+                - /url: "#risk-status"
+                - img
+          - generic [ref=e150]:
+            - generic [ref=e152]:
+              - paragraph [ref=e157]: Greek Limits
+              - alert [ref=e160]:
+                - paragraph [ref=e165]: ⛔ 1 violation(s)
+            - generic [ref=e167]:
+              - paragraph [ref=e172]: DTE Expiry Risk
+              - alert [ref=e175]:
+                - paragraph [ref=e180]: ✓ No DTE risk
+            - generic [ref=e182]:
+              - paragraph [ref=e187]: Concentration
+              - alert [ref=e190]:
+                - paragraph [ref=e195]: ✓ Concentration OK
+            - generic [ref=e197]:
+              - paragraph [ref=e202]: Daily Drawdown
+              - alert [ref=e205]:
+                - paragraph [ref=e210]: ✓ Drawdown OK
+          - group [ref=e213]:
+            - generic "keyboard_arrow_down Active Risk Violations" [ref=e214] [cursor=pointer]:
+              - generic [ref=e215]:
+                - generic [ref=e217]: keyboard_arrow_down
+                - paragraph [ref=e220]: Active Risk Violations
+            - paragraph [ref=e227]:
+              - text: •
+              - strong [ref=e228]: Theta
+              - text: ": Daily theta collection below minimum (current:"
+              - code [ref=e229]: "0.0"
+              - text: ", limit:"
+              - code [ref=e230]: "300.0"
+              - text: )
+        - heading "IBKR Account Summary" [level=3] [ref=e235]:
+          - text: IBKR Account Summary
+          - generic [ref=e236]:
+            - link "Link to heading":
+              - /url: "#ibkr-account-summary"
+              - img
+        - generic [ref=e238]:
+          - generic [ref=e243]:
+            - paragraph [ref=e247]: Net Liquidation
+            - paragraph [ref=e251]: 26,037.34
+          - generic [ref=e256]:
+            - paragraph [ref=e260]: Buying Power
+            - paragraph [ref=e264]: 1,710.59
+          - generic [ref=e269]:
+            - paragraph [ref=e273]: Maint Margin
+            - paragraph [ref=e277]: 6,032.99
+          - generic [ref=e282]:
+            - paragraph [ref=e286]: Excess Liquidity
+            - paragraph [ref=e290]: 3,057.04
+        - paragraph [ref=e295]: "Greeks timestamp: 2026-02-18T02:18:02.648078 UTC (1.1 minutes old)"
+        - generic [ref=e297]:
+          - generic [ref=e302]:
+            - paragraph [ref=e306]: Delta
+            - paragraph [ref=e310]: "135.18"
+          - generic [ref=e315]:
+            - paragraph [ref=e319]: Theta
+            - paragraph [ref=e323]: "0.00"
+          - generic [ref=e328]:
+            - paragraph [ref=e332]: Vega
+            - paragraph [ref=e336]: "0.00"
+          - generic [ref=e341]:
+            - paragraph [ref=e345]: Gamma
+            - paragraph [ref=e349]: "0.00"
+          - generic [ref=e354]:
+            - paragraph [ref=e358]: SPX Delta
+            - paragraph [ref=e362]: "2.63"
+          - generic [ref=e367]:
+            - paragraph [ref=e371]: Theta/Vega
+            - paragraph [ref=e375]: "0.000"
+        - heading "IV vs HV Analysis" [level=3] [ref=e380]:
+          - text: IV vs HV Analysis
+          - generic [ref=e381]:
+            - link "Link to heading":
+              - /url: "#iv-vs-hv-analysis"
+              - img
+        - alert [ref=e384]:
+          - paragraph [ref=e389]: IV/HV analysis unavailable for current positions (missing IV or insufficient price history).
+        - heading "Portfolio Positions & Greeks" [level=3] [ref=e394]:
+          - text: Portfolio Positions & Greeks
+          - generic [ref=e395]:
+            - link "Link to heading":
+              - /url: "#portfolio-positions-and-greeks"
+              - img
+        - paragraph [ref=e698]: Option Greeks in this table are multiplied by 100 for IBKR-style contract scaling.
+        - generic [ref=e702]:
+          - button "Download as CSV" [ref=e705] [cursor=pointer]:
+            - img [ref=e706]
+          - button "Search" [ref=e711] [cursor=pointer]:
+            - img [ref=e712]
+          - button "Fullscreen" [ref=e717] [cursor=pointer]:
+            - img [ref=e718]
+        - heading "Risk Compliance" [level=3] [ref=e732]:
+          - text: Risk Compliance
+          - generic [ref=e733]:
+            - link "Link to heading":
+              - /url: "#risk-compliance"
+              - img
+        - alert [ref=e735]:
+          - paragraph [ref=e740]: One or more risk limits are violated.
+        - generic [ref=e744]:
+          - button "Download as CSV" [ref=e747] [cursor=pointer]:
+            - img [ref=e748]
+          - button "Search" [ref=e753] [cursor=pointer]:
+            - img [ref=e754]
+          - button "Fullscreen" [ref=e759] [cursor=pointer]:
+            - img [ref=e760]
+        - heading "Gamma Risk by DTE" [level=3] [ref=e775]:
+          - text: Gamma Risk by DTE
+          - generic [ref=e776]:
+            - link "Link to heading":
+              - /url: "#gamma-risk-by-dte"
+              - img
+        - generic [ref=e483]:
+          - img:
+            - generic:
+              - generic:
+                - generic:
+                  - generic:
+                    - generic: 0-7
+                  - generic:
+                    - generic: 8-30
+                  - generic:
+                    - generic: 31-60
+                  - generic:
+                    - generic: 60+
+                - generic:
+                  - generic:
+                    - generic: −1
+                  - generic:
+                    - generic: −0.5
+                  - generic:
+                    - generic: "0"
+                  - generic:
+                    - generic: "0.5"
+                  - generic:
+                    - generic: "1"
+          - img:
+            - generic:
+              - generic:
+                - generic: DTE Bucket
+              - generic:
+                - generic: Gamma
+          - toolbar [ref=e497]:
+            - button "Download plot as a PNG" [ref=e499] [cursor=pointer]:
+              - img [ref=e500]
+            - generic [ref=e502]:
+              - button "Zoom" [ref=e503] [cursor=pointer]:
+                - img [ref=e504]
+              - button "Pan" [ref=e506] [cursor=pointer]:
+                - img [ref=e507]
+            - generic [ref=e509]:
+              - button "Zoom in" [ref=e510] [cursor=pointer]:
+                - img [ref=e511]
+              - button "Zoom out" [ref=e513] [cursor=pointer]:
+                - img [ref=e514]
+              - button "Autoscale" [ref=e516] [cursor=pointer]:
+                - img [ref=e517]
+              - button "Reset axes" [ref=e519] [cursor=pointer]:
+                - img [ref=e520]
+            - button "Fullscreen" [ref=e523] [cursor=pointer]:
+              - img [ref=e524]
+          - img
+        - heading "Theta/Vega Profile" [level=3] [ref=e781]:
+          - text: Theta/Vega Profile
+          - generic [ref=e782]:
+            - link "Link to heading":
+              - /url: "#theta-vega-profile"
+              - img
+        - generic [ref=e537]:
+          - img:
+            - generic:
+              - generic:
+                - generic:
+                  - generic:
+                    - generic:
+                      - generic:
+                        - generic:
+                          - generic:
+                            - generic: Current (0.000)
+                - generic:
+                  - generic:
+                    - generic: "0"
+                  - generic:
+                    - generic: "20"
+                  - generic:
+                    - generic: "40"
+                  - generic:
+                    - generic: "60"
+                  - generic:
+                    - generic: "80"
+                  - generic:
+                    - generic: "100"
+                - generic:
+                  - generic:
+                    - generic: "0"
+                  - generic:
+                    - generic: "10"
+                  - generic:
+                    - generic: "20"
+                  - generic:
+                    - generic: "30"
+                  - generic:
+                    - generic: "40"
+                  - generic:
+                    - generic: "50"
+          - img:
+            - generic:
+              - generic [ref=e554]:
+                - generic [ref=e556]: Current portfolio
+                - generic [ref=e563]: 1:3 reference (0.33)
+                - generic [ref=e566]: Target zone (0.25-0.40)
+              - generic:
+                - generic: Abs Vega (dollars)
+              - generic:
+                - generic: Abs Theta (dollars)
+          - toolbar [ref=e571]:
+            - button "Download plot as a PNG" [ref=e573] [cursor=pointer]:
+              - img [ref=e574]
+            - generic [ref=e576]:
+              - button "Zoom" [ref=e577] [cursor=pointer]:
+                - img [ref=e578]
+              - button "Pan" [ref=e580] [cursor=pointer]:
+                - img [ref=e581]
+            - generic [ref=e583]:
+              - button "Zoom in" [ref=e584] [cursor=pointer]:
+                - img [ref=e585]
+              - button "Zoom out" [ref=e587] [cursor=pointer]:
+                - img [ref=e588]
+              - button "Autoscale" [ref=e590] [cursor=pointer]:
+                - img [ref=e591]
+              - button "Reset axes" [ref=e593] [cursor=pointer]:
+                - img [ref=e594]
+            - button "Fullscreen" [ref=e597] [cursor=pointer]:
+              - img [ref=e598]
+          - img
+        - paragraph [ref=e786]: "Target zone: 0.25 ≤ |Theta|/|Vega| ≤ 0.40 (Sebastian 1:3 framework)."
+        - heading "Market Data" [level=3] [ref=e790]:
+          - text: Market Data
+          - generic [ref=e791]:
+            - link "Link to heading":
+              - /url: "#market-data"
+              - img
+        - generic [ref=e796]:
+          - generic [ref=e798] [cursor=pointer]:
+            - img [ref=e801]
+            - generic [ref=e803]: "{"
+          - generic [ref=e805]:
+            - generic [ref=e806]:
+              - generic [ref=e807]:
+                - generic [ref=e808]:
+                  - text: "\""
+                  - generic [ref=e809]: VIX
+                  - text: "\""
+                - generic [ref=e810]: ":"
+              - generic [ref=e812] [cursor=pointer]: "20.29"
+            - generic [ref=e813]:
+              - generic [ref=e814]:
+                - generic [ref=e815]:
+                  - text: "\""
+                  - generic [ref=e816]: VIX3M
+                  - text: "\""
+                - generic [ref=e817]: ":"
+              - generic [ref=e819] [cursor=pointer]: "21.6"
+            - generic [ref=e820]:
+              - generic [ref=e821]:
+                - generic [ref=e822]:
+                  - text: "\""
+                  - generic [ref=e823]: TermStructure
+                  - text: "\""
+                - generic [ref=e824]: ":"
+              - generic [ref=e826] [cursor=pointer]: "1.065"
+            - generic [ref=e827]:
+              - generic [ref=e828]:
+                - generic [ref=e829]:
+                  - text: "\""
+                  - generic [ref=e830]: Backwardation
+                  - text: "\""
+                - generic [ref=e831]: ":"
+              - generic [ref=e833] [cursor=pointer]: "false"
+            - generic [ref=e834]:
+              - generic [ref=e835]:
+                - generic [ref=e836]:
+                  - text: "\""
+                  - generic [ref=e837]: UpdatedAtUTC
+                  - text: "\""
+                - generic [ref=e838]: ":"
+              - generic [ref=e841]: "\"2026-02-18T02:19:05.931862\""
+          - generic [ref=e843] [cursor=pointer]: "}"
+        - heading "AI Assistant" [level=3] [ref=e848]:
+          - text: AI Assistant
+          - generic [ref=e849]:
+            - link "Link to heading":
+              - /url: "#ai-assistant"
+              - img
+        - generic [ref=e671]:
+          - paragraph [ref=e675]: Ask for a risk adjustment
+          - textbox "Ask for a risk adjustment" [ref=e678]:
+            - /placeholder: How should I reduce near-term gamma?
+        - group [ref=e852]:
+          - generic "keyboard_arrow_right Assistant configuration" [ref=e853] [cursor=pointer]:
+            - generic [ref=e854]:
+              - generic [ref=e856]: keyboard_arrow_right
+              - paragraph [ref=e859]: Assistant configuration
+  - img [ref=e689]
