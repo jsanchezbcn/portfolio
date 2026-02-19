@@ -7,6 +7,7 @@
 Completed all requirements for AI trading agent with Greeks accuracy fixes, Market Intelligence debugging, and LLM model picker.
 
 ### What was implemented:
+
 1. **Greeks Accuracy Fix** (adapters/ibkr_adapter.py)
    - Removed position-adjusted fields from `_extract_native_greeks` that were causing double-counting
    - Changed to use only per-contract Greek fields
@@ -28,7 +29,7 @@ Completed all requirements for AI trading agent with Greeks accuracy fixes, Mark
    - Defaults to `gpt-4.1`
 
 5. **Expanded AI Assistant Context** (dashboard/app.py)
-   - Account ID, regime, VIX data  
+   - Account ID, regime, VIX data
    - Per-position option table (qty, DTE, Greeks per contract, greeks source)
    - Equity/Futures position summaries
    - Full risk violation details
@@ -39,21 +40,25 @@ Completed all requirements for AI trading agent with Greeks accuracy fixes, Mark
    - Falls back to hardcoded list on failure
 
 ### Dashboard Status:
+
 - Running on http://localhost:8506 (PID 94669)
 - All changes compiled successfully
 - Ready for testing
 
 ### Files Modified:
+
 - adapters/ibkr_adapter.py
 - agents/news_sentry.py (added `import re`)
 - agents/llm_client.py (new `async_list_models()`)
 - dashboard/app.py (model picker + expanded context)
 
 ### Testing Notes:
+
 - Greeks=0 issue should now resolve via IBKR-first logic + preserved source tags
 - Market Intelligence scoring should work with proper JSON parsing
 - LLM model picker allows selection of different models
 - AI assistant context now includes full position details
 
 ---
+
 Ready for next spec.
