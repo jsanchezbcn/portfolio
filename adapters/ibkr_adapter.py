@@ -91,17 +91,24 @@ class IBKRAdapter(BrokerAdapter):
         missing_greeks_details: list[dict[str, Any]] = []
 
         if self.enable_prefetch and not self.disable_tasty_cache:
-            for underlying, request_set in prefetch_targets.items():
+            # Run all prefetch tasks concurrently to reduce total wait time
+            # (each WebSocket fetch takes ~18s; serial would be N×18s)
+            async def _prefetch_one(und: str, reqs: set) -> tuple[str, int]:
                 try:
                     fetched = await self.client.options_cache.fetch_and_cache_options_for_underlying(
-                        underlying,
-                        only_options=request_set,
+                        und,
+                        only_options=reqs,
                         force_refresh=self.force_refresh_on_miss,
                     )
-                    prefetch_results[underlying] = len(fetched)
+                    return und, len(fetched)
                 except Exception as exc:
-                    LOGGER.warning("Prefetch failed for %s: %s", underlying, exc)
-                    prefetch_results[underlying] = 0
+                    LOGGER.warning("Prefetch failed for %s: %s", und, exc)
+                    return und, 0
+
+            tasks = [_prefetch_one(und, reqs) for und, reqs in prefetch_targets.items()]
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+            for und, count in results:
+                prefetch_results[und] = count
 
         cache_miss_count = 0
 
@@ -110,9 +117,24 @@ class IBKRAdapter(BrokerAdapter):
                 updated_positions.append(position)
                 continue
 
-            if position.greeks_source == "ibkr_native":
+            # IBKR-first strategy:
+            # If IBKR provided ALL greeks (delta + theta + vega all non-zero), use them directly.
+            # If IBKR only has delta (typical for most options), still run Tastytrade to get
+            # theta/vega — we preserve the IBKR delta/gamma in that case (more accurate).
+            ibkr_has_full_greeks = (
+                position.greeks_source == "ibkr_native"
+                and abs(position.theta) > 1e-9
+                and abs(position.vega) > 1e-9
+            )
+            if ibkr_has_full_greeks:
                 updated_positions.append(position)
                 continue
+
+            # Track whether we have a valid IBKR delta to preserve
+            ibkr_has_delta = (
+                position.greeks_source == "ibkr_native"
+                and abs(position.delta) > 1e-9
+            )
 
             if not position.underlying or not position.expiration or not position.strike or not position.option_type:
                 updated_positions.append(position)
@@ -161,9 +183,19 @@ class IBKRAdapter(BrokerAdapter):
                         "lookup_candidates": ", ".join(candidates),
                         "lookup_used": selected_underlying,
                         "reason": source,
+                        "ibkr_had_delta": ibkr_has_delta,
                     }
                 )
-                position.greeks_source = "none"
+                # IBKR-first: if we had IBKR native delta, keep it rather than marking as "none".
+                # This preserves delta accuracy even when Tastytrade cannot supply theta/vega.
+                if ibkr_has_delta:
+                    LOGGER.debug(
+                        "Tastytrade miss (%s) for %s — keeping IBKR native delta=%.4f",
+                        source, position.symbol, position.delta,
+                    )
+                    # Leave position.greeks_source as "ibkr_native" to indicate partial data
+                else:
+                    position.greeks_source = "none"
                 updated_positions.append(position)
                 continue
 
@@ -177,12 +209,21 @@ class IBKRAdapter(BrokerAdapter):
             delta_gamma_multiplier = self._option_delta_gamma_multiplier(position, contract_multiplier)
             theta_vega_multiplier = self._option_theta_vega_multiplier(position, contract_multiplier)
 
-            position.delta = per_contract_delta * position.quantity * delta_gamma_multiplier
-            position.gamma = per_contract_gamma * position.quantity * delta_gamma_multiplier
-            position.theta = per_contract_theta * position.quantity * theta_vega_multiplier
-            position.vega = per_contract_vega * position.quantity * theta_vega_multiplier
-            position.iv = self._safe_optional_float(greeks.get("impliedVol"))
-            position.greeks_source = "tastytrade"
+            if ibkr_has_delta:
+                # IBKR-first: preserve IBKR delta/gamma (broker model, already position-adjusted),
+                # and fill in theta/vega/iv from Tastytrade (IBKR often lacks these).
+                position.theta = per_contract_theta * position.quantity * theta_vega_multiplier
+                position.vega = per_contract_vega * position.quantity * theta_vega_multiplier
+                position.iv = self._safe_optional_float(greeks.get("impliedVol"))
+                position.greeks_source = "ibkr_native+tastytrade"
+            else:
+                # No IBKR native greeks — use Tastytrade for everything.
+                position.delta = per_contract_delta * position.quantity * delta_gamma_multiplier
+                position.gamma = per_contract_gamma * position.quantity * delta_gamma_multiplier
+                position.theta = per_contract_theta * position.quantity * theta_vega_multiplier
+                position.vega = per_contract_vega * position.quantity * theta_vega_multiplier
+                position.iv = self._safe_optional_float(greeks.get("impliedVol"))
+                position.greeks_source = "tastytrade"
 
             price = position.market_value / position.quantity if position.quantity else 0.0
             if position.strike is not None and position.strike > 0:
@@ -351,11 +392,13 @@ class IBKRAdapter(BrokerAdapter):
         )
 
     def _extract_native_greeks(self, position: dict[str, Any]) -> dict[str, float | None]:
+        # Use PER-CONTRACT fields only (positionDelta/positionGamma/etc. are quantity-adjusted
+        # and would double-count when multiplied by quantity in _to_unified_position).
         candidates = {
-            "delta": ["delta", "positionDelta", "netDelta", "optDelta", "modelDelta"],
-            "gamma": ["gamma", "positionGamma", "optGamma", "modelGamma"],
-            "theta": ["theta", "positionTheta", "optTheta", "modelTheta"],
-            "vega": ["vega", "positionVega", "optVega", "modelVega"],
+            "delta": ["delta", "optDelta", "modelDelta"],
+            "gamma": ["gamma", "optGamma", "modelGamma"],
+            "theta": ["theta", "optTheta", "modelTheta"],
+            "vega": ["vega", "optVega", "modelVega"],
         }
 
         extracted: dict[str, float | None] = {"delta": None, "gamma": None, "theta": None, "vega": None}

@@ -1,16 +1,63 @@
+# ============================================================================
+# How limits work:
+#   Effective limit = ratio * NLV * vix_scaler * ts_scaler
+#
+#   When NLV is known (live IBKR account):
+#     Each *_pct_nlv field is multiplied by account NLV.
+#     A $250k account gets ~10x looser absolute limits than a $25k account.
+#
+#   When NLV is unknown (no IBKR connection):
+#     The legacy_* absolute fallback values are used, also scaled by
+#     vix_scaler and ts_scaler for market-condition sensitivity.
+#
+#   NLV examples (neutral_volatility, scalers=1.0):
+#     $25k  → theta $30/day, vega -$1,200, delta 300 pts
+#     $100k → theta $120/day, vega -$4,800, delta 1,200 pts
+#     $250k → theta $300/day, vega -$12,000, delta 3,000 pts
+# ============================================================================
+
+vix_scalers:
+  - vix_threshold: 20
+    scale: 0.85 # VIX >= 20 → tighten limits by 15%
+  - vix_threshold: 25
+    scale: 0.70 # VIX >= 25 → tighten by 30%
+  - vix_threshold: 30
+    scale: 0.50 # VIX >= 30 → tighten by 50%
+  - vix_threshold: 35
+    scale: 0.25 # VIX >= 35 → tighten by 75% (crisis)
+
+term_structure_scalers:
+  - term_structure_threshold: 1.10
+    scale: 1.10 # deep contango → relax by 10%
+  - term_structure_threshold: 1.0
+    scale: 1.0 # normal contango → no change
+  - term_structure_threshold: 0.95
+    scale: 0.80 # mild backwardation → tighten by 20%
+  - term_structure_threshold: 0.90
+    scale: 0.60 # backwardation → tighten by 40%
+  - term_structure_threshold: 0.0
+    scale: 0.40 # deep backwardation → tighten by 60%
+
 regimes:
   low_volatility:
     condition: "VIX < 15 and term_structure > 1.10"
     description: "Complacency. Market grinds up. Cheap hedges available."
     limits:
-      max_beta_delta: 600
-      max_negative_vega: -500
-      min_daily_theta: 100
-      max_gamma: 50
+      # NLV-relative ratios (primary) — scale automatically with portfolio size
+      # $25k:  theta $18/day, vega -$750, delta 450 pts, gamma 26
+      # $100k: theta $72/day, vega -$3,000, delta 1,800 pts
+      min_daily_theta_pct_nlv: 0.00072 # 0.072% NLV/day
+      max_negative_vega_pct_nlv: -0.030 # 3.0% NLV short vega
+      max_spx_delta_pct_nlv: 0.018 # 1.8% NLV
+      max_gamma_pct_nlv: 0.00105 # 0.105% NLV
+      # Legacy absolute fallbacks (used when NLV is unavailable)
+      legacy_min_daily_theta: 18
+      legacy_max_negative_vega: -750
+      legacy_max_beta_delta: 450
+      legacy_max_gamma: 26
+      # Non-Greek limits (not scaled by NLV)
       recession_probability_threshold: 0.4
-      # Issue 5: vega concentration cap (single underlying fraction of total vega)
       max_single_underlying_vega_pct: 0.70
-      # Issue 6: max contracts per individual position
       max_position_contracts: 100
       allowed_strategies:
         - "Long Calendars"
@@ -21,10 +68,20 @@ regimes:
     condition: "15 <= VIX <= 22"
     description: "Standard operating environment."
     limits:
-      max_beta_delta: 300
-      max_negative_vega: -1200
-      min_daily_theta: 300
-      max_gamma: 35
+      # NLV-relative ratios (primary)
+      # $25k:  theta $30/day, vega -$1,200, delta 300 pts, gamma 35
+      # $100k: theta $120/day, vega -$4,800, delta 1,200 pts
+      # $250k: theta $300/day, vega -$12,000, delta 3,000 pts
+      min_daily_theta_pct_nlv: 0.0012 # 0.12% NLV/day
+      max_negative_vega_pct_nlv: -0.048 # 4.8% NLV short vega
+      max_spx_delta_pct_nlv: 0.012 # 1.2% NLV
+      max_gamma_pct_nlv: 0.0014 # 0.14% NLV
+      # Legacy absolute fallbacks
+      legacy_min_daily_theta: 30
+      legacy_max_negative_vega: -1200
+      legacy_max_beta_delta: 300
+      legacy_max_gamma: 35
+      # Non-Greek limits
       recession_probability_threshold: 0.4
       max_single_underlying_vega_pct: 0.60
       max_position_contracts: 50
@@ -37,10 +94,19 @@ regimes:
     condition: "VIX > 22 or recession_probability > 0.40"
     description: "Fear. Elevated premiums. Fast moves."
     limits:
-      max_beta_delta: 100
-      max_negative_vega: -2500
-      min_daily_theta: 600
-      max_gamma: 20
+      # NLV-relative ratios — tighter delta, higher theta demand
+      # $25k:  theta $60/day, vega -$1,500, delta 75 pts, gamma 15
+      # $100k: theta $240/day, vega -$6,000, delta 300 pts
+      min_daily_theta_pct_nlv: 0.0024 # 0.24% NLV/day (higher theta demand in fear)
+      max_negative_vega_pct_nlv: -0.060 # 6.0% NLV (fast moves punish short vol)
+      max_spx_delta_pct_nlv: 0.003 # 0.3% NLV (much tighter delta)
+      max_gamma_pct_nlv: 0.00060 # 0.06% NLV
+      # Legacy absolute fallbacks
+      legacy_min_daily_theta: 60
+      legacy_max_negative_vega: -1500
+      legacy_max_beta_delta: 75
+      legacy_max_gamma: 15
+      # Non-Greek limits
       recession_probability_threshold: 0.4
       max_single_underlying_vega_pct: 0.50
       max_position_contracts: 20
@@ -51,12 +117,19 @@ regimes:
 
   crisis_mode:
     condition: "VIX > 35 or vvix > 150"
-    description: "Panic. Liquidity drying up."
+    description: "Panic. Liquidity drying up. Reduce ALL short vol."
     limits:
-      max_beta_delta: 0
-      max_negative_vega: 0
-      min_daily_theta: 0
-      max_gamma: 10
+      # Near-zero short risk in crisis — vega must be flat or long
+      min_daily_theta_pct_nlv: 0.0 # no theta minimum in crisis
+      max_negative_vega_pct_nlv: 0.0 # no short vega allowed
+      max_spx_delta_pct_nlv: 0.0 # flat delta
+      max_gamma_pct_nlv: 0.00040 # some long gamma OK
+      # Legacy absolute fallbacks
+      legacy_min_daily_theta: 0
+      legacy_max_negative_vega: 0
+      legacy_max_beta_delta: 0
+      legacy_max_gamma: 10
+      # Non-Greek limits
       recession_probability_threshold: 0.4
       max_single_underlying_vega_pct: 0.40
       max_position_contracts: 10
@@ -64,3 +137,6 @@ regimes:
         - "Long Puts"
         - "Cash"
         - "Long Volatility"
+
+# Arbitrage fee estimate per leg (USD). Used by ArbHunter for EV calculations.
+arb_fee_per_leg: 0.65

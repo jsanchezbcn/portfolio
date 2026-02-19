@@ -91,7 +91,7 @@ def load_snapshot(client: ib.IBKRClient, snapshot_path: str) -> Tuple[List[Dict]
 
 
 async def _prefetch_greeks(client: ib.IBKRClient, accounts: List[Dict], positions_map: Dict[str, List[Dict]],
-                           cache_minutes: int = 5, force_refresh: bool = False, dry_run: bool = False) -> None:
+                           cache_minutes: int = 1, force_refresh: bool = False, dry_run: bool = False) -> None:
     """Prefetch Tastytrade options for only the contracts held in the portfolio."""
     per_underlying: Dict[str, Set[Tuple[str, float, str]]] = {}
 
@@ -131,7 +131,7 @@ async def _prefetch_greeks(client: ib.IBKRClient, accounts: List[Dict], position
 
 
 def refresh_greeks(client: ib.IBKRClient, accounts: List[Dict], positions_map: Dict[str, List[Dict]],
-                   cache_minutes: int = 5, force_refresh: bool = True, dry_run: bool = False) -> None:
+                   cache_minutes: int = 1, force_refresh: bool = True, dry_run: bool = False) -> None:
     if not ib.TASTYTRADE_AVAILABLE:
         print("Tastytrade package not available; cannot refresh Greeks.")
         return
@@ -143,7 +143,7 @@ def refresh_greeks(client: ib.IBKRClient, accounts: List[Dict], positions_map: D
 
 
 def show_summary_by_account(client: ib.IBKRClient, accounts: List[Dict], positions_map: Dict[str, List[Dict]],
-                            cache_minutes: int = 5) -> None:
+                            cache_minutes: int = 1) -> None:
     if not accounts:
         print("No accounts loaded. Fetch or load a snapshot first.")
         return
@@ -246,10 +246,10 @@ def main():
                 if not accounts:
                     print("Load accounts/positions first.")
                 else:
-                    refresh_greeks(client, accounts, positions_map, cache_minutes=5, force_refresh=True, dry_run=False)
+                    refresh_greeks(client, accounts, positions_map, cache_minutes=1, force_refresh=True, dry_run=False)
 
             elif choice == '4':
-                show_summary_by_account(client, accounts, positions_map, cache_minutes=5)
+                show_summary_by_account(client, accounts, positions_map, cache_minutes=1)
 
             elif choice == '5':
                 show_summary_per_instrument(client, accounts, positions_map)

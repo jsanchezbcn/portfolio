@@ -9,7 +9,7 @@ from agent_tools.alert_dispatcher import AlertDispatcher, build_default_dispatch
 from core.processor import DataProcessor
 from database.db_manager import DBManager, TradeEntry
 from models.unified_position import InstrumentType, UnifiedPosition
-from risk_engine.regime_detector import MarketRegime
+from risk_engine.regime_detector import MarketRegime, ResolvedLimits
 
 LOGGER = logging.getLogger(__name__)
 
@@ -59,86 +59,112 @@ class PortfolioTools:
         summary: dict,
         regime: MarketRegime,
         positions: list[UnifiedPosition] | None = None,
+        nlv: float | None = None,
     ) -> list[dict]:
         """Compare summary metrics with active regime limits and return violations.
 
+        Limits are resolved dynamically:
+        - When *nlv* is provided the NLV-relative ratios from the config are used
+          (so a $250k account gets ~10× looser absolute limits than a $25k account).
+        - VIX and term-structure scalers are baked into the regime at detection
+          time and applied automatically.
+        - If NLV is unknown the legacy absolute fallback values are used instead.
+
         Args:
             summary: Output of :meth:`get_portfolio_summary`.
-            regime: Active :class:`MarketRegime`.
-            positions: Optional list of positions — enables the per-position size check
-                (Issue 6) when provided.
+            regime: Active :class:`MarketRegime` (carries vix/ts scalers).
+            positions: Optional list — enables the per-position size check.
+            nlv: Account net liquidation value for NLV-relative scaling.
 
         Returns:
-            List of violation dicts.  Each dict has ``metric``, ``current``,
-            ``limit``, and ``message`` keys.  Also dispatches via
-            :attr:`dispatcher` when violations are found.
+            List of violation dicts with ``metric``, ``current``, ``limit``,
+            and ``message`` keys.  Also dispatches via :attr:`dispatcher`.
         """
 
         violations: list[dict] = []
 
-        if abs(summary["total_spx_delta"]) > regime.limits.max_beta_delta:
+        # Resolve effective (scaled) absolute limits for *this* NLV + market
+        eff: ResolvedLimits = regime.resolve_limits(nlv=nlv)
+
+        # ── helpers for human-readable context strings ─────────────────────
+        def _scale_ctx() -> str:
+            parts = []
+            if eff.is_nlv_scaled and eff.nlv_used:
+                parts.append(f"NLV ${eff.nlv_used:,.0f}")
+            if eff.vix_scaler != 1.0:
+                parts.append(f"VIX×{eff.vix_scaler:.2f}")
+            if eff.ts_scaler != 1.0:
+                parts.append(f"TS×{eff.ts_scaler:.2f}")
+            return f" [{', '.join(parts)}]" if parts else ""
+
+        ctx = _scale_ctx()
+
+        # ── SPX / Beta-weighted Delta ───────────────────────────────────────
+        if abs(summary["total_spx_delta"]) > eff.max_beta_delta:
             violations.append(
                 {
                     "metric": "SPX Delta",
                     "current": summary["total_spx_delta"],
-                    "limit": regime.limits.max_beta_delta,
-                    "message": "Directional risk exceeds regime limit",
+                    "limit": eff.max_beta_delta,
+                    "message": f"Directional risk exceeds regime limit{ctx}",
                 }
             )
 
-        # Issue 13: regime-aware vega violation message
-        if summary["total_vega"] < regime.limits.max_negative_vega:
+        # ── Vega ────────────────────────────────────────────────────────────
+        if summary["total_vega"] < eff.max_negative_vega:
             if regime.name == "crisis_mode":
-                vega_message = "Portfolio must be vega-neutral or long in crisis mode"
+                vega_message = f"Portfolio must be vega-neutral or long in crisis mode{ctx}"
             else:
-                vega_message = "Short volatility exposure exceeds limit"
+                vega_message = f"Short volatility exposure exceeds limit{ctx}"
             violations.append(
                 {
                     "metric": "Vega",
                     "current": summary["total_vega"],
-                    "limit": regime.limits.max_negative_vega,
+                    "limit": eff.max_negative_vega,
                     "message": vega_message,
                 }
             )
 
-        if summary["total_theta"] < regime.limits.min_daily_theta:
+        # ── Theta ───────────────────────────────────────────────────────────
+        if summary["total_theta"] < eff.min_daily_theta:
             violations.append(
                 {
                     "metric": "Theta",
                     "current": summary["total_theta"],
-                    "limit": regime.limits.min_daily_theta,
-                    "message": "Daily theta collection below minimum",
+                    "limit": eff.min_daily_theta,
+                    "message": f"Daily theta collection below minimum{ctx}",
                 }
             )
 
-        if abs(summary["total_gamma"]) > regime.limits.max_gamma:
+        # ── Gamma ───────────────────────────────────────────────────────────
+        if abs(summary["total_gamma"]) > eff.max_gamma:
             violations.append(
                 {
                     "metric": "Gamma",
                     "current": summary["total_gamma"],
-                    "limit": regime.limits.max_gamma,
-                    "message": "Gamma exposure exceeds regime limit",
+                    "limit": eff.max_gamma,
+                    "message": f"Gamma exposure exceeds regime limit{ctx}",
                 }
             )
 
-        # Issue 6: per-position contract size check
+        # ── Per-position contract size ──────────────────────────────────────
         if positions is not None:
             for pos in positions:
-                if abs(pos.quantity) > regime.limits.max_position_contracts:
+                if abs(pos.quantity) > eff.max_position_contracts:
                     violations.append(
                         {
                             "metric": "Position Size",
                             "symbol": pos.symbol,
                             "current": pos.quantity,
-                            "limit": regime.limits.max_position_contracts,
+                            "limit": eff.max_position_contracts,
                             "message": (
                                 f"{pos.symbol} has {abs(pos.quantity):.0f} contracts"
-                                f" (limit {regime.limits.max_position_contracts})"
+                                f" (limit {eff.max_position_contracts})"
                             ),
                         }
                     )
 
-        # Issue 4: auto-dispatch whenever violations are found
+        # Dispatch whenever violations are found
         if violations:
             self.dispatcher.dispatch(f"Risk check [{regime.name}]", violations)
 

@@ -176,11 +176,73 @@ class DBManager:
         CREATE INDEX IF NOT EXISTS idx_greek_snapshots_lookup ON greek_snapshots (broker, account_id, contract_key, event_time DESC);
         """
 
+        # T004: staged_orders — orders staged in TWS with transmit=False
+        create_staged_orders = """
+        CREATE TABLE IF NOT EXISTS staged_orders (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tws_order_id TEXT,
+            account_id TEXT NOT NULL,
+            instrument_type TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            expiration DATE,
+            strike NUMERIC,
+            quantity NUMERIC NOT NULL,
+            direction TEXT NOT NULL,
+            limit_price NUMERIC,
+            status TEXT NOT NULL DEFAULT 'STAGED',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+
+        # T005: market_intel — sentiment records written by NewsSentry
+        create_market_intel = """
+        CREATE TABLE IF NOT EXISTS market_intel (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            trade_id UUID,
+            symbol TEXT NOT NULL,
+            source TEXT NOT NULL,
+            content TEXT NOT NULL,
+            sentiment_score DOUBLE PRECISION,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_market_intel_symbol ON market_intel (symbol, created_at DESC);
+        """
+
+        # T006: signals — arbitrage opportunity signals from ArbHunter
+        create_signals = """
+        CREATE TABLE IF NOT EXISTS signals (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            signal_type TEXT NOT NULL,
+            legs_json JSONB NOT NULL DEFAULT '{}'::JSONB,
+            net_value NUMERIC,
+            confidence DOUBLE PRECISION,
+            status TEXT NOT NULL DEFAULT 'ACTIVE',
+            detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_signals_status ON signals (status, detected_at DESC);
+        """
+
+        # T007: trade_journal — entry context for ExplainPerformanceSkill
+        create_trade_journal = """
+        CREATE TABLE IF NOT EXISTS trade_journal (
+            trade_id UUID PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            entry_greeks_json JSONB NOT NULL DEFAULT '{}'::JSONB,
+            thesis TEXT,
+            entry_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+
         async with self._pool.acquire() as conn:
             await conn.execute(create_trades)
             await conn.execute(create_snapshots_parent)
             await conn.execute(create_partition)
             await conn.execute(create_indexes)
+            await conn.execute(create_staged_orders)
+            await conn.execute(create_market_intel)
+            await conn.execute(create_signals)
+            await conn.execute(create_trade_journal)
 
     async def start_background_flush(self) -> None:
         if self._flush_task and not self._flush_task.done():
@@ -352,3 +414,315 @@ class DBManager:
     @staticmethod
     def as_dict(record: GreekSnapshotRecord) -> dict[str, Any]:
         return asdict(record)
+
+    # ------------------------------------------------------------------ #
+    # T016 — staged_orders                                                 #
+    # ------------------------------------------------------------------ #
+
+    async def insert_staged_order(
+        self,
+        *,
+        tws_order_id: str | None,
+        account_id: str,
+        instrument_type: str,
+        symbol: str,
+        quantity: float,
+        direction: str,
+        limit_price: float | None = None,
+        expiration: date | None = None,
+        strike: float | None = None,
+        status: str = "STAGED",
+    ) -> str:
+        """Insert a staged order record and return the new UUID as a string."""
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        query = """
+        INSERT INTO staged_orders
+            (tws_order_id, account_id, instrument_type, symbol, expiration,
+             strike, quantity, direction, limit_price, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        RETURNING id::TEXT;
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                query,
+                tws_order_id,
+                account_id,
+                instrument_type,
+                symbol,
+                expiration,
+                strike,
+                quantity,
+                direction,
+                limit_price,
+                status,
+            )
+        return row["id"]  # type: ignore[index]
+
+    # ------------------------------------------------------------------ #
+    # T025 — market_intel                                                  #
+    # ------------------------------------------------------------------ #
+
+    async def insert_market_intel(
+        self,
+        *,
+        symbol: str,
+        source: str,
+        content: str,
+        sentiment_score: float | None = None,
+        trade_id: str | None = None,
+    ) -> str:
+        """Insert a sentiment/news record and return the new UUID as a string."""
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        query = """
+        INSERT INTO market_intel (trade_id, symbol, source, content, sentiment_score)
+        VALUES ($1::UUID, $2, $3, $4, $5)
+        RETURNING id::TEXT;
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                query,
+                trade_id,
+                symbol,
+                source,
+                content,
+                sentiment_score,
+            )
+        return row["id"]  # type: ignore[index]
+
+    async def get_market_intel_for_trade(
+        self, trade_id: str, *, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Return recent market_intel rows associated with *trade_id*."""
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        query = """
+        SELECT id::TEXT, trade_id::TEXT, symbol, source, content, sentiment_score, created_at
+        FROM market_intel
+        WHERE trade_id = $1::UUID
+        ORDER BY created_at DESC
+        LIMIT $2;
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(query, trade_id, limit)
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # T035 — signals                                                       #
+    # ------------------------------------------------------------------ #
+
+    async def insert_signal(
+        self,
+        *,
+        signal_type: str,
+        legs_json: dict[str, Any],
+        net_value: float | None = None,
+        confidence: float | None = None,
+        status: str = "ACTIVE",
+    ) -> str:
+        """Insert an arbitrage signal record and return the new UUID as a string."""
+        import json as _json
+
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        query = """
+        INSERT INTO signals (signal_type, legs_json, net_value, confidence, status)
+        VALUES ($1, $2::JSONB, $3, $4, $5)
+        RETURNING id::TEXT;
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                query,
+                signal_type,
+                _json.dumps(legs_json),
+                net_value,
+                confidence,
+                status,
+            )
+        return row["id"]  # type: ignore[index]
+
+    async def expire_stale_signals(self, *, active_ids: list[str]) -> int:
+        """Mark all ACTIVE signals whose IDs are NOT in *active_ids* as 'EXPIRED'.
+
+        Returns the number of rows updated.
+        """
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        query = """
+        UPDATE signals
+        SET status = 'EXPIRED', updated_at = NOW()
+        WHERE status = 'ACTIVE'
+          AND ($1::UUID[] IS NULL OR id <> ALL($1::UUID[]))
+        """
+        # Pass None when no active IDs to expire everything active.
+        ids_param: list[str] | None = active_ids if active_ids else None
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(query, ids_param)
+        # asyncpg returns e.g. "UPDATE 3" — parse the count.
+        try:
+            return int(result.split()[-1])
+        except (AttributeError, IndexError, ValueError):
+            return 0
+
+    # ------------------------------------------------------------------ #
+    # T007b / T046 — trade_journal                                        #
+    # ------------------------------------------------------------------ #
+
+    async def insert_trade_journal_entry(
+        self,
+        *,
+        trade_id: str,
+        symbol: str,
+        entry_greeks_json: dict[str, Any],
+        thesis: str | None = None,
+    ) -> None:
+        """Insert (or upsert) a trade_journal row for *trade_id*."""
+        import json as _json
+
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        query = """
+        INSERT INTO trade_journal (trade_id, symbol, entry_greeks_json, thesis)
+        VALUES ($1::UUID, $2, $3::JSONB, $4)
+        ON CONFLICT (trade_id) DO UPDATE
+            SET entry_greeks_json = EXCLUDED.entry_greeks_json,
+                thesis = EXCLUDED.thesis;
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                query,
+                trade_id,
+                symbol,
+                _json.dumps(entry_greeks_json),
+                thesis,
+            )
+
+    async def get_trade_journal_entry(self, trade_id: str) -> dict[str, Any] | None:
+        """Return the trade_journal row for *trade_id*, or None if not found."""
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        query = """
+        SELECT trade_id::TEXT, symbol, entry_greeks_json, thesis, entry_at
+        FROM trade_journal
+        WHERE trade_id = $1::UUID;
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(query, trade_id)
+        return dict(row) if row else None
+
+    # ------------------------------------------------------------------ #
+    # Dashboard read helpers                                               #
+    # ------------------------------------------------------------------ #
+
+    async def get_recent_market_intel(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Return the most recent *limit* market_intel rows across all symbols."""
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        query = """
+        SELECT id::TEXT, trade_id::TEXT, symbol, source, content, sentiment_score, created_at
+        FROM market_intel
+        ORDER BY created_at DESC
+        LIMIT $1;
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(query, limit)
+        return [dict(r) for r in rows]
+
+    async def upsert_market_intel(
+        self,
+        *,
+        symbol: str,
+        source: str,
+        sentiment_score: float | None = None,
+        summary: str = "",
+        raw_data: dict[str, Any] | None = None,
+    ) -> str:
+        """Insert or replace the single latest record for (symbol, source).
+
+        Keeps only the most recent row per (symbol, source) by deleting
+        any existing row first, then inserting a fresh one.  Used by
+        LLM agents (llm_risk_audit, llm_brief) that maintain one live
+        result per source rather than an append-only log.
+
+        Returns the new UUID as a string.
+        """
+        import json as _json
+
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        delete_query = """
+        DELETE FROM market_intel
+        WHERE symbol = $1 AND source = $2;
+        """
+        insert_query = """
+        INSERT INTO market_intel (symbol, source, content, sentiment_score)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id::TEXT;
+        """
+        content = summary
+        if raw_data:
+            # Encode raw_data as JSON and append to content for easy recovery
+            try:
+                content = _json.dumps(raw_data)
+            except (TypeError, ValueError):
+                content = summary
+        async with self._pool.acquire() as conn:
+            await conn.execute(delete_query, symbol, source)
+            row = await conn.fetchrow(insert_query, symbol, source, content, sentiment_score)
+        return row["id"]  # type: ignore[index]
+
+    async def get_market_intel_by_source(
+        self, source: str, *, symbol: str | None = None, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """Return the most recent rows for a given *source*, optionally filtered by *symbol*."""
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        if symbol:
+            query = """
+            SELECT id::TEXT, symbol, source, content, sentiment_score, created_at
+            FROM market_intel
+            WHERE source = $1 AND symbol = $2
+            ORDER BY created_at DESC
+            LIMIT $3;
+            """
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(query, source, symbol, limit)
+        else:
+            query = """
+            SELECT id::TEXT, symbol, source, content, sentiment_score, created_at
+            FROM market_intel
+            WHERE source = $1
+            ORDER BY created_at DESC
+            LIMIT $2;
+            """
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(query, source, limit)
+        return [dict(r) for r in rows]
+
+    async def get_active_signals(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Return active (non-expired) arbitrage signals, newest first."""
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        query = """
+        SELECT id::TEXT, signal_type, legs_json, net_value, confidence, status,
+               detected_at, updated_at
+        FROM signals
+        WHERE status = 'ACTIVE'
+        ORDER BY detected_at DESC
+        LIMIT $1;
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(query, limit)
+        return [dict(r) for r in rows]

@@ -36,11 +36,13 @@ def test_check_risk_limits_detects_violations() -> None:
         "total_theta": 50,
         "total_gamma": 60,
     }
+    # Use legacy absolute fields so the test is independent of NLV
     regime = MarketRegime(
         name="low_volatility",
         condition="",
         description="",
         limits=RegimeLimits(
+            # NLV-relative ratios left at 0.0 so legacy fallbacks are used
             max_beta_delta=600,
             max_negative_vega=-500,
             min_daily_theta=100,
