@@ -11,7 +11,7 @@
 ### 1. Run deterministic analytics demo
 
 ```bash
-PYTHONPATH=. ./.venv/bin/python demo_us7_deterministic.py
+PYwTHONPATH=. ./.venv/bin/python demo_us7_deterministic.py
 ```
 
 Expected outcome: prints Theta/Vega ratio zone, gamma-by-DTE, and IV/HV edge signals.
@@ -32,29 +32,6 @@ chmod +x start_dashboard.sh && ./start_dashboard.sh
 
 Open `http://localhost:8506`.
 
-### 4. Streaming startup and recovery drill
-
-```bash
-PYTHONPATH=. ./.venv/bin/python debug_greeks_cli.py \
-	--account U2052408 \
-	--ibkr-stream-benchmark \
-	--ibkr-ws-url wss://localhost:5001/v1/api/ws \
-	--max-options 10 \
-	--stream-timeout-seconds 12 \
-	--output-prefix .ibkr_stream_u2052408_demo
-```
-
-Expected outcome:
-
-- Benchmark JSON/CSV artifacts are produced.
-- `connect_error` is `null` and websocket timing fields are populated.
-- If stream topic data is absent, heartbeat/system events still confirm connection health.
-
-Recovery check:
-
-- Restart IBKR gateway while benchmark is running, then rerun benchmark.
-- Confirm reconnection path succeeds without restarting the Python process.
-
 ## What to Show in UI
 
 - Regime banner with VIX/term-structure + macro probability
@@ -69,5 +46,4 @@ Recovery check:
 ```bash
 pkill -f 'streamlit run dashboard/app.py' || true
 rm -f .positions_snapshot_*.json .greeks_debug_*.json .greeks_debug_*.csv .greeks_debug_*.log
-rm -f .ibkr_stream_u2052408_demo.json .ibkr_stream_u2052408_demo.csv
 ```

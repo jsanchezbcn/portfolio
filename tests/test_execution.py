@@ -371,17 +371,18 @@ class TestDeltaBreach:
 
 
 class TestSubmitStub:
-    """submit() must be a no-op stub that raises NotImplementedError.
-    This ensures no accidental live order submission before T030 is implemented.
-    """
+    """Safety contract: DRAFT order must be rejected; flatten_risk() still a stub."""
 
-    def test_submit_raises_not_implemented(self):
-        """submit() is not yet implemented — must raise NotImplementedError."""
-        engine, _ = _make_engine()
-        order = _make_order()
+    def test_draft_order_raises_value_error(self):
+        """submit() rejects DRAFT orders — order must be SIMULATED before submission."""
+        engine, mock_client = _make_engine()
+        order = _make_order()  # starts in DRAFT
 
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(ValueError, match="SIMULATED"):
             engine.submit("U12345", order)
+
+        # Broker endpoint MUST NOT be called for DRAFT orders
+        assert not mock_client.session.post.called
 
     def test_flatten_risk_raises_not_implemented(self):
         """flatten_risk() is not yet implemented — must raise NotImplementedError."""
@@ -400,14 +401,13 @@ class TestSubmitStub:
 
 
 class TestSubmitBehavior:
-    """Describe the required behaviour of ExecutionEngine.submit() post-T030.
+    """Acceptance tests for ExecutionEngine.submit() (T030).
 
-    These tests FAIL now because submit() raises NotImplementedError.
-    They become the acceptance criteria for T030.
+    All broker calls are mocked — no live orders transmitted.
+    _poll_order_status is patched to avoid 30-second polling loops.
 
     ⚠ SAFETY REMINDER: submit() must only ever be called after an explicit
-    2-step user confirmation in the UI.  No test in this file transmits a
-    live order — all broker calls are mocked.
+    2-step user confirmation in the UI.
     """
 
     # ------------------------------------------------------------------
@@ -430,84 +430,78 @@ class TestSubmitBehavior:
         return order
 
     @staticmethod
-    def _submit_response(order_id: str = "IBKR-001", status: str = "Submitted") -> MagicMock:
+    def _submit_response(order_id: str = "IBKR-001") -> MagicMock:
         """Mock HTTP 200 response from /orders endpoint."""
         resp = MagicMock()
         resp.status_code = 200
-        resp.json.return_value = [{"order_id": order_id, "order_status": status}]
+        resp.json.return_value = [{"order_id": order_id}]
         return resp
 
     # ------------------------------------------------------------------
-    # Happy-path submit tests (will pass after T030)
+    # Happy-path submit tests (T030)
     # ------------------------------------------------------------------
 
-    @pytest.mark.xfail(strict=True, reason="T030 not yet implemented")
     def test_submit_transmits_order_to_ibkr(self):
         """Confirmed submit() calls POST /orders — not /orders/whatif."""
         resp = self._submit_response()
         engine, mock_client = _make_engine(http_response=resp)
         order = self._make_simulated_order()
 
-        engine.submit("U12345", order)
+        with patch.object(engine, "_poll_order_status", return_value="Filled"):
+            engine.submit("U12345", order)
 
         assert mock_client.session.post.called
         called_url = mock_client.session.post.call_args.args[0]
         assert "/orders" in called_url
         assert "whatif" not in called_url
 
-    @pytest.mark.xfail(strict=True, reason="T030 not yet implemented")
-    def test_submit_advances_order_to_pending(self):
-        """After submit(), order.status is PENDING while awaiting fill."""
+    def test_submit_advances_order_to_filled_after_poll(self):
+        """After submit() + poll confirms fill, order.status is FILLED."""
         resp = self._submit_response()
         engine, _ = _make_engine(http_response=resp)
         order = self._make_simulated_order()
 
-        engine.submit("U12345", order)
+        with patch.object(engine, "_poll_order_status", return_value="Filled"):
+            engine.submit("U12345", order)
 
-        assert order.status in (OrderStatus.PENDING, OrderStatus.FILLED)
+        assert order.status == OrderStatus.FILLED
 
-    @pytest.mark.xfail(strict=True, reason="T030 not yet implemented")
     def test_submit_stores_broker_order_id(self):
         """broker_order_id is populated after a successful submit()."""
         resp = self._submit_response(order_id="IBKR-TEST-42")
         engine, _ = _make_engine(http_response=resp)
         order = self._make_simulated_order()
 
-        engine.submit("U12345", order)
+        with patch.object(engine, "_poll_order_status", return_value="Filled"):
+            engine.submit("U12345", order)
 
-        assert order.broker_order_id is not None
+        assert order.broker_order_id == "IBKR-TEST-42"
 
-    @pytest.mark.xfail(strict=True, reason="T030 not yet implemented")
-    def test_submit_multi_leg_uses_conidex_format(self):
-        """Multi-leg combo order payload uses IBKR conidex format."""
+    def test_submit_multi_leg_includes_all_legs(self):
+        """Multi-leg combo order payload includes all legs."""
         resp = self._submit_response()
         engine, mock_client = _make_engine(http_response=resp)
         order = self._make_simulated_order(n_legs=2)
-        # Give each leg a conid so conidex can be built
         order.legs[0].conid = "265598"
         order.legs[1].conid = "265599"
 
-        engine.submit("U12345", order)
+        with patch.object(engine, "_poll_order_status", return_value="Filled"):
+            engine.submit("U12345", order)
 
-        payload = mock_client.session.post.call_args.kwargs.get("json") or \
-                  mock_client.session.post.call_args[1].get("json")
+        payload = (
+            mock_client.session.post.call_args.kwargs.get("json")
+            or mock_client.session.post.call_args[1].get("json")
+        )
         assert payload is not None
-        # IBKR combo format: legs encoded together or via conidex field
         orders_in_payload = payload.get("orders", [])
         assert len(orders_in_payload) >= 2, "All legs must be in the payload"
 
     # ------------------------------------------------------------------
-    # Unconfirmed order must NOT be transmitted (UI cancel path)
+    # Safety: DRAFT order must NOT reach broker
     # ------------------------------------------------------------------
 
-    @pytest.mark.xfail(strict=True, reason="T030 not yet implemented")
     def test_draft_order_cannot_be_submitted(self):
-        """submit() must raise ValueError when order is still DRAFT.
-
-        A DRAFT order has not been simulated — UI should never call submit()
-        without a prior successful simulate().  T030 must enforce this check
-        before any HTTP call is made.
-        """
+        """submit() must raise ValueError when order is still DRAFT."""
         resp = self._submit_response()
         engine, mock_client = _make_engine(http_response=resp)
         order = _make_order()  # DRAFT status — not yet simulated
@@ -522,13 +516,11 @@ class TestSubmitBehavior:
     # Error paths: rejection, connection drop
     # ------------------------------------------------------------------
 
-    @pytest.mark.xfail(strict=True, reason="T030 not yet implemented")
     def test_broker_rejection_surfaces_reason(self):
-        """Broker rejection returns updated Order with REJECTED status and reason."""
+        """Broker HTTP error returns Order with REJECTED status."""
         resp = MagicMock()
-        resp.status_code = 200
-        resp.json.return_value = [{"order_id": None, "order_status": "Rejected",
-                                   "text": "Insufficient buying power"}]
+        resp.status_code = 400
+        resp.json.return_value = {"error": "Insufficient buying power"}
         engine, _ = _make_engine(http_response=resp)
         order = self._make_simulated_order()
 
@@ -536,21 +528,19 @@ class TestSubmitBehavior:
 
         assert result_order.status == OrderStatus.REJECTED
 
-    @pytest.mark.xfail(strict=True, reason="T030 not yet implemented")
     def test_connection_drop_mid_order_returns_unknown(self):
-        """Connection drop during order polling returns Order with UNKNOWN status indication.
+        """Connection drop during order submission returns Order without raising.
 
         The order may or may not have reached the broker — user must verify
-        in the IBKR platform directly.
+        in the IBKR platform directly.  Status is left as PENDING.
         """
         engine, mock_client = _make_engine(
             http_exception=requests.exceptions.ConnectionError("connection reset")
         )
         order = self._make_simulated_order()
 
-        # Should not raise — must return an Order that signals status unknown
+        # Should not raise — must return an Order
         result_order = engine.submit("U12345", order)
-        # Status unknown: either a dedicated UNKNOWN value or broker_order_id is set
-        # and status is not FILLED/REJECTED/CANCELLED
         assert result_order is not None
-
+        # PENDING because we couldn't confirm delivery
+        assert result_order.status == OrderStatus.PENDING

@@ -1,0 +1,526 @@
+openapi: "3.0.3"
+info:
+  title: "003 Algo Execution Platform — Internal Python API"
+  description: |
+    Internal interfaces for the Algo Execution & Journaling Platform.
+    These are not HTTP endpoints exposed to external clients — they define the
+    Python method contracts between modules within the application.
+    Documented in OpenAPI format for consistency with other spec contracts.
+  version: "1.0.0"
+
+paths:
+
+  # ──────────────────────────────────────────────────────────────
+  # MODULE 1: Beta Weighter
+  # ──────────────────────────────────────────────────────────────
+
+  /beta_weighter/compute_portfolio_spx_delta:
+    post:
+      summary: "Compute full-portfolio SPX beta-weighted delta"
+      description: |
+        Iterates all positions, fetches beta from Tastytrade (primary) or yfinance
+        (fallback), applies the dollar-beta formula, and returns aggregate PortfolioGreeks.
+        Positions where beta cannot be fetched default to 1.0 and set beta_unavailable=True.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ComputeDeltaRequest"
+      responses:
+        "200":
+          description: "Successful computation"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PortfolioGreeks"
+        "503":
+          description: "SPX price unavailable — cannot normalise delta"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /beta_weighter/get_beta:
+    post:
+      summary: "Fetch beta for a single symbol"
+      description: |
+        Returns beta vs SPX for the given symbol.
+        Source chain: Tastytrade get_market_metrics → yfinance → beta_config.json → 1.0 default.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol:
+                  type: string
+                  example: "AAPL"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  symbol:    { type: string }
+                  beta:      { type: number, example: 1.14 }
+                  source:    { type: string, enum: ["tastytrade", "yfinance", "config", "default"] }
+                  unavailable: { type: boolean }
+
+  # ──────────────────────────────────────────────────────────────
+  # MODULE 2: Execution Engine (IBKR)
+  # ──────────────────────────────────────────────────────────────
+
+  /execution/simulate:
+    post:
+      summary: "Simulate a multi-leg order (what-if)"
+      description: |
+        Calls IBKR Client Portal POST /iserver/account/{acctId}/orders/whatif.
+        Fetches leg Greeks, computes projected post-trade Greeks.
+        Does NOT transmit any order.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SimulateRequest"
+      responses:
+        "200":
+          description: "Simulation result with margin impact and projected Greeks"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimulationResult"
+        "408":
+          description: "IBKR API timeout (>10s)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "IBKR gateway not reachable"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /execution/submit:
+    post:
+      summary: "Submit a simulated order to the broker"
+      description: |
+        Submits a previously simulated Order object to IBKR.
+        Requires Order.status == "SIMULATED" or raises ValueError.
+        Returns the broker order reference and status.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitRequest"
+      responses:
+        "200":
+          description: "Order accepted by broker"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitResult"
+        "400":
+          description: "Order not simulated or invalid state"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "IBKR gateway not reachable"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /execution/flatten_risk:
+    post:
+      summary: "Generate buy-to-close orders for all short option legs"
+      description: |
+        Scans current positions for short options.
+        Returns a list of Orders (status=DRAFT, type=MKT) — does NOT submit.
+        Caller must pass each order through submit() after user confirmation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account_id]
+              properties:
+                account_id: { type: string }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Order"
+                  message:
+                    type: string
+                    example: "Found 4 short option legs"
+
+  # ──────────────────────────────────────────────────────────────
+  # MODULE 3: Trade Journal
+  # ──────────────────────────────────────────────────────────────
+
+  /journal/record_fill:
+    post:
+      summary: "Record a completed trade fill in the journal"
+      description: |
+        Called automatically after broker confirms a fill.
+        Captures VIX, SPX price, regime, pre/post Greeks, and rationale.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RecordFillRequest"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  journal_id: { type: string, format: uuid }
+
+  /journal/query:
+    post:
+      summary: "Query trade journal with filters"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JournalQuery"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TradeJournalEntry"
+                  total: { type: integer }
+
+  /journal/export_csv:
+    post:
+      summary: "Export journal entries as CSV bytes"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JournalQuery"
+      responses:
+        "200":
+          content:
+            text/csv:
+              schema:
+                type: string
+                format: binary
+
+  # ──────────────────────────────────────────────────────────────
+  # MODULE 4: AI Risk Analyst
+  # ──────────────────────────────────────────────────────────────
+
+  /ai/suggest_trades:
+    post:
+      summary: "Request 3 trade suggestions for a risk breach"
+      description: |
+        Sends the breach context to the LLM and parses the structured JSON response.
+        Returns exactly 3 AITradeSuggestion objects.
+        If the LLM is unavailable, returns an empty list (never raises).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SuggestTradesRequest"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  suggestions:
+                    type: array
+                    minItems: 0
+                    maxItems: 3
+                    items:
+                      $ref: "#/components/schemas/AITradeSuggestion"
+                  llm_available: { type: boolean }
+
+  # ──────────────────────────────────────────────────────────────
+  # MODULE 5: Historical Snapshot Logger
+  # ──────────────────────────────────────────────────────────────
+
+  /snapshots/capture:
+    post:
+      summary: "Capture current account snapshot (called by background loop)"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account_id]
+              properties:
+                account_id: { type: string }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountSnapshot"
+
+  /snapshots/query:
+    post:
+      summary: "Query historical snapshots for charting"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnapshotQuery"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  snapshots:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AccountSnapshot"
+
+# ──────────────────────────────────────────────────────────────
+# SCHEMAS
+# ──────────────────────────────────────────────────────────────
+
+components:
+  schemas:
+
+    OrderLeg:
+      type: object
+      required: [conid, symbol, action, quantity, multiplier]
+      properties:
+        conid:      { type: integer, example: 265598 }
+        symbol:     { type: string, example: "SPX 260321P05200" }
+        action:     { type: string, enum: [BUY, SELL] }
+        quantity:   { type: integer, minimum: 1 }
+        right:      { type: string, enum: [C, P], nullable: true }
+        strike:     { type: number, nullable: true, example: 5200.0 }
+        expiry:     { type: string, nullable: true, example: "20260321" }
+        multiplier: { type: number, example: 100 }
+        delta:      { type: number, nullable: true }
+        gamma:      { type: number, nullable: true }
+        theta:      { type: number, nullable: true }
+        vega:       { type: number, nullable: true }
+
+    Order:
+      type: object
+      required: [id, account_id, legs, order_type, tif, status]
+      properties:
+        id:          { type: string, format: uuid }
+        account_id:  { type: string }
+        legs:
+          type: array
+          minItems: 1
+          maxItems: 4
+          items:
+            $ref: "#/components/schemas/OrderLeg"
+        order_type:  { type: string, enum: [LMT, MKT, MOC] }
+        limit_price: { type: number, nullable: true }
+        tif:         { type: string, enum: [DAY, GTC] }
+        status:
+          type: string
+          enum: [DRAFT, SIMULATED, PENDING, FILLED, REJECTED, CANCELLED]
+        user_rationale:  { type: string, default: "" }
+        ai_suggestion_id:{ type: string, format: uuid, nullable: true }
+        created_at:  { type: string, format: date-time }
+
+    SimulateRequest:
+      type: object
+      required: [account_id, order]
+      properties:
+        account_id: { type: string }
+        order:
+          $ref: "#/components/schemas/Order"
+
+    SimulationResult:
+      type: object
+      properties:
+        initial_margin_current:    { type: number }
+        initial_margin_change:     { type: number }
+        initial_margin_after:      { type: number }
+        maintenance_margin_change: { type: number }
+        equity_change:             { type: number }
+        projected_greeks:
+          $ref: "#/components/schemas/PortfolioGreeks"
+        simulated_at: { type: string, format: date-time }
+        broker_warn:  { type: string, nullable: true }
+
+    SubmitRequest:
+      type: object
+      required: [order]
+      properties:
+        order:
+          $ref: "#/components/schemas/Order"
+
+    SubmitResult:
+      type: object
+      properties:
+        broker_order_id: { type: string }
+        status:          { type: string, enum: [PENDING, FILLED, REJECTED] }
+
+    PortfolioGreeks:
+      type: object
+      properties:
+        timestamp:             { type: string, format: date-time }
+        spx_equiv_delta:       { type: number, example: -127.4 }
+        gamma:                 { type: number }
+        theta:                 { type: number }
+        vega:                  { type: number }
+        beta_unavailable_count:{ type: integer }
+
+    ComputeDeltaRequest:
+      type: object
+      required: [positions, spx_price]
+      properties:
+        positions:
+          type: array
+          items:
+            type: object
+            description: "UnifiedPosition objects from the adapter layer"
+        spx_price:
+          type: number
+          example: 5901.23
+
+    TradeJournalEntry:
+      type: object
+      properties:
+        id:               { type: string, format: uuid }
+        created_at:       { type: string, format: date-time }
+        broker:           { type: string }
+        account_id:       { type: string }
+        underlying:       { type: string }
+        strategy_tag:     { type: string, nullable: true }
+        status:           { type: string }
+        legs_json:        { type: array }
+        net_debit_credit: { type: number, nullable: true }
+        vix_at_fill:      { type: number, nullable: true }
+        spx_price_at_fill:{ type: number, nullable: true }
+        regime:           { type: string, nullable: true }
+        pre_greeks_json:  { type: object }
+        post_greeks_json: { type: object }
+        user_rationale:   { type: string, nullable: true }
+        ai_rationale:     { type: string, nullable: true }
+
+    RecordFillRequest:
+      type: object
+      required: [order, broker, account_id, pre_greeks, post_greeks]
+      properties:
+        order:
+          $ref: "#/components/schemas/Order"
+        broker:      { type: string }
+        account_id:  { type: string }
+        fill_prices: { type: object, description: "conid -> fill_price map" }
+        pre_greeks:
+          $ref: "#/components/schemas/PortfolioGreeks"
+        post_greeks:
+          $ref: "#/components/schemas/PortfolioGreeks"
+        vix_at_fill:      { type: number }
+        spx_price_at_fill:{ type: number }
+        regime:           { type: string }
+
+    JournalQuery:
+      type: object
+      properties:
+        account_id:   { type: string }
+        underlying:   { type: string, nullable: true }
+        regime:       { type: string, nullable: true }
+        from_date:    { type: string, format: date }
+        to_date:      { type: string, format: date }
+        limit:        { type: integer, default: 50 }
+        offset:       { type: integer, default: 0 }
+
+    SuggestTradesRequest:
+      type: object
+      required: [breach, portfolio_greeks, vix, regime]
+      properties:
+        breach:
+          type: object
+          properties:
+            breach_type:  { type: string }
+            metric:       { type: string }
+            threshold:    { type: number }
+            actual_value: { type: number }
+        portfolio_greeks:
+          $ref: "#/components/schemas/PortfolioGreeks"
+        vix:          { type: number }
+        regime:       { type: string }
+        theta_budget: { type: number, default: 0, description: "0 = no limit" }
+
+    AITradeSuggestion:
+      type: object
+      properties:
+        id:                    { type: string, format: uuid }
+        legs:
+          type: array
+          items:
+            $ref: "#/components/schemas/OrderLeg"
+        projected_delta_change: { type: number }
+        projected_theta_cost:   { type: number }
+        rationale:              { type: string }
+
+    AccountSnapshot:
+      type: object
+      properties:
+        id:              { type: string, format: uuid }
+        captured_at:     { type: string, format: date-time }
+        account_id:      { type: string }
+        broker:          { type: string }
+        net_liquidation: { type: number }
+        cash_balance:    { type: number }
+        spx_delta:       { type: number }
+        gamma:           { type: number }
+        theta:           { type: number }
+        vega:            { type: number }
+        delta_theta_ratio: { type: number, nullable: true }
+        vix:             { type: number }
+        spx_price:       { type: number }
+        regime:          { type: string }
+
+    SnapshotQuery:
+      type: object
+      required: [account_id]
+      properties:
+        account_id: { type: string }
+        from_date:  { type: string, format: date-time }
+        to_date:    { type: string, format: date-time }
+        limit:      { type: integer, default: 500 }
+
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:   { type: string }
+        message: { type: string }

@@ -69,23 +69,3 @@ Integration tests (require credentials/network):
 pre-commit install
 pre-commit run --all-files
 ```
-
----
-
-## AI Trading Agent — Environment Variables (002-ai-trading-agent)
-
-The following environment variables configure the AI trading agent subsystem:
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `NEWS_PROVIDER` | No | `alpaca` | News API to use: `alpaca` or `finnhub` |
-| `NEWS_API_KEY` | Yes (for live) | — | API key for Alpaca (`APCA-API-KEY-ID`) or Finnhub |
-| `NEWS_API_SECRET` | Alpaca only | — | Alpaca API secret key (`APCA-API-SECRET-KEY`) |
-| `LLM_MODEL` | No | `gpt-4o-mini` | OpenAI-compatible model name for sentiment scoring and trade explanation |
-| `OPENAI_API_KEY` | Yes (for live) | — | OpenAI API key (or GitHub Models token) |
-| `OPENAI_API_BASE` | No | OpenAI default | Override endpoint, e.g. GitHub Models: `https://models.inference.ai.azure.com` |
-| `NEWS_INTERVAL_SECONDS` | No | `900` | NewsSentry polling interval in seconds (default 15 min) |
-| `ARB_FEE_PER_LEG` | No | `0.65` | Override fe| `ARB_FEE_PER_LEG` | No | `0.65` | Override fe| `ARB_FEE_PER_LEG` | Noatr|x.ya| `ARB_FEE_PER_LEG` | No | `0.65` | Override fe| `ARB_FEE_PER_LEG` : polls news APIs and writes scored `SentimentRecord` to `market_intel` table
-- `agents/arb_hunter.py` — `ArbHunter`: scans option chains for Put-- `agents/arb_hunter.py` — `ArbHunter`: scans option chains for Put-- `agder_manager.py` — `OrderManager`: stages orders in IBKR TWS with `transmit=False` via Client Portal REST; persists to `staged_orders` table
-- `skills/explain_performance.py` — `Expla- `skills/explain_performance.py` — `Expla- `skills/explain_performance.py` — `Expla- `skills/explain_perfrders` — orders staged in TWS (never auto-transmitted)
-- `market_intel` — sentiment - `market_intel` — sentiment - `market_intel` — sentiment - `market_intel` — sentiment - `market_intel` —context (thesis + Greeks) for ExplainPerformanceSkill

@@ -5,9 +5,10 @@ SAFETY CONTRACT
 This module interacts with a LIVE IBKR brokerage account.
 
   simulate()      — READ-ONLY. Calls /orders/whatif only. Zero orders transmitted.
-  submit()        — LIVE ORDERS. Not yet implemented (T030).
-                    When implemented, MUST ONLY be called after explicit multi-step
-                    user confirmation in the UI. NEVER auto-triggered.
+  submit()        — LIVE ORDERS. REQUIRES explicit human approval (T031):
+                    - Order must be in SIMULATED status (else ValueError).
+                    - UI must have collected checkbox confirmation + button click.
+                    - NEVER auto-triggered by timers, loops, or reactive events.
   flatten_risk()  — LIVE ORDERS (batch). Not yet implemented (T066).
                     Requires a separate confirmation dialog before any call.
 
@@ -18,6 +19,7 @@ without an explicit, user-initiated confirmation step.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -222,24 +224,174 @@ class ExecutionEngine:
         return result
 
     # ------------------------------------------------------------------
-    # submit() — LIVE ORDER — NOT YET IMPLEMENTED (T030)
+    # submit() — LIVE ORDER (T030) — REQUIRES HUMAN APPROVAL
     # ------------------------------------------------------------------
 
     def submit(self, account_id: str, order: Order) -> Order:
-        """Submit a live order to IBKR.
+        """Submit a live order to IBKR after human approval.
 
-        ⚠ SAFETY: This method MUST only be called after the user has completed
-        a 2-step confirmation in the UI (preview → explicit "Confirm & Submit"
-        button click).  It must NEVER be called from an auto-trigger, loop,
-        or timer.
+        ⚠ SAFETY CONTRACT ⚠
+        ====================
+        This method MUST only be called after ALL of the following:
+          1. The order has been through simulate() and is in SIMULATED status.
+          2. The user has reviewed the order preview in the 2-step confirmation
+             modal (T031) and explicitly clicked "Confirm & Submit".
+          3. The UI has set the session-state approval flag.
 
-        Not yet implemented — stub raises ``NotImplementedError`` until T030.
+        This method MUST NEVER be called from auto-triggers, loops, or timers.
+
+        Parameters
+        ----------
+        account_id:
+            IBKR account ID (e.g. "U12345").
+        order:
+            The Order to submit. MUST be in OrderStatus.SIMULATED.
+
+        Returns
+        -------
+        Order
+            The same order, with status updated to FILLED, REJECTED, CANCELLED,
+            or left as PENDING if status is unknown (connection loss/timeout).
+
+        Raises
+        ------
+        ValueError
+            If order.status is not SIMULATED (safety guard against unreviewed orders).
         """
-        raise NotImplementedError(
-            "submit() is not yet implemented.  "
-            "Live execution requires T030 implementation + explicit UI confirmation.  "
-            "Do NOT wire this to any auto-trigger."
+        # ── Safety guard: must be post-simulation ────────────────────────────
+        if order.status != OrderStatus.SIMULATED:
+            raise ValueError(
+                f"Order must be in SIMULATED status before submission; "
+                f"current status: {order.status.value}.  "
+                f"Run simulate() first and complete the 2-step UI confirmation."
+            )
+
+        # ── Advance to PENDING ─────────────────────────────────────────────
+        order.transition_to(OrderStatus.PENDING)
+        order.submitted_at = datetime.utcnow()
+
+        url = (
+            f"{self._client.base_url}"
+            f"/v1/api/iserver/account/{account_id}/orders"
         )
+        payload = self._build_submit_payload(order)
+
+        logger.info(
+            "Submitting live order account=%s legs=%d type=%s",
+            account_id,
+            len(order.legs),
+            order.order_type.value,
+        )
+
+        # ── HTTP submission ──────────────────────────────────────────────────
+        try:
+            resp = self._client.session.post(
+                url, json=payload, verify=False, timeout=15
+            )
+        except requests.exceptions.Timeout:
+            logger.error(
+                "Order submission timed out (account=%s) — status unknown", account_id
+            )
+            return order  # PENDING; caller must verify in broker platform
+        except requests.exceptions.RequestException as exc:
+            logger.error(
+                "Order submission connection error (account=%s): %s", account_id, exc
+            )
+            return order  # PENDING; status unknown
+
+        # ── Non-200 from broker ──────────────────────────────────────────────
+        if resp.status_code not in (200, 201):
+            try:
+                err_body = resp.json()
+                reason = err_body.get("error") or err_body.get("message") or resp.text[:300]
+            except Exception:
+                reason = resp.text[:300]
+            logger.error(
+                "Order rejected HTTP %s (account=%s): %s",
+                resp.status_code,
+                account_id,
+                reason,
+            )
+            order.transition_to(OrderStatus.REJECTED)
+            order.rejection_reason = str(reason)
+            return order
+
+        # ── Parse submission response ─────────────────────────────────────────
+        try:
+            result_list = resp.json()
+        except Exception as exc:
+            logger.error("Could not parse order submission response: %s", exc)
+            return order  # PENDING; status unknown
+
+        # ── Handle IBKR interactive confirmation questions ────────────────────
+        # IBKR sometimes returns a list with an "id" + "message" asking for explicit
+        # acknowledgement of warnings.  We auto-answer "confirmed: True" since the
+        # human has already approved via the UI modal (T031).
+        if isinstance(result_list, list):
+            for item in result_list:
+                if item.get("id") and isinstance(item.get("message"), list):
+                    try:
+                        reply_id = item["id"]
+                        reply_url = (
+                            f"{self._client.base_url}"
+                            f"/v1/api/iserver/reply/{reply_id}"
+                        )
+                        logger.info(
+                            "Answering IBKR interactive confirmation: reply_id=%s",
+                            reply_id,
+                        )
+                        confirm_resp = self._client.session.post(
+                            reply_url,
+                            json={"confirmed": True},
+                            verify=False,
+                            timeout=10,
+                        )
+                        if confirm_resp.status_code == 200:
+                            result_list = confirm_resp.json()
+                    except Exception as exc:
+                        logger.warning(
+                            "IBKR reply confirmation failed: %s", exc
+                        )
+
+        # ── Extract broker_order_id ───────────────────────────────────────────
+        broker_order_id: Optional[str] = None
+        if isinstance(result_list, list) and result_list:
+            first = result_list[0]
+            broker_order_id = str(
+                first.get("order_id") or first.get("orderId") or ""
+            ) or None
+
+        if broker_order_id:
+            order.broker_order_id = broker_order_id
+            logger.info(
+                "Order accepted by broker: broker_order_id=%s", broker_order_id
+            )
+
+        # ── Poll for final status (up to 30 s) ────────────────────────────────
+        final_status = self._poll_order_status(
+            account_id, broker_order_id, timeout_seconds=30
+        )
+
+        if final_status in ("Filled", "Submitted"):  # Submitted = filled for MKT orders
+            order.transition_to(OrderStatus.FILLED)
+            order.filled_at = datetime.utcnow()
+            logger.info("Order %s FILLED", broker_order_id)
+        elif final_status in ("Cancelled",):
+            order.transition_to(OrderStatus.CANCELLED)
+            logger.info("Order %s CANCELLED", broker_order_id)
+        elif final_status in ("Rejected", "Inactive", "Error"):
+            order.transition_to(OrderStatus.REJECTED)
+            order.rejection_reason = f"Broker status: {final_status}"
+            logger.warning("Order %s REJECTED (status=%s)", broker_order_id, final_status)
+        else:
+            # Timeout or unknown — leave as PENDING so UI can alert the user
+            logger.warning(
+                "Order %s status unknown after polling — left as PENDING. "
+                "Verify in broker platform.",
+                broker_order_id,
+            )
+
+        return order
 
     # ------------------------------------------------------------------
     # flatten_risk() — BATCH LIVE ORDERS — NOT YET IMPLEMENTED (T066)
@@ -323,3 +475,104 @@ class ExecutionEngine:
             orders_list.append(entry)
 
         return {"orders": orders_list}
+
+    @staticmethod
+    def _build_submit_payload(order: Order) -> dict:
+        """Build the JSON body for ``POST /v1/api/iserver/account/{id}/orders`` (live).
+
+        Same structure as WhatIf payload but submitted to the execution endpoint.
+        """
+        orders_list: list[dict] = []
+
+        for leg in order.legs:
+            entry: dict = {
+                "side": leg.action.value,
+                "quantity": str(leg.quantity),
+                "orderType": order.order_type.value,
+                "tif": "DAY",
+            }
+            if leg.conid:
+                entry["conid"] = leg.conid
+            if leg.strike is not None:
+                entry["strike"] = str(leg.strike)
+            if leg.option_right is not None:
+                entry["right"] = leg.option_right.value
+
+            orders_list.append(entry)
+
+        return {"orders": orders_list}
+
+    def _poll_order_status(
+        self,
+        account_id: str,
+        broker_order_id: Optional[str],
+        timeout_seconds: int = 30,
+        poll_interval: float = 2.0,
+    ) -> Optional[str]:
+        """Poll IBKR order status until a terminal state is reached or timeout.
+
+        Terminal states: "Filled", "Cancelled", "Rejected", "Inactive".
+
+        Parameters
+        ----------
+        account_id:
+            The IBKR account ID.
+        broker_order_id:
+            The order ID returned by the submission response.
+        timeout_seconds:
+            Stop polling after this many seconds.
+        poll_interval:
+            Seconds between each status check.
+
+        Returns
+        -------
+        str | None
+            IBKR status string on success, or ``None`` if timeout / no broker_order_id.
+        """
+        if not broker_order_id:
+            return None
+
+        url = f"{self._client.base_url}/v1/api/iserver/account/orders"
+        deadline = time.monotonic() + timeout_seconds
+        _terminal = {"Filled", "Cancelled", "Rejected", "Inactive", "Error"}
+
+        while time.monotonic() < deadline:
+            try:
+                resp = self._client.session.get(
+                    url,
+                    params={"accountId": account_id},
+                    verify=False,
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    body = resp.json()
+                    orders = (
+                        body.get("orders", [])
+                        if isinstance(body, dict)
+                        else body
+                    )
+                    for o in (orders if isinstance(orders, list) else []):
+                        oid = str(
+                            o.get("orderId") or o.get("order_id") or ""
+                        )
+                        if oid == str(broker_order_id):
+                            status = (
+                                o.get("status") or o.get("order_status") or ""
+                            )
+                            if status in _terminal:
+                                return status
+                            # "PreSubmitted" → still waiting; continue polling
+            except Exception as exc:
+                logger.debug(
+                    "Order status poll failed (order=%s): %s", broker_order_id, exc
+                )
+            time.sleep(poll_interval)
+
+        logger.warning(
+            "Order status poll timed out after %ds (order=%s)",
+            timeout_seconds,
+            broker_order_id,
+        )
+        return None  # Status unknown
+
+

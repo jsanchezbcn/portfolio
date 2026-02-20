@@ -14,12 +14,14 @@ to call from any event-loop coroutine as long as you don't share a single
 """
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 import aiosqlite  # type: ignore[import]
 
@@ -75,9 +77,79 @@ class LocalStore:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS ix_mi_created ON market_intel(created_at);"
             )
+            await self._init_trade_journal(db)
+            await self._init_account_snapshots(db)
             await db.commit()
         self._initialised = True
         logger.info("LocalStore ready at %s", self._db_path)
+
+    async def _init_trade_journal(self, db: aiosqlite.Connection) -> None:
+        """Create trade_journal table and indexes (idempotent)."""
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_journal (
+                id                TEXT PRIMARY KEY,
+                created_at        TEXT NOT NULL,
+                broker            TEXT NOT NULL DEFAULT '',
+                account_id        TEXT NOT NULL DEFAULT '',
+                broker_order_id   TEXT,
+                underlying        TEXT NOT NULL DEFAULT '',
+                strategy_tag      TEXT,
+                status            TEXT NOT NULL DEFAULT 'FILLED',
+                legs_json         TEXT NOT NULL DEFAULT '[]',
+                net_debit_credit  REAL,
+                vix_at_fill       REAL,
+                spx_price_at_fill REAL,
+                regime            TEXT,
+                pre_greeks_json   TEXT NOT NULL DEFAULT '{}',
+                post_greeks_json  TEXT NOT NULL DEFAULT '{}',
+                user_rationale    TEXT,
+                ai_rationale      TEXT,
+                ai_suggestion_id  TEXT
+            );
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_tj_created_at ON trade_journal(created_at DESC);"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_tj_account ON trade_journal(account_id, created_at DESC);"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_tj_underlying ON trade_journal(underlying, created_at DESC);"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_tj_regime ON trade_journal(regime, created_at DESC);"
+        )
+
+    async def _init_account_snapshots(self, db: aiosqlite.Connection) -> None:
+        """Create account_snapshots table and indexes (idempotent)."""
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS account_snapshots (
+                id                TEXT PRIMARY KEY,
+                captured_at       TEXT NOT NULL,
+                account_id        TEXT NOT NULL DEFAULT '',
+                broker            TEXT NOT NULL DEFAULT '',
+                net_liquidation   REAL,
+                cash_balance      REAL,
+                spx_delta         REAL,
+                gamma             REAL,
+                theta             REAL,
+                vega              REAL,
+                delta_theta_ratio REAL,
+                vix               REAL,
+                spx_price         REAL,
+                regime            TEXT
+            );
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_as_captured_at ON account_snapshots(captured_at DESC);"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_as_account ON account_snapshots(account_id, captured_at DESC);"
+        )
 
     # ------------------------------------------------------------------ #
     # Write methods (same signatures as DBManager)                        #
@@ -226,6 +298,201 @@ class LocalStore:
                 LIMIT ?;
                 """,
                 (trade_id, limit),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # Trade Journal (003-algo-execution-platform)                        #
+    # ------------------------------------------------------------------ #
+
+    async def record_fill(self, entry: Any) -> str:
+        """Insert a trade fill into trade_journal and return its UUID.
+
+        Accepts a :class:`models.order.TradeJournalEntry` or any object with
+        matching attributes.  Uses REPLACE to handle duplicate broker_order_id
+        gracefully (idempotent re-delivery of the same fill).
+        """
+        await self._ensure_init()
+        entry_id = getattr(entry, "entry_id", None) or str(uuid.uuid4())
+        created_at = getattr(entry, "created_at", None) or datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO trade_journal (
+                    id, created_at, broker, account_id, broker_order_id,
+                    underlying, strategy_tag, status, legs_json,
+                    net_debit_credit, vix_at_fill, spx_price_at_fill, regime,
+                    pre_greeks_json, post_greeks_json,
+                    user_rationale, ai_rationale, ai_suggestion_id
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
+                """,
+                (
+                    entry_id,
+                    created_at,
+                    getattr(entry, "broker", ""),
+                    getattr(entry, "account_id", ""),
+                    getattr(entry, "broker_order_id", None),
+                    getattr(entry, "underlying", ""),
+                    getattr(entry, "strategy_tag", None),
+                    getattr(entry, "status", "FILLED"),
+                    getattr(entry, "legs_json", "[]"),
+                    getattr(entry, "net_debit_credit", None),
+                    getattr(entry, "vix_at_fill", None),
+                    getattr(entry, "spx_price_at_fill", None),
+                    getattr(entry, "regime", None),
+                    getattr(entry, "pre_greeks_json", "{}"),
+                    getattr(entry, "post_greeks_json", "{}"),
+                    getattr(entry, "user_rationale", None),
+                    getattr(entry, "ai_rationale", None),
+                    getattr(entry, "ai_suggestion_id", None),
+                ),
+            )
+            await db.commit()
+        logger.debug("Recorded fill %s for %s", entry_id, getattr(entry, "underlying", ""))
+        return entry_id
+
+    async def query_journal(
+        self,
+        *,
+        start_dt: Optional[str] = None,
+        end_dt: Optional[str] = None,
+        instrument: Optional[str] = None,
+        regime: Optional[str] = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Query trade_journal with optional filters.  Returns rows newest-first."""
+        await self._ensure_init()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if start_dt:
+            clauses.append("created_at >= ?")
+            params.append(start_dt)
+        if end_dt:
+            clauses.append("created_at <= ?")
+            params.append(end_dt)
+        if instrument:
+            clauses.append("(underlying LIKE ? OR legs_json LIKE ?)")
+            like = f"%{instrument}%"
+            params.extend([like, like])
+        if regime:
+            clauses.append("regime = ?")
+            params.append(regime)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"""
+                SELECT * FROM trade_journal
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?;
+                """,
+                params,
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    def export_csv(self, entries: list[dict[str, Any]]) -> str:
+        """Serialise a list of trade_journal row dicts to a CSV string."""
+        if not entries:
+            return ""
+        fieldnames = [
+            "id", "created_at", "broker", "account_id", "broker_order_id",
+            "underlying", "strategy_tag", "status", "legs_json",
+            "net_debit_credit", "vix_at_fill", "spx_price_at_fill", "regime",
+            "pre_greeks_json", "post_greeks_json",
+            "user_rationale", "ai_rationale", "ai_suggestion_id",
+        ]
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(entries)
+        return buf.getvalue()
+
+    # ------------------------------------------------------------------ #
+    # Account Snapshots (003-algo-execution-platform)                    #
+    # ------------------------------------------------------------------ #
+
+    async def capture_snapshot(self, snapshot: Any) -> str:
+        """Insert one account snapshot row and return its UUID."""
+        await self._ensure_init()
+        snap_id = getattr(snapshot, "snapshot_id", None) or str(uuid.uuid4())
+        captured_at = getattr(snapshot, "captured_at", None) or datetime.now(timezone.utc).isoformat()
+
+        # Pre-compute delta_theta_ratio from the snapshot's own theta/delta if not set
+        delta_theta_ratio = getattr(snapshot, "delta_theta_ratio", None)
+        if delta_theta_ratio is None:
+            spx_delta = getattr(snapshot, "spx_delta", None)
+            theta = getattr(snapshot, "theta", None)
+            if spx_delta and spx_delta != 0.0 and theta is not None:
+                delta_theta_ratio = theta / spx_delta
+
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO account_snapshots (
+                    id, captured_at, account_id, broker,
+                    net_liquidation, cash_balance,
+                    spx_delta, gamma, theta, vega, delta_theta_ratio,
+                    vix, spx_price, regime
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?);
+                """,
+                (
+                    snap_id,
+                    captured_at,
+                    getattr(snapshot, "account_id", ""),
+                    getattr(snapshot, "broker", ""),
+                    getattr(snapshot, "net_liquidation", None),
+                    getattr(snapshot, "cash_balance", None),
+                    getattr(snapshot, "spx_delta", None),
+                    getattr(snapshot, "gamma", None),
+                    getattr(snapshot, "theta", None),
+                    getattr(snapshot, "vega", None),
+                    delta_theta_ratio,
+                    getattr(snapshot, "vix", None),
+                    getattr(snapshot, "spx_price", None),
+                    getattr(snapshot, "regime", None),
+                ),
+            )
+            await db.commit()
+        logger.debug("Captured snapshot %s at %s", snap_id, captured_at)
+        return snap_id
+
+    async def query_snapshots(
+        self,
+        *,
+        start_dt: Optional[str] = None,
+        end_dt: Optional[str] = None,
+        account_id: Optional[str] = None,
+        limit: int = 10_000,
+    ) -> list[dict[str, Any]]:
+        """Query account_snapshots (ascending by captured_at for chart rendering)."""
+        await self._ensure_init()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if start_dt:
+            clauses.append("captured_at >= ?")
+            params.append(start_dt)
+        if end_dt:
+            clauses.append("captured_at <= ?")
+            params.append(end_dt)
+        if account_id:
+            clauses.append("account_id = ?")
+            params.append(account_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"""
+                SELECT * FROM account_snapshots
+                {where}
+                ORDER BY captured_at ASC
+                LIMIT ?;
+                """,
+                params,
             ) as cursor:
                 rows = await cursor.fetchall()
         return [dict(r) for r in rows]

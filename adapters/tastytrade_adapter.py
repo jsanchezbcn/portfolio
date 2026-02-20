@@ -6,7 +6,9 @@ from typing import Any
 import logging
 
 from adapters.base_adapter import BrokerAdapter
+from models.order import PortfolioGreeks
 from models.unified_position import InstrumentType, UnifiedPosition
+from risk_engine.beta_weighter import BetaWeighter
 
 
 LOGGER = logging.getLogger(__name__)
@@ -19,6 +21,10 @@ class TastytradeAdapter(BrokerAdapter):
         """Store the broker client dependency."""
 
         self.client = client
+        # BetaWeighter uses the Tastytrade session (if available) as primary beta source.
+        # The session is injected via ``client.session`` if present.
+        _tt_session = getattr(client, "session", None)
+        self._beta_weighter = BetaWeighter(tastytrade_session=_tt_session)
 
     async def fetch_positions(self, account_id: str) -> list[UnifiedPosition]:
         """Fetch account positions from Tastytrade and normalize schema."""
@@ -75,6 +81,20 @@ class TastytradeAdapter(BrokerAdapter):
             position.greeks_source = "tastytrade"
 
         return positions
+
+    async def compute_portfolio_greeks(
+        self,
+        positions: list[UnifiedPosition],
+        spx_price: float,
+    ) -> PortfolioGreeks:
+        """Aggregate all positions into a PortfolioGreeks snapshot using BetaWeighter.
+
+        Unlike the IBKR adapter, callers are responsible for supplying *spx_price*
+        because Tastytrade does not provide direct SPX quote access via the SDK.
+        When *spx_price* is 0 or negative, all SPX deltas are 0 and the caller
+        should surface an error state in the dashboard (T020).
+        """
+        return await self._beta_weighter.compute_portfolio_spx_delta(positions, spx_price)
 
     def _to_unified_position(self, position: dict[str, Any]) -> UnifiedPosition:
         """Transform raw Tastytrade position payload into UnifiedPosition."""
