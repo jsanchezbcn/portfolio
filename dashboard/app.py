@@ -435,13 +435,68 @@ def _fetch_llm_intel_cached(source: str, symbol: str | None = None) -> dict | No
         return None
 
 
+# ── Worker job dispatch helpers ────────────────────────────────────────────────
+
+def _dispatch_job(job_type: str, payload: dict | None = None) -> str | None:
+    """Enqueue a background worker job; return the job_id or None on error.
+
+    Non-blocking — safe to call from the Streamlit render thread.
+    """
+    import concurrent.futures
+
+    async def _enqueue():
+        from database.db_manager import DBManager
+        db = await DBManager.get_instance()
+        return await db.enqueue_job(job_type, payload or {})
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, _enqueue()).result(timeout=5)
+    except Exception as exc:
+        LOGGER.debug("dispatch_job(%s) failed: %s", job_type, exc)
+        return None
+
+
+def _get_job_result(job_type: str, max_age_seconds: float = 60) -> dict | None:
+    """Return the latest completed result for job_type if younger than max_age_seconds."""
+    import concurrent.futures
+
+    async def _fetch():
+        from database.db_manager import DBManager
+        db = await DBManager.get_instance()
+        return await db.get_latest_job_result(job_type, max_age_seconds=max_age_seconds)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, _fetch()).result(timeout=5)
+    except Exception as exc:
+        LOGGER.debug("get_job_result(%s) failed: %s", job_type, exc)
+        return None
+
+
+def _positions_from_dicts(position_dicts: list[dict]) -> list:
+    """Reconstruct UnifiedPosition dataclass instances from serialized dicts."""
+    from dataclasses import fields
+    from models.unified_position import UnifiedPosition
+
+    pos_fields = {f.name for f in fields(UnifiedPosition)}
+    positions = []
+    for d in position_dicts:
+        try:
+            filtered = {k: v for k, v in d.items() if k in pos_fields}
+            positions.append(UnifiedPosition(**filtered))
+        except Exception as exc:
+            LOGGER.debug("position deserialization skipped: %s", exc)
+    return positions
+
+
 def main() -> None:
     LOGGER.info("Starting dashboard run")
     st.set_page_config(page_title="Portfolio Risk Manager", page_icon="📊", layout="wide")
-    st.title("Portfolio Risk Manager")
 
     adapter, portfolio_tools, market_tools, regime_detector = get_services()
 
+    st.title("Portfolio Risk Manager")
     st.sidebar.header("Inputs")
     reload_accounts = st.sidebar.button("Reload Accounts")
     render_ibkr_login_button(adapter)
@@ -455,13 +510,12 @@ def main() -> None:
         col_restart, col_stop = st.columns(2)
         with col_restart:
             if st.button("Restart Portal", help="Stop + restart the IBKR Client Portal gateway"):
-                with st.spinner("Restarting Client Portal…"):
-                    ok = adapter.client.restart_gateway()
-                if ok:
-                    st.success("Portal restarted — please re-authenticate.")
+                _job_id = _dispatch_job("restart_gateway", {})
+                if _job_id:
+                    st.info("⏳ Gateway restart dispatched to worker. Check back in ~30s.")
                     st.markdown("[Open login page](https://localhost:5001)")
                 else:
-                    st.error("Restart timed out. Check logs below.")
+                    st.error("Could not dispatch restart job. Is the worker running?")
         with col_stop:
             if st.button("Stop Portal", help="Gracefully stop the gateway process"):
                 adapter.client.stop_gateway()
@@ -565,63 +619,90 @@ def main() -> None:
         fallback_saved_at = None
         st.session_state["greeks_refresh_fallback"] = False
         st.session_state["greeks_refresh_fallback_reason"] = ""
-        if refresh or positions is None or previous_account != account_id:
-            fetched_positions = asyncio.run(adapter.fetch_positions(account_id))
-            if fetched_positions:
-                positions = fetched_positions
-                save_positions_snapshot(account_id, positions)
-                data_refresh["positions"] = _safe_iso_now()
-            elif use_cached_fallback:
-                cached_positions, fallback_saved_at = load_positions_snapshot(account_id)
-                positions = cached_positions
-                if fallback_saved_at:
-                    data_refresh["positions"] = fallback_saved_at
-            else:
-                positions = []
-                data_refresh["positions"] = _safe_iso_now()
-            positions = st.session_state["positions"] = positions
-            st.session_state["selected_account"] = account_id
-            st.session_state["fallback_saved_at"] = fallback_saved_at
-        else:
-            fallback_saved_at = st.session_state.get("fallback_saved_at")
 
-        # Always enrich greeks via fetch_greeks. When ibkr_only_mode=True the
-        # adapter flags above ensure only IBKR snapshot is used (no Tastytrade),
-        # exactly matching CLI behaviour with --ibkr-only.
-        if positions:
-            positions = asyncio.run(adapter.fetch_greeks(positions))
+        # ── Worker-based greeks fetch ─────────────────────────────────────────
+        # Try to get positions+greeks from the latest completed worker job.
+        # This avoids blocking the Streamlit render thread on heavy I/O.
+        _worker_result = _get_job_result("fetch_greeks", max_age_seconds=120)
+        _worker_positions = (
+            _positions_from_dicts(_worker_result["positions"])
+            if _worker_result and _worker_result.get("positions")
+            else None
+        )
+
+        if _worker_positions:
+            # Fresh result from worker — no blocking needed
+            positions = _worker_positions
+            data_refresh["positions"] = _safe_iso_now()
             data_refresh["greeks"] = _safe_iso_now()
+            st.session_state["positions"] = positions
+            st.session_state["selected_account"] = account_id
+            st.session_state["fallback_saved_at"] = None
+            fallback_saved_at = None
+            # Dispatch a new job if the result is getting stale or refresh was requested
+            _stale = _get_job_result("fetch_greeks", max_age_seconds=60) is None
+            if refresh or _stale or previous_account != account_id:
+                _dispatch_job("fetch_greeks", {"account_id": account_id, "ibkr_only": ibkr_only_mode})
+        else:
+            # No fresh worker result — dispatch job for future renders, then
+            # fall back to the blocking path so the page still loads with data.
+            _dispatch_job("fetch_greeks", {"account_id": account_id, "ibkr_only": ibkr_only_mode})
 
-            options_count = sum(1 for position in positions if position.instrument_type.name == "OPTION")
-            greeks_status = getattr(adapter, "last_greeks_status", {})
-            cache_miss_count = int(greeks_status.get("cache_miss_count", 0))
-            miss_ratio = (cache_miss_count / options_count) if options_count else 0.0
+            if refresh or positions is None or previous_account != account_id:
+                fetched_positions = asyncio.run(adapter.fetch_positions(account_id))
+                if fetched_positions:
+                    positions = fetched_positions
+                    save_positions_snapshot(account_id, positions)
+                    data_refresh["positions"] = _safe_iso_now()
+                elif use_cached_fallback:
+                    cached_positions, fallback_saved_at = load_positions_snapshot(account_id)
+                    positions = cached_positions
+                    if fallback_saved_at:
+                        data_refresh["positions"] = fallback_saved_at
+                else:
+                    positions = []
+                    data_refresh["positions"] = _safe_iso_now()
+                positions = st.session_state["positions"] = positions
+                st.session_state["selected_account"] = account_id
+                st.session_state["fallback_saved_at"] = fallback_saved_at
+            else:
+                fallback_saved_at = st.session_state.get("fallback_saved_at")
 
-            previous_positions_list = previous_positions_for_account if isinstance(previous_positions_for_account, list) else []
-            can_reuse_previous = (
-                refresh
-                and previous_account == account_id
-                and use_cached_fallback
-                and bool(previous_positions_list)
-            )
+            # Enrich with greeks (blocking fallback path only)
+            if positions:
+                positions = asyncio.run(adapter.fetch_greeks(positions))
+                data_refresh["greeks"] = _safe_iso_now()
 
-            if can_reuse_previous and options_count > 0 and miss_ratio >= 0.8:
-                previous_option_positions = [
-                    p for p in previous_positions_list if p.instrument_type.name == "OPTION"
-                ]
-                previous_has_nonzero_greeks = any(
-                    abs(float(getattr(p, "theta", 0.0))) > 0.0
-                    or abs(float(getattr(p, "vega", 0.0))) > 0.0
-                    or abs(float(getattr(p, "gamma", 0.0))) > 0.0
-                    for p in previous_option_positions
+                options_count = sum(1 for position in positions if position.instrument_type.name == "OPTION")
+                greeks_status = getattr(adapter, "last_greeks_status", {})
+                cache_miss_count = int(greeks_status.get("cache_miss_count", 0))
+                miss_ratio = (cache_miss_count / options_count) if options_count else 0.0
+
+                previous_positions_list = previous_positions_for_account if isinstance(previous_positions_for_account, list) else []
+                can_reuse_previous = (
+                    refresh
+                    and previous_account == account_id
+                    and use_cached_fallback
+                    and bool(previous_positions_list)
                 )
-                if previous_has_nonzero_greeks:
-                    positions = previous_positions_list
-                    st.session_state["greeks_refresh_fallback"] = True
-                    st.session_state["greeks_refresh_fallback_reason"] = (
-                        f"Latest refresh had {cache_miss_count}/{options_count} missing option Greeks; "
-                        "reusing previous in-session snapshot."
+
+                if can_reuse_previous and options_count > 0 and miss_ratio >= 0.8:
+                    previous_option_positions = [
+                        p for p in previous_positions_list if p.instrument_type.name == "OPTION"
+                    ]
+                    previous_has_nonzero_greeks = any(
+                        abs(float(getattr(p, "theta", 0.0))) > 0.0
+                        or abs(float(getattr(p, "vega", 0.0))) > 0.0
+                        or abs(float(getattr(p, "gamma", 0.0))) > 0.0
+                        for p in previous_option_positions
                     )
+                    if previous_has_nonzero_greeks:
+                        positions = previous_positions_list
+                        st.session_state["greeks_refresh_fallback"] = True
+                        st.session_state["greeks_refresh_fallback_reason"] = (
+                            f"Latest refresh had {cache_miss_count}/{options_count} missing option Greeks; "
+                            "reusing previous in-session snapshot."
+                        )
 
         if positions:
             save_positions_snapshot(account_id, positions)
@@ -1193,19 +1274,22 @@ def main() -> None:
         else:
             st.info("No market brief available.")
 
-    if st.button("📰 Refresh Brief", help="Request a fresh LLM market brief now"):
-        with st.spinner("Generating market brief..."):
-            try:
-                from agents.llm_market_brief import LLMMarketBrief
-                from database.db_manager import DBManager
-                _brief_db = DBManager()
-                brief_agent = LLMMarketBrief(db=_brief_db)
-                _run_async(brief_agent.brief_now())
-                _fetch_llm_intel_cached.clear()
-                st.success("Market brief refreshed.")
-                st.rerun()
-            except Exception as _exc:
-                st.warning(f"Brief refresh failed: {_exc}")
+    if st.button("📰 Refresh Brief", help="Request a fresh LLM market brief from worker"):
+        _brief_payload = {
+            "vix": float(vix_data.get("vix", 20.0)),
+            "vix3m": float(vix_data.get("vix3m") or 21.0),
+            "term_structure": float(vix_data.get("term_structure", 1.05)),
+            "regime_name": regime.name if hasattr(regime, "name") else str(regime),
+            "recession_probability": vix_data.get("recession_probability"),
+            "portfolio_summary": summary,
+            "nlv": st.session_state.get("_last_nlv"),
+        }
+        _bid = _dispatch_job("llm_brief", _brief_payload)
+        if _bid:
+            _fetch_llm_intel_cached.clear()
+            st.info("⏳ Market brief requested — worker is generating it. Refresh in ~30s.")
+        else:
+            st.warning("Could not dispatch brief job. Is the worker running?")
 
     # ── Arbitrage Signals ─────────────────────────────────────────────
     st.subheader("Arbitrage Signals")

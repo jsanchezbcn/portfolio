@@ -234,6 +234,22 @@ class DBManager:
         );
         """
 
+        # T008: worker_jobs — async job queue for background workers
+        create_worker_jobs = """
+        CREATE TABLE IF NOT EXISTS worker_jobs (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            job_type TEXT NOT NULL,
+            payload JSONB NOT NULL DEFAULT '{}'::JSONB,
+            status TEXT NOT NULL DEFAULT 'pending',
+            result JSONB,
+            error TEXT,
+            worker_id TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_worker_jobs_status ON worker_jobs (job_type, status, created_at DESC);
+        """
+
         async with self._pool.acquire() as conn:
             await conn.execute(create_trades)
             await conn.execute(create_snapshots_parent)
@@ -243,6 +259,7 @@ class DBManager:
             await conn.execute(create_market_intel)
             await conn.execute(create_signals)
             await conn.execute(create_trade_journal)
+            await conn.execute(create_worker_jobs)
 
     async def start_background_flush(self) -> None:
         if self._flush_task and not self._flush_task.done():
@@ -726,3 +743,142 @@ class DBManager:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(query, limit)
         return [dict(r) for r in rows]
+
+    # ── Worker job queue ──────────────────────────────────────────────────────
+
+    async def enqueue_job(
+        self,
+        job_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> str:
+        """Insert a new pending job; return the UUID as a string."""
+        import json as _json
+
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        payload_str = _json.dumps(payload or {})
+        query = """
+        INSERT INTO worker_jobs (job_type, payload, status, created_at, updated_at)
+        VALUES ($1, $2::JSONB, 'pending', NOW(), NOW())
+        RETURNING id::TEXT;
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(query, job_type, payload_str)
+        return row["id"]  # type: ignore[index]
+
+    async def claim_next_job(self, worker_id: str) -> dict[str, Any] | None:
+        """Atomically claim the oldest pending job; return the row or None."""
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        query = """
+        UPDATE worker_jobs
+        SET status = 'running', worker_id = $1, updated_at = NOW()
+        WHERE id = (
+            SELECT id FROM worker_jobs
+            WHERE status = 'pending'
+            ORDER BY created_at ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        )
+        RETURNING id::TEXT, job_type, payload, status, worker_id, created_at, updated_at;
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(query, worker_id)
+        if row is None:
+            return None
+        d = dict(row)
+        # asyncpg returns JSONB as a dict already; normalize
+        if isinstance(d.get("payload"), str):
+            import json as _json
+            d["payload"] = _json.loads(d["payload"])
+        return d
+
+    async def complete_job(self, job_id: str, result: dict[str, Any]) -> None:
+        """Mark a running job as done and store the result."""
+        import json as _json
+
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        result_str = _json.dumps(result)
+        query = """
+        UPDATE worker_jobs
+        SET status = 'done', result = $2::JSONB, updated_at = NOW()
+        WHERE id = $1::UUID;
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute(query, job_id, result_str)
+
+    async def fail_job(self, job_id: str, error: str) -> None:
+        """Mark a running job as error."""
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        query = """
+        UPDATE worker_jobs
+        SET status = 'error', error = $2, updated_at = NOW()
+        WHERE id = $1::UUID;
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute(query, job_id, error)
+
+    async def get_latest_job_result(
+        self, job_type: str, *, max_age_seconds: float = 60
+    ) -> dict[str, Any] | None:
+        """Return the result JSON of the most recently completed job of the given type,
+        or None if no such job exists within max_age_seconds."""
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        query = """
+        SELECT result
+        FROM worker_jobs
+        WHERE job_type = $1
+          AND status = 'done'
+          AND updated_at >= NOW() - ($2 || ' seconds')::INTERVAL
+        ORDER BY updated_at DESC
+        LIMIT 1;
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(query, job_type, str(int(max_age_seconds)))
+        if row is None or row["result"] is None:
+            return None
+        result = row["result"]
+        if isinstance(result, str):
+            import json as _json
+            result = _json.loads(result)
+        return result
+
+    async def get_job_status(self, job_id: str) -> dict[str, Any] | None:
+        """Return status/result/error for a specific job id."""
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        query = """
+        SELECT id::TEXT, job_type, status, result, error, worker_id, created_at, updated_at
+        FROM worker_jobs
+        WHERE id = $1::UUID;
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(query, job_id)
+        return dict(row) if row else None
+
+    async def cleanup_old_jobs(self, *, max_age_hours: int = 24) -> int:
+        """Delete done/error jobs older than max_age_hours. Returns count deleted."""
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        query = """
+        DELETE FROM worker_jobs
+        WHERE status IN ('done', 'error')
+          AND updated_at < NOW() - ($1 || ' hours')::INTERVAL;
+        """
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(query, str(max_age_hours))
+        # asyncpg returns 'DELETE N'
+        try:
+            return int(result.split()[-1])
+        except (IndexError, ValueError):
+            return 0

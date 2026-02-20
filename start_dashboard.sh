@@ -46,6 +46,29 @@ else
   start_gateway
 fi
 
+# ── Start background workers ──────────────────────────────────────────────────
+echo "Starting portfolio workers..."
+
+# Terminate any stale workers/bot from a previous session
+pkill -f "portfolio_worker.py" 2>/dev/null || true
+pkill -f "telegram_bot.py" 2>/dev/null || true
+sleep 1
+
+nohup "$PYTHON_BIN" "$ROOT_DIR/workers/portfolio_worker.py" --worker-id worker-1 \
+  > /tmp/worker-1.log 2>&1 &
+echo "  Worker-1 started (PID $!)."
+
+nohup "$PYTHON_BIN" "$ROOT_DIR/workers/portfolio_worker.py" --worker-id worker-2 \
+  > /tmp/worker-2.log 2>&1 &
+echo "  Worker-2 started (PID $!)."
+
+# ── Start Telegram bot ────────────────────────────────────────────────────────
+if [[ -f "$ROOT_DIR/agents/telegram_bot.py" ]]; then
+  nohup "$PYTHON_BIN" "$ROOT_DIR/agents/telegram_bot.py" \
+    > /tmp/telegram_bot.log 2>&1 &
+  echo "  Telegram bot started (PID $!)."
+fi
+
 echo "Starting Streamlit on port $STREAMLIT_PORT..."
 cd "$ROOT_DIR"
 exec "$PYTHON_BIN" -m streamlit run dashboard/app.py \
