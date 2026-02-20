@@ -24,6 +24,7 @@ os.chdir(PROJECT_ROOT)
 from adapters.ibkr_adapter import IBKRAdapter
 from agent_config import AGENT_SYSTEM_PROMPT, TOOL_SCHEMAS
 from core.market_data import MarketDataService
+from dashboard.components.ibkr_login import render_ibkr_login_button
 from dashboard.components.order_builder import render_order_builder
 from dashboard.components.order_management import render_order_management
 from agent_tools.market_data_tools import MarketDataTools
@@ -443,16 +444,7 @@ def main() -> None:
 
     st.sidebar.header("Inputs")
     reload_accounts = st.sidebar.button("Reload Accounts")
-    if st.sidebar.button("Sign in to IBKR"):
-        gateway_ok = adapter.client.check_gateway_status()
-        if not gateway_ok:
-            gateway_ok = adapter.client.start_gateway()
-        if gateway_ok:
-            adapter.client.initiate_sso_login()
-            st.sidebar.success("IBKR sign-in initiated. Open gateway and complete login.")
-            st.sidebar.markdown("[Open IBKR Gateway Login](https://localhost:5001)")
-        else:
-            st.sidebar.error("Unable to start/connect to IBKR Gateway. Keep current cached mode or start gateway manually.")
+    render_ibkr_login_button(adapter)
 
     # ── Client Portal restart ──────────────────────────────────────────────────
     with st.sidebar.expander("Client Portal Controls", expanded=False):
