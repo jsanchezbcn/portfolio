@@ -59,6 +59,8 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -215,6 +217,14 @@ async def _fetch_regime():
 # ═══════════════════════════════════════════════════════════════════════════════
 # 3.  COMMAND HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+@require_auth
+async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply to plain-text messages with a command reminder."""
+    await update.message.reply_text(
+        "I only understand commands. Try /help to see what's available."
+    )
+
 
 @require_auth
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -466,12 +476,14 @@ def _build_app() -> Application:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_help))
-    app.add_handler(CommandHandler("help",  cmd_help))
+    app.add_handler(CommandHandler("start",   cmd_help))
+    app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(CommandHandler("greeks",  cmd_greeks))
     app.add_handler(CommandHandler("regime",  cmd_regime))
     app.add_handler(CommandHandler("analyze", cmd_analyze))
     app.add_handler(CommandHandler("journal", cmd_journal))
+    # Catch-all for plain text messages (no command prefix)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_unknown))
 
     return app
 
@@ -490,11 +502,18 @@ async def _run(app: Application) -> None:
     # Start background alert loop as an asyncio task
     alert_task = asyncio.create_task(_alert_loop(app))
 
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    import signal as _signal
+    for _sig in (getattr(_signal, "SIGINT", None), getattr(_signal, "SIGTERM", None)):
+        if _sig is not None:
+            try:
+                loop.add_signal_handler(_sig, stop_event.set)
+            except NotImplementedError:
+                pass  # Windows
+
     try:
-        # Run forever until KeyboardInterrupt
-        await asyncio.Event().wait()
-    except (KeyboardInterrupt, SystemExit):
-        pass
+        await stop_event.wait()
     finally:
         alert_task.cancel()
         try:

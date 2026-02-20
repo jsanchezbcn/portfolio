@@ -138,13 +138,17 @@ def _start_login() -> None:
     _THREAD_BUF["status"]  = "starting"
     _THREAD_BUF["message"] = ""
 
-    # Launch the login script as a subprocess with stdout piped
+    # Launch the login script as a subprocess with stdout piped.
+    # start_new_session=True puts the child in its own process group so that
+    # macOS will not SIGKILL Streamlit when Playwright/Chromium uses lots of RAM.
+    # stderr goes to DEVNULL — Playwright's stderr is noisy and fills the pipe.
     proc = subprocess.Popen(
         [_PYTHON, str(_SCRIPT)],
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.DEVNULL,
         text=True,
         bufsize=1,              # line-buffered
+        start_new_session=True, # detach from Streamlit's process group
     )
     st.session_state[_SS_PROC] = proc
 
