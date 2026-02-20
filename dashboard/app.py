@@ -71,136 +71,6 @@ def get_services() -> tuple[IBKRAdapter, PortfolioTools, MarketDataTools, Regime
     return adapter, portfolio_tools, market_tools, regime_detector
 
 
-def _run_async(coro):
-    """Run an async coroutine from synchronous Streamlit context."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result(timeout=10)
-        return loop.run_until_complete(coro)
-    except Exception:
-        return asyncio.run(coro)
-
-
-@st.cache_data(ttl=3600)
-def _get_available_models() -> list[dict]:
-    """Fetch available LLM models from Copilot SDK (cached 1 h)."""
-    try:
-        from agents.llm_client import async_list_models
-        result = _run_async(async_list_models())
-        return result if result else []
-    except Exception:
-        return [
-            {"id": "gpt-4.1",     "name": "GPT-4.1",    "is_free": True},
-            {"id": "gpt-4o",      "name": "GPT-4o",      "is_free": True},
-            {"id": "gpt-4o-mini", "name": "GPT-4o mini", "is_free": True},
-        ]
-
-
-@st.cache_data(ttl=60)
-def _fetch_market_intel_cached() -> list[dict]:
-    """Fetch recent market_intel rows from the DB (cached 60 s).
-
-    Tries PostgreSQL (DBManager) first; falls back to local SQLite (LocalStore).
-    """
-    async def _fetch():
-        # Try PostgreSQL first
-        try:
-            from database.db_manager import DBManager
-            db = DBManager()
-            await db.connect()
-            return await db.get_recent_market_intel(limit=20)
-        except Exception as exc:
-            LOGGER.debug("PostgreSQL market_intel unavailable (%s), using LocalStore", exc)
-        # Fallback: SQLite local store
-        try:
-            from database.local_store import LocalStore
-            db = LocalStore()
-            return await db.get_recent_market_intel(limit=20)
-        except Exception as exc2:
-            LOGGER.debug("LocalStore market_intel also failed: %s", exc2)
-            return []
-
-    import concurrent.futures
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(asyncio.run, _fetch()).result(timeout=15)
-    except Exception as exc:
-        LOGGER.debug("market_intel fetch skipped: %s", exc)
-        return []
-
-
-@st.cache_data(ttl=60)
-def _fetch_active_signals_cached() -> list[dict]:
-    """Fetch active arbitrage signals from the DB (cached 60 s)."""
-    try:
-        from database.db_manager import DBManager
-
-        async def _fetch():
-            db = DBManager()
-            await db.connect()
-            return await db.get_active_signals(limit=50)
-
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(asyncio.run, _fetch()).result(timeout=15)
-    except Exception as exc:
-        LOGGER.debug("signals fetch skipped: %s", exc)
-        return []
-
-
-@st.cache_data(ttl=120)
-def _fetch_llm_intel_cached(source: str, symbol: str | None = None) -> dict | None:
-    """Return the latest market_intel row for a given LLM ``source`` tag.
-
-    TTL is 120 s so the dashboard shows near-live results without hammering the DB.
-    Returns a parsed dict when content is JSON, otherwise ``{"headline": content}``.
-    Tries PostgreSQL first; falls back to local SQLite.
-    """
-    async def _fetch():
-        row = None
-        # Try PostgreSQL first
-        try:
-            from database.db_manager import DBManager
-            db = DBManager()
-            await db.connect()
-            rows = await db.get_market_intel_by_source(source, symbol=symbol, limit=1)
-            row = rows[0] if rows else None
-        except Exception as exc:
-            LOGGER.debug("PostgreSQL llm_intel unavailable (%s), using LocalStore", exc)
-        # Fallback: SQLite
-        if row is None:
-            try:
-                from database.local_store import LocalStore
-                db = LocalStore()
-                rows = await db.get_market_intel_by_source(source, symbol=symbol, limit=1)
-                row = rows[0] if rows else None
-            except Exception as exc2:
-                LOGGER.debug("LocalStore llm_intel also failed: %s", exc2)
-        return row
-
-    import concurrent.futures
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            row = pool.submit(asyncio.run, _fetch()).result(timeout=15)
-        if row is None:
-            return None
-        content = row.get("content", "")
-        try:
-            parsed = json.loads(content) if content else {}
-        except (ValueError, TypeError):
-            parsed = {"headline": content}
-        parsed["_created_at"] = str(row.get("created_at", ""))[:19]
-        return parsed
-    except Exception as exc:
-        LOGGER.debug("llm_intel fetch skipped (source=%s): %s", source, exc)
-        return None
-
-
-
 @st.cache_data(ttl=120)
 def get_cached_vix_data() -> dict:
     """Return cached VIX payload for dashboard reads."""
@@ -300,6 +170,7 @@ def build_positions_dataframe(positions: list, ibkr_option_scaling: bool) -> pd.
                 "Vega": vega,
                 "Gamma": gamma,
                 "SPX Delta": float(position.spx_delta),
+                "⚠ Beta": "⚠ unavailable" if getattr(position, "beta_unavailable", False) else "",  # T019
                 "Greek Source": getattr(position, "greeks_source", "none"),
                 "Delta/Unit": (delta / quantity) if quantity else 0.0,
                 "Theta/Unit": (theta / quantity) if quantity else 0.0,
@@ -313,6 +184,134 @@ def build_positions_dataframe(positions: list, ibkr_option_scaling: bool) -> pd.
             drop=True
         )
     return table
+
+
+# ── async helpers ──────────────────────────────────────────────────────────────
+
+def _run_async(coro):
+    """Run an async coroutine from synchronous Streamlit context."""
+    import concurrent.futures
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(asyncio.run, coro)
+                return future.result(timeout=30)
+        return loop.run_until_complete(coro)
+    except Exception:
+        return asyncio.run(coro)
+
+
+@st.cache_data(ttl=3600)
+def _get_available_models() -> list[dict]:
+    """Fetch available LLM models from Copilot SDK (cached 1 h)."""
+    try:
+        from agents.llm_client import async_list_models
+        result = _run_async(async_list_models())
+        return result if result else []
+    except Exception:
+        return [
+            {"id": "gpt-4.1",     "name": "GPT-4.1",    "is_free": True},
+            {"id": "gpt-4o",      "name": "GPT-4o",      "is_free": True},
+            {"id": "gpt-4o-mini", "name": "GPT-4o mini", "is_free": True},
+        ]
+
+
+@st.cache_data(ttl=60)
+def _fetch_market_intel_cached() -> list[dict]:
+    """Fetch recent market_intel rows from the DB (cached 60 s).
+
+    Tries PostgreSQL (DBManager) first; falls back to local SQLite (LocalStore).
+    """
+    import concurrent.futures
+
+    async def _fetch():
+        try:
+            from database.db_manager import DBManager
+            db = DBManager()
+            await db.connect()
+            return await db.get_recent_market_intel(limit=20)
+        except Exception as exc:
+            LOGGER.debug("PostgreSQL market_intel unavailable (%s), using LocalStore", exc)
+        try:
+            from database.local_store import LocalStore
+            db = LocalStore()
+            return await db.get_recent_market_intel(limit=20)
+        except Exception as exc2:
+            LOGGER.debug("LocalStore market_intel also failed: %s", exc2)
+            return []
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, _fetch()).result(timeout=15)
+    except Exception as exc:
+        LOGGER.debug("market_intel fetch skipped: %s", exc)
+        return []
+
+
+@st.cache_data(ttl=60)
+def _fetch_active_signals_cached() -> list[dict]:
+    """Fetch active arbitrage signals from the DB (cached 60 s)."""
+    import concurrent.futures
+
+    async def _fetch():
+        try:
+            from database.db_manager import DBManager
+            db = DBManager()
+            await db.connect()
+            return await db.get_active_signals(limit=50)
+        except Exception as exc:
+            LOGGER.debug("signals fetch skipped: %s", exc)
+            return []
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, _fetch()).result(timeout=15)
+    except Exception as exc:
+        LOGGER.debug("signals fetch skipped: %s", exc)
+        return []
+
+
+@st.cache_data(ttl=120)
+def _fetch_llm_intel_cached(source: str, symbol: str | None = None) -> dict | None:
+    """Return the latest market_intel row for a given LLM ``source`` tag (TTL 120 s)."""
+    import concurrent.futures
+
+    async def _fetch():
+        row = None
+        try:
+            from database.db_manager import DBManager
+            db = DBManager()
+            await db.connect()
+            rows = await db.get_market_intel_by_source(source, symbol=symbol, limit=1)
+            row = rows[0] if rows else None
+        except Exception as exc:
+            LOGGER.debug("PostgreSQL llm_intel unavailable (%s), using LocalStore", exc)
+        if row is None:
+            try:
+                from database.local_store import LocalStore
+                db = LocalStore()
+                rows = await db.get_market_intel_by_source(source, symbol=symbol, limit=1)
+                row = rows[0] if rows else None
+            except Exception as exc2:
+                LOGGER.debug("LocalStore llm_intel also failed: %s", exc2)
+        return row
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            row = pool.submit(asyncio.run, _fetch()).result(timeout=15)
+        if row is None:
+            return None
+        content = row.get("content", "")
+        try:
+            parsed = json.loads(content) if content else {}
+        except (ValueError, TypeError):
+            parsed = {"headline": content}
+        parsed["_created_at"] = str(row.get("created_at", ""))[:19]
+        return parsed
+    except Exception as exc:
+        LOGGER.debug("llm_intel fetch skipped (source=%s): %s", source, exc)
+        return None
 
 
 def main() -> None:
@@ -335,6 +334,39 @@ def main() -> None:
         else:
             st.sidebar.error("Unable to start/connect to IBKR Gateway. Keep current cached mode or start gateway manually.")
 
+    # ── Client Portal restart ──────────────────────────────────────────────────
+    with st.sidebar.expander("Client Portal Controls", expanded=False):
+        gateway_alive = adapter.client.check_gateway_status()
+        st.markdown(
+            f"**Gateway status:** {'🟢 Running' if gateway_alive else '🔴 Down'}"
+        )
+        col_restart, col_stop = st.columns(2)
+        with col_restart:
+            if st.button("Restart Portal", help="Stop + restart the IBKR Client Portal gateway"):
+                with st.spinner("Restarting Client Portal…"):
+                    ok = adapter.client.restart_gateway()
+                if ok:
+                    st.success("Portal restarted — please re-authenticate.")
+                    st.markdown("[Open login page](https://localhost:5001)")
+                else:
+                    st.error("Restart timed out. Check logs below.")
+        with col_stop:
+            if st.button("Stop Portal", help="Gracefully stop the gateway process"):
+                adapter.client.stop_gateway()
+                st.warning("Portal stopped.")
+
+        # Show last 60 lines of the gateway log
+        log_path = PROJECT_ROOT / ".clientportal.log"
+        if log_path.exists():
+            try:
+                lines = log_path.read_text(errors="replace").splitlines()
+                tail = "\n".join(lines[-60:]) if len(lines) > 60 else "\n".join(lines)
+                st.text_area("Gateway log (last 60 lines)", value=tail, height=200)
+            except Exception:
+                st.caption("Log file unreadable.")
+        else:
+            st.caption("No gateway log found yet.")
+
     if "ibkr_accounts" not in st.session_state or reload_accounts:
         try:
             live_accounts = adapter.client.get_accounts()
@@ -350,43 +382,22 @@ def main() -> None:
     ]
 
     if not account_options:
-        # Gateway unavailable — fall back to cached position snapshots for offline mode
-        import glob as _glob
-        _snap_files = _glob.glob(str(PROJECT_ROOT / ".positions_snapshot_*.json"))
-        _cached_account_ids = [
-            Path(f).name.replace(".positions_snapshot_", "").replace(".json", "")
-            for f in _snap_files
-        ]
-        if _cached_account_ids:
-            st.warning(
-                "⚠️ IBKR gateway not available — using **cached snapshot** (read-only mode).  \n"
-                "Start the gateway and click **Reload Accounts** to go live."
-            )
-            account_options = sorted(_cached_account_ids)
-        else:
-            st.error(
-                "No IBKR accounts available from gateway. "
-                "Use 'Sign in to IBKR' in the sidebar, then click 'Reload Accounts'."
-            )
-            st.stop()
+        st.error("No IBKR accounts available from gateway. Use 'Sign in to IBKR' in the sidebar, then click 'Reload Accounts'.")
+        st.stop()
 
     account_id = st.sidebar.selectbox("IBKR Account", options=account_options, index=0)
     refresh = st.sidebar.button("Refresh")
     show_positions_table = st.sidebar.checkbox("Show per-position Greeks", value=True)
     ibkr_option_scaling = st.sidebar.checkbox("IBKR-style option scaling (x100)", value=False)
     use_cached_fallback = st.sidebar.checkbox("Use latest cached portfolio if IBKR unavailable", value=True)
-    ibkr_only_mode = st.sidebar.checkbox("IBKR-only mode (no external Greeks)", value=False)
+    ibkr_only_mode = st.sidebar.checkbox("IBKR-only mode (no external Greeks)", value=True)
 
-    # LLM Model picker
+    # ── LLM model picker ──────────────────────────────────────────────
     st.sidebar.subheader("🤖 AI / LLM Settings")
     _all_models = _get_available_models()
-    _model_labels = [
-        f"{m['name']} {'🆓' if m['is_free'] else '💰'}" for m in _all_models
-    ]
+    _model_labels = [f"{m['name']} {'🆓' if m['is_free'] else '💰'}" for m in _all_models]
     _model_ids = [m["id"] for m in _all_models]
-    _default_model_idx = next(
-        (i for i, m in enumerate(_all_models) if m["id"] == "gpt-4.1"), 0
-    )
+    _default_model_idx = next((i for i, m in enumerate(_all_models) if m["id"] == "gpt-4.1"), 0)
     _sel_idx = st.sidebar.selectbox(
         "Model",
         options=range(len(_model_labels)),
@@ -394,7 +405,7 @@ def main() -> None:
         index=_default_model_idx,
         key="llm_model_picker",
     )
-    selected_llm_model: str = _model_ids[_sel_idx]
+    selected_llm_model: str = _model_ids[_sel_idx] if _model_ids else "gpt-4.1"
 
     st.sidebar.subheader("Greeks Diagnostics")
     disable_tasty_cache = st.sidebar.checkbox(
@@ -415,6 +426,7 @@ def main() -> None:
         get_cached_historical_volatility.clear()
         _fetch_market_intel_cached.clear()
         _fetch_active_signals_cached.clear()
+        _fetch_llm_intel_cached.clear()
 
     if account_id is None:
         st.error("Unable to resolve a valid IBKR account ID from gateway response.")
@@ -444,49 +456,46 @@ def main() -> None:
             else:
                 positions = []
                 data_refresh["positions"] = _safe_iso_now()
-            # Fetch Greeks only when positions are actually refreshed (not on every render)
-            if positions and not ibkr_only_mode:
-                positions = asyncio.run(adapter.fetch_greeks(positions))
-                data_refresh["greeks"] = _safe_iso_now()
-
-                options_count = sum(1 for position in positions if position.instrument_type.name == "OPTION")
-                greeks_status = getattr(adapter, "last_greeks_status", {})
-                cache_miss_count = int(greeks_status.get("cache_miss_count", 0))
-                miss_ratio = (cache_miss_count / options_count) if options_count else 0.0
-
-                previous_positions_list = previous_positions_for_account if isinstance(previous_positions_for_account, list) else []
-                can_reuse_previous = (
-                    refresh
-                    and previous_account == account_id
-                    and use_cached_fallback
-                    and bool(previous_positions_list)
-                )
-
-                if can_reuse_previous and options_count > 0 and miss_ratio >= 0.8:
-                    previous_option_positions = [
-                        p for p in previous_positions_list if p.instrument_type.name == "OPTION"
-                    ]
-                    previous_has_nonzero_greeks = any(
-                        abs(float(getattr(p, "theta", 0.0))) > 0.0
-                        or abs(float(getattr(p, "vega", 0.0))) > 0.0
-                        or abs(float(getattr(p, "gamma", 0.0))) > 0.0
-                        for p in previous_option_positions
-                    )
-                    if previous_has_nonzero_greeks:
-                        positions = previous_positions_list
-                        st.session_state["greeks_refresh_fallback"] = True
-                        st.session_state["greeks_refresh_fallback_reason"] = (
-                            f"Latest refresh had {cache_miss_count}/{options_count} missing option Greeks; "
-                            "reusing previous in-session snapshot."
-                        )
-
             positions = st.session_state["positions"] = positions
             st.session_state["selected_account"] = account_id
             st.session_state["fallback_saved_at"] = fallback_saved_at
         else:
             fallback_saved_at = st.session_state.get("fallback_saved_at")
-            # Use already-loaded positions (with Greeks) from session state
-            positions = st.session_state.get("positions") or positions
+
+        if positions and not ibkr_only_mode:
+            positions = asyncio.run(adapter.fetch_greeks(positions))
+            data_refresh["greeks"] = _safe_iso_now()
+
+            options_count = sum(1 for position in positions if position.instrument_type.name == "OPTION")
+            greeks_status = getattr(adapter, "last_greeks_status", {})
+            cache_miss_count = int(greeks_status.get("cache_miss_count", 0))
+            miss_ratio = (cache_miss_count / options_count) if options_count else 0.0
+
+            previous_positions_list = previous_positions_for_account if isinstance(previous_positions_for_account, list) else []
+            can_reuse_previous = (
+                refresh
+                and previous_account == account_id
+                and use_cached_fallback
+                and bool(previous_positions_list)
+            )
+
+            if can_reuse_previous and options_count > 0 and miss_ratio >= 0.8:
+                previous_option_positions = [
+                    p for p in previous_positions_list if p.instrument_type.name == "OPTION"
+                ]
+                previous_has_nonzero_greeks = any(
+                    abs(float(getattr(p, "theta", 0.0))) > 0.0
+                    or abs(float(getattr(p, "vega", 0.0))) > 0.0
+                    or abs(float(getattr(p, "gamma", 0.0))) > 0.0
+                    for p in previous_option_positions
+                )
+                if previous_has_nonzero_greeks:
+                    positions = previous_positions_list
+                    st.session_state["greeks_refresh_fallback"] = True
+                    st.session_state["greeks_refresh_fallback_reason"] = (
+                        f"Latest refresh had {cache_miss_count}/{options_count} missing option Greeks; "
+                        "reusing previous in-session snapshot."
+                    )
 
         if positions:
             save_positions_snapshot(account_id, positions)
@@ -506,13 +515,7 @@ def main() -> None:
         ibkr_summary: dict[str, object] = summary_payload if isinstance(summary_payload, dict) else {}
 
     summary = portfolio_tools.get_portfolio_summary(positions)
-    # Extract NLV early so risk limits can be scaled by portfolio size.
-    # ibkr_summary may not be populated yet; fall back to None gracefully.
-    try:
-        _nlv_for_risk = float(ibkr_summary.get("netliquidation")) if ibkr_summary else None
-    except (TypeError, ValueError):
-        _nlv_for_risk = None
-    violations = portfolio_tools.check_risk_limits(summary, regime, nlv=_nlv_for_risk)
+    violations = portfolio_tools.check_risk_limits(summary, regime)
 
     previous_regime = st.session_state.get("last_regime_name")
     current_regime = str(regime.name)
@@ -532,79 +535,6 @@ def main() -> None:
     )
 
     render_regime_banner(regime.name, vix_data, macro_data)
-
-    # Issue 15: Dedicated Risk Status panel — traffic-light for every guardrail
-    with st.container():
-        st.subheader("Risk Status")
-        rs_cols = st.columns(4)
-
-        # Column 0: Greek limit compliance
-        with rs_cols[0]:
-            st.caption("Greek Limits")
-            if violations:
-                st.error(f"⛔ {len(violations)} violation(s)")
-            else:
-                st.success("✓ All limits OK")
-
-        # Column 1: DTE expiry risk
-        with rs_cols[1]:
-            st.caption("DTE Expiry Risk")
-            if positions:
-                _dte_alerts = portfolio_tools.check_dte_expiry_risk(positions)
-                _crit_dte = [a for a in _dte_alerts if a["level"] == "CRITICAL"]
-                _warn_dte = [a for a in _dte_alerts if a["level"] == "WARNING"]
-                if _crit_dte:
-                    st.error(f"⛔ {len(_crit_dte)} expiry critical")
-                elif _warn_dte:
-                    st.warning(f"⚠ {len(_warn_dte)} expiry warning(s)")
-                else:
-                    st.success("✓ No DTE risk")
-            else:
-                st.info("No positions")
-
-        # Column 2: Vega concentration
-        with rs_cols[2]:
-            st.caption("Concentration")
-            if positions:
-                _conc = portfolio_tools.check_concentration_risk(positions, regime)
-                if _conc:
-                    st.warning(f"⚠ {len(_conc)} concentration issue(s)")
-                else:
-                    st.success("✓ Concentration OK")
-            else:
-                st.info("No positions")
-
-        # Column 3: Daily drawdown (requires set_start_of_day_net_liq to be called)
-        with rs_cols[3]:
-            st.caption("Daily Drawdown")
-            _current_nl: float | None = None
-            if ibkr_summary:
-                def _to_float_safe(value: object) -> float | None:
-                    try:
-                        if isinstance(value, dict):
-                            a = value.get("amount")
-                            return float(a) if a not in (None, "", "N/A") else None
-                        return float(str(value).replace(",", "")) if value not in (None, "", "N/A") else None
-                    except (TypeError, ValueError):
-                        return None
-                _current_nl = _to_float_safe(ibkr_summary.get("netliquidation"))
-            if _current_nl is not None:
-                _dd = portfolio_tools.check_daily_drawdown(_current_nl)
-                if _dd:
-                    st.error(f"⛔ {_dd['loss_pct']:.1%} drawdown")
-                else:
-                    st.success("✓ Drawdown OK")
-            else:
-                st.info("Net liq N/A")
-
-        # Show violation details when any exist
-        if violations:
-            with st.expander("Active Risk Violations", expanded=True):
-                for _v in violations:
-                    st.write(
-                        f"• **{_v.get('metric', '?')}**: {_v.get('message', '')} "
-                        f"(current: `{_v.get('current', '?')}`, limit: `{_v.get('limit', '?')}`)"
-                    )
 
     with st.sidebar.expander("Data Freshness", expanded=False):
         data_refresh = st.session_state.get("data_refresh_timestamps", {})
@@ -733,7 +663,22 @@ def main() -> None:
     metrics[1].metric("Theta", f"{summary['total_theta']:.2f}")
     metrics[2].metric("Vega", f"{summary['total_vega']:.2f}")
     metrics[3].metric("Gamma", f"{summary['total_gamma']:.2f}")
-    metrics[4].metric("SPX Delta", f"{summary['total_spx_delta']:.2f}")
+    _spx_price_for_display = adapter.last_greeks_status.get("spx_price", 0.0) or 0.0
+    # T020: SPX price unavailable error banner
+    if not _spx_price_for_display or _spx_price_for_display <= 0:
+        st.error(
+            "⛔ **SPX price unavailable** — portfolio SPX delta cannot be computed. "
+            "Ensure the IBKR gateway is authenticated and SPX market data is subscribed."
+        )
+    # T018: Prominent Portfolio SPX Equivalent Beta-Weighted Delta
+    _total_spx_delta = float(summary.get('total_spx_delta', 0.0))
+    _spx_color = "normal" if abs(_total_spx_delta) <= 100 else "inverse"
+    metrics[4].metric(
+        "Portfolio SPX Delta (β-wtd)",
+        f"{_total_spx_delta:.1f}",
+        help="Sum of beta-weighted SPX-equivalent deltas across all positions. "
+             "Formula: Δ × Q × M × β × P_underlying / P_SPX",
+    )
     metrics[5].metric("Theta/Vega", f"{summary['theta_vega_ratio']:.3f}")
 
     iv_analysis: list[dict] = []
@@ -930,302 +875,141 @@ def main() -> None:
         }
     )
 
-    # ------------------------------------------------------------------ #
-    # NewsSentry — Market Intelligence panel                              #
-    # ------------------------------------------------------------------ #
+    # ── Market Intelligence (NewsSentry sentiment) ────────────────────
     st.subheader("Market Intelligence (Sentiment)")
-    if refresh:
-        _fetch_market_intel_cached.clear()
-    market_intel_rows = _fetch_market_intel_cached()
-    if market_intel_rows:
-        intel_df = pd.DataFrame(market_intel_rows)
-        # Format display columns
-        display_cols = [c for c in ["symbol", "source", "sentiment_score", "content", "created_at"] if c in intel_df.columns]
-        intel_df = intel_df[display_cols]
-        if "sentiment_score" in intel_df.columns:
-            intel_df["sentiment_score"] = intel_df["sentiment_score"].apply(
-                lambda x: f"{float(x):.2f}" if x is not None else "N/A"
-            )
-        if "created_at" in intel_df.columns:
-            intel_df["created_at"] = intel_df["created_at"].apply(
-                lambda x: str(x)[:19] if x is not None else ""
-            )
-        st.dataframe(intel_df, use_container_width=True)
-        # Aggregate sentiment per symbol
-        if "sentiment_score" in market_intel_rows[0]:
-            scored = [r for r in market_intel_rows if r.get("sentiment_score") is not None]
-            if scored:
-                by_symbol: dict[str, list[float]] = {}
-                for r in scored:
-                    sym = str(r.get("symbol", "?"))
-                    try:
-                        by_symbol.setdefault(sym, []).append(float(r["sentiment_score"]))
-                    except (TypeError, ValueError):
-                        pass
-                if by_symbol:
-                    avg_scores = {sym: sum(scores) / len(scores) for sym, scores in by_symbol.items()}
-                    sentiment_cols = st.columns(min(len(avg_scores), 4))
-                    for idx, (sym, avg) in enumerate(avg_scores.items()):
-                        color = "🟢" if avg > 0.1 else ("🔴" if avg < -0.1 else "🟡")
-                        sentiment_cols[idx % len(sentiment_cols)].metric(f"{color} {sym}", f"{avg:.2f}")
+    intel_rows = _fetch_market_intel_cached()
+    if intel_rows:
+        intel_df = pd.DataFrame(intel_rows)
+        _display_cols = [c for c in ["created_at", "symbol", "source", "headline", "sentiment_score"] if c in intel_df.columns]
+        st.dataframe(intel_df[_display_cols] if _display_cols else intel_df, use_container_width=True)
+        if "sentiment_score" in intel_df.columns and "symbol" in intel_df.columns:
+            avg_sent = intel_df.groupby("symbol")["sentiment_score"].mean().sort_values()
+            st.bar_chart(avg_sent)
     else:
-        st.info(
-            "No market intelligence data available. "
-            "Use the **Fetch News Now** button, or run `python -m agents.news_sentry`."
-        )
+        st.info("No market intelligence rows — run NewsSentry or check DB connection.")
 
-    # "Fetch News Now" button — always visible in the news section
-    _news_col, _ = st.columns([1, 3])
-    with _news_col:
-        if st.button("📰 Fetch News Now", key="btn_fetch_news"):
-            # Derive symbols from current portfolio positions (fallback: broad ETFs)
+    _portfolio_symbols = list({p.get("symbol", "") for p in (positions or []) if p.get("symbol")})
+    if st.button("📰 Fetch News Now", help="Fetch and score news for all portfolio symbols"):
+        with st.spinner("Fetching news..."):
             try:
-                _raw_syms = [str(p.symbol).split()[0].upper() for p in positions if getattr(p, "symbol", None)]
-                _news_symbols = sorted(set(_raw_syms)) or ["SPY", "QQQ", "NVDA", "AAPL"]
-            except Exception:
-                _news_symbols = ["SPY", "QQQ", "NVDA", "AAPL"]
+                from agents.news_sentry import NewsSentry
+                sentry = NewsSentry()
+                _run_async(sentry.fetch_and_score(_portfolio_symbols or ["SPY", "QQQ"]))
+                _fetch_market_intel_cached.clear()
+                st.success("News fetched and scored.")
+                st.rerun()
+            except Exception as _exc:
+                st.warning(f"News fetch failed: {_exc}")
 
-            with st.spinner(f"Fetching & scoring news for {_news_symbols}…"):
-                try:
-                    async def _do_news():
-                        from agents.news_sentry import NewsSentry
-                        from database.local_store import LocalStore
-                        _db = LocalStore()
-                        _sentry = NewsSentry(symbols=_news_symbols, db=_db)
-                        for _sym in _news_symbols:
-                            await _sentry.fetch_and_score(_sym)
+    # ── AI Insights: Risk Audit + Market Brief ─────────────────────────
+    _urgency_color = {"green": "success", "yellow": "warning", "red": "error"}
+    _urgency_emoji = {"green": "✅", "yellow": "⚠️", "red": "🚨"}
 
-                    _run_async(_do_news())
-                    _fetch_market_intel_cached.clear()
-                    st.success(f"News fetched for: {', '.join(_news_symbols)}")
-                    st.rerun()
-                except Exception as _ne:
-                    st.error(f"News fetch failed: {_ne}")
+    _ai_col1, _ai_col2 = st.columns(2)
 
-    # ------------------------------------------------------------------ #
-    # AI Insights — LLM Risk Audit + Market Brief                        #
-    # ------------------------------------------------------------------ #
-    st.subheader("🤖 AI Insights")
-    if refresh:
-        _fetch_llm_intel_cached.clear()
-
-    _ai_audit_col, _ai_brief_col = st.columns(2)
-
-    # --- Risk Audit (LLMRiskAuditor, source="llm_risk_audit") -----------
-    with _ai_audit_col:
-        st.markdown("**Live Risk Audit** *(gpt-4.1 · 5-min cadence)*")
-        audit_data = _fetch_llm_intel_cached("llm_risk_audit", symbol="PORTFOLIO")
-        if audit_data:
-            urgency = audit_data.get("urgency", "green").lower()
-            _urgency_emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴"}.get(urgency, "⚪")
-            _urgency_color = {"green": "success", "yellow": "warning", "red": "error"}.get(urgency, "info")
-            getattr(st, _urgency_color)(f"{_urgency_emoji} **{audit_data.get('headline', 'Audit result')}**")
-            if audit_data.get("body"):
-                st.caption(audit_data["body"])
-            suggestions = audit_data.get("suggestions") or []
-            if isinstance(suggestions, list) and suggestions:
-                with st.expander("Suggestions", expanded=urgency == "red"):
-                    for _s in suggestions:
-                        st.markdown(f"• {_s}")
-            st.caption(f"Generated: {audit_data.get('_created_at', 'unknown')}")
+    with _ai_col1:
+        st.subheader("🔍 Live Risk Audit")
+        _audit = _fetch_llm_intel_cached("llm_risk_audit", symbol="PORTFOLIO")
+        if _audit:
+            _urg = _audit.get("urgency", "green")
+            getattr(st, _urgency_color.get(_urg, "info"))(
+                f"{_urgency_emoji.get(_urg, '')} {_audit.get('headline', '')}"
+            )
+            if _audit.get("body"):
+                st.write(_audit["body"])
+            _sugg = _audit.get("suggestions", [])
+            if _sugg:
+                st.markdown("**Suggested actions:**")
+                for _s in _sugg:
+                    st.markdown(f"- {_s}")
+            st.caption(f"Last updated: {_audit.get('_created_at', 'unknown')}")
         else:
-            st.info("No audit available yet. Start LLMRiskAuditor or use the button below.")
+            st.info("No risk audit available — LLMRiskAuditor may not have run yet.")
 
-        # On-demand audit button
-        if st.button("🔍 Audit Now", key="btn_audit_now"):
-            with st.spinner("Running LLM risk audit…"):
-                try:
-                    from agents.llm_risk_auditor import LLMRiskAuditor
-
-                    async def _do_audit():
-                        try:
-                            from database.db_manager import DBManager
-                            db = DBManager()
-                            await db.connect()
-                        except Exception:
-                            from database.local_store import LocalStore
-                            db = LocalStore()
-                        auditor = LLMRiskAuditor(db=db)
-                        return await auditor.audit_now(
-                            summary=summary,
-                            regime_name=regime.name,
-                            vix=vix_data["vix"],
-                            term_structure=vix_data["term_structure"],
-                            nlv=_nlv_for_risk,
-                            violations=violations,
-                            resolved_limits=None,
-                        )
-
-                    _audit_result = _run_async(_do_audit())
-                    _fetch_llm_intel_cached.clear()
-                    st.rerun()
-                except Exception as _ae:
-                    st.error(f"Audit failed: {_ae}")
-
-    # --- Market Brief (LLMMarketBrief, source="llm_brief") --------------
-    with _ai_brief_col:
-        st.markdown("**Market Brief** *(gpt-4.1-mini · 1-hr cadence)*")
-        brief_data = _fetch_llm_intel_cached("llm_brief", symbol="MARKET")
-        if brief_data:
-            _tone = brief_data.get("confidence", "medium")
-            _tone_emoji = {"high": "💪", "medium": "🤔", "low": "😐"}.get(_tone, "")
-            st.info(f"{_tone_emoji} **{brief_data.get('headline', 'Market brief')}**")
-            if brief_data.get("regime_read"):
-                st.caption(brief_data["regime_read"])
-            if brief_data.get("opportunity"):
-                st.success(f"**Opportunity:** {brief_data['opportunity']}")
-            if brief_data.get("risk"):
-                st.warning(f"**Watch:** {brief_data['risk']}")
-            if brief_data.get("action"):
-                with st.expander("💡 Trade Idea"):
-                    st.markdown(brief_data["action"])
-            st.caption(f"Generated: {brief_data.get('_created_at', 'unknown')}")
+    with _ai_col2:
+        st.subheader("📊 Market Brief")
+        _brief = _fetch_llm_intel_cached("llm_market_brief")
+        if _brief:
+            _urg = _brief.get("urgency", "green")
+            getattr(st, _urgency_color.get(_urg, "info"))(
+                f"{_urgency_emoji.get(_urg, '')} {_brief.get('headline', '')}"
+            )
+            if _brief.get("body"):
+                st.write(_brief["body"])
+            _sugg = _brief.get("suggestions", [])
+            if _sugg:
+                st.markdown("**Suggested actions:**")
+                for _s in _sugg:
+                    st.markdown(f"- {_s}")
+            st.caption(f"Last updated: {_brief.get('_created_at', 'unknown')}")
         else:
-            st.info("No brief available yet. Start LLMMarketBrief or use the button below.")
+            st.info("No market brief available.")
 
-        # On-demand brief button
-        if st.button("📰 Refresh Brief", key="btn_refresh_brief"):
-            with st.spinner("Generating market brief…"):
-                try:
-                    from agents.llm_market_brief import LLMMarketBrief
+    if st.button("📰 Refresh Brief", help="Request a fresh LLM market brief now"):
+        with st.spinner("Generating market brief..."):
+            try:
+                from agents.llm_market_brief import LLMMarketBrief
+                brief_agent = LLMMarketBrief()
+                _run_async(brief_agent.brief_now())
+                _fetch_llm_intel_cached.clear()
+                st.success("Market brief refreshed.")
+                st.rerun()
+            except Exception as _exc:
+                st.warning(f"Brief refresh failed: {_exc}")
 
-                    async def _do_brief():
-                        try:
-                            from database.db_manager import DBManager
-                            db = DBManager()
-                            await db.connect()
-                        except Exception:
-                            from database.local_store import LocalStore
-                            db = LocalStore()
-                        brief_agent = LLMMarketBrief(db=db)
-                        return await brief_agent.brief_now(
-                            vix=vix_data["vix"],
-                            vix3m=vix_data.get("vix3m", vix_data["vix"]),
-                            term_structure=vix_data["term_structure"],
-                            regime_name=regime.name,
-                            recession_probability=macro_data.get("recession_probability"),
-                            portfolio_summary=summary,
-                            nlv=_nlv_for_risk,
-                        )
-
-                    _run_async(_do_brief())
-                    _fetch_llm_intel_cached.clear()
-                    st.rerun()
-                except Exception as _be:
-                    st.error(f"Brief failed: {_be}")
-
-    # ------------------------------------------------------------------ #
-    # ArbHunter — Active Arbitrage Signals panel                          #
-    # ------------------------------------------------------------------ #
+    # ── Arbitrage Signals ─────────────────────────────────────────────
     st.subheader("Arbitrage Signals")
-    if refresh:
-        _fetch_active_signals_cached.clear()
-    active_signals = _fetch_active_signals_cached()
-    if active_signals:
-        signals_df = pd.DataFrame(active_signals)
-        display_sig_cols = [c for c in ["signal_type", "net_value", "confidence", "status", "detected_at"] if c in signals_df.columns]
-        signals_df = signals_df[display_sig_cols]
-        if "net_value" in signals_df.columns:
-            signals_df["net_value"] = signals_df["net_value"].apply(
-                lambda x: f"${float(x):.2f}" if x is not None else "N/A"
-            )
-        if "confidence" in signals_df.columns:
-            signals_df["confidence"] = signals_df["confidence"].apply(
-                lambda x: f"{float(x):.2f}" if x is not None else "N/A"
-            )
-        if "detected_at" in signals_df.columns:
-            signals_df["detected_at"] = signals_df["detected_at"].apply(
-                lambda x: str(x)[:19] if x is not None else ""
-            )
-        st.dataframe(signals_df, use_container_width=True)
-        pcp_count = sum(1 for r in active_signals if r.get("signal_type", "").upper() == "PUT_CALL_PARITY")
-        box_count = sum(1 for r in active_signals if r.get("signal_type", "").upper() == "BOX_SPREAD")
-        sig_cols = st.columns(2)
-        sig_cols[0].metric("Put-Call Parity Signals", pcp_count)
-        sig_cols[1].metric("Box Spread Signals", box_count)
+    _signals = _fetch_active_signals_cached()
+    if _signals:
+        _sig_df = pd.DataFrame(_signals)
+        st.dataframe(_sig_df, use_container_width=True)
     else:
-        st.info(
-            "No active arbitrage signals. "
-            "Run ArbHunter.scan() against an option chain to detect opportunities."
-        )
+        st.info("No active arbitrage signals.")
 
-    # ------------------------------------------------------------------ #
-    # AI Assistant                                                        #
-    # ------------------------------------------------------------------ #
+    # ── AI Assistant (real LLM) ────────────────────────────────────────
     st.subheader("AI Assistant")
     user_prompt = st.text_input("Ask for a risk adjustment", placeholder="How should I reduce near-term gamma?")
     if user_prompt:
         violation_count = len(violations)
-        stance = "defensive" if violation_count > 0 or abs(float(summary.get("total_spx_delta", 0.0))) > 500 else "balanced"
-
-        # Build per-position context (top 12 option positions)
-        _opt_positions = [p for p in positions if getattr(p, "instrument_type", None) and p.instrument_type.name == "OPTION"][:12]
-        _equity_positions = [p for p in positions if getattr(p, "instrument_type", None) and p.instrument_type.name == "EQUITY"][:5]
-        _futures_positions = [p for p in positions if getattr(p, "instrument_type", None) and p.instrument_type.name == "FUTURE"][:5]
-
-        def _pos_line(p) -> str:
-            dte = getattr(p, "days_to_expiration", None)
-            dte_s = f"DTE={dte}" if dte is not None else ""
-            return (
-                f"  {str(p.symbol)[:28]:<28} qty={p.quantity:+6.1f} {dte_s:<8} "
-                f"Δ={p.delta:+.3f} θ={p.theta:+.3f} ν={p.vega:+.3f} "
-                f"src={getattr(p, 'greeks_source', '?')}"
+        _pos_lines = []
+        for _p in (positions or [])[:30]:
+            _pos_lines.append(
+                f"  {_p.get('symbol','?')} qty={_p.get('quantity',0)} "
+                f"spx_delta={_p.get('spx_delta',_p.get('delta',0)):.2f} "
+                f"theta={_p.get('theta',0):.2f}"
             )
-
-        _opt_block = "\n".join(_pos_line(p) for p in _opt_positions) or "  (none)"
-        _eq_block  = "\n".join(f"  {str(p.symbol)[:20]:<20} qty={p.quantity:+.1f} Δ={p.delta:+.3f}" for p in _equity_positions) or "  (none)"
-        _fut_block = "\n".join(f"  {str(p.symbol)[:20]:<20} qty={p.quantity:+.1f} Δ={p.delta:+.3f}" for p in _futures_positions) or "  (none)"
-
-        # Full context block for AI
         context_block = (
-            f"Account: {account_id}\n"
-            f"Regime: {regime.name}\n"
-            f"VIX: {vix_data['vix']:.2f} | VIX3M: {vix_data.get('vix3m', 'N/A')} | Term Structure: {vix_data['term_structure']:.3f}\n"
-            f"Portfolio aggregate — Delta: {summary['total_delta']:.2f} | Theta: {summary['total_theta']:.2f} | "
-            f"Vega: {summary['total_vega']:.2f} | Gamma: {summary['total_gamma']:.2f}\n"
-            f"SPX Delta: {summary['total_spx_delta']:.2f} | Theta/Vega ratio: {summary['theta_vega_ratio']:.3f}\n"
-            f"Position counts — Options: {len(_opt_positions)} shown (of {sum(1 for p in positions if getattr(p,'instrument_type',None) and p.instrument_type.name=='OPTION')}) | "
-            f"Equity: {len(_equity_positions)} | Futures: {len(_futures_positions)}\n"
-            f"Option positions (qty, DTE, Greeks per contract × qty):\n{_opt_block}\n"
-            f"Equity positions:\n{_eq_block}\n"
-            f"Futures positions:\n{_fut_block}\n"
-            f"Risk violations ({violation_count}): "
-            + (", ".join(f"{v.get('metric','?')}: {v.get('message','')}" for v in violations) if violations else "none")
-            + f"\nSuggested stance: {stance}"
+            f"Portfolio snapshot (IBKR-only={ibkr_only_mode}):\n"
+            f"  Regime: {regime.name}\n"
+            f"  VIX: {vix_data.get('vix','?')}, VIX3M: {vix_data.get('vix3m','?')}, "
+            f"Term structure: {vix_data.get('term_structure','?')}\n"
+            f"  SPX Delta: {summary.get('total_spx_delta', 0):.2f}, "
+            f"Delta: {summary.get('total_delta', 0):.2f}, "
+            f"Theta: {summary.get('total_theta', 0):.2f}, "
+            f"Vega: {summary.get('total_vega', 0):.2f}, "
+            f"Gamma: {summary.get('total_gamma', 0):.4f}\n"
+            f"  Theta/Vega: {summary.get('theta_vega_ratio', 0):.3f}\n"
+            f"  Violations ({violation_count}): {'; '.join(str(v) for v in violations[:5])}\n"
+            f"\nTop positions:\n" + "\n".join(_pos_lines)
         )
-
-        # Use GitHub Copilot SDK (CopilotClient) — same pattern as news_sentry.py and explain_performance.py
-        llm_response: str | None = None
-        llm_model = selected_llm_model
-        full_prompt = (
-            f"System: {AGENT_SYSTEM_PROMPT}\n\n"
-            f"Current portfolio context:\n{context_block}\n\n"
-            f"User question: {user_prompt}"
-        )
-        try:
-            from agents.llm_client import async_llm_chat
-            with st.spinner("Asking AI assistant..."):
-                llm_response = _run_async(
-                    async_llm_chat(full_prompt, model=llm_model, timeout=45.0)
-                ) or None
-        except Exception as llm_exc:
-            LOGGER.warning("LLM call failed: %s", llm_exc)
-            llm_response = None
-
-        if llm_response:
-            st.info(llm_response)
-        else:
-            # Graceful fallback — structured context response
-            tool_names = [tool["name"] for tool in TOOL_SCHEMAS]
-            st.info(
-                "**Portfolio context** (GitHub Copilot CLI required for AI responses)\n\n"
-                f"- Regime: {regime.name}\n"
-                f"- Violations: {violation_count}\n"
-                f"- SPX Delta: {summary['total_spx_delta']:.2f}\n"
-                f"- Theta/Vega ratio: {summary['theta_vega_ratio']:.3f}\n"
-                f"- Suggested stance: {stance}\n"
-                f"- Available tools: {', '.join(tool_names)}"
-            )
+        full_prompt = context_block + "\n\nUser question: " + user_prompt
+        with st.spinner("Thinking..."):
+            try:
+                from agents.llm_client import async_llm_chat
+                _reply = _run_async(async_llm_chat(full_prompt, model=selected_llm_model, timeout=45.0))
+                st.markdown(_reply or "*(no response)*")
+            except Exception as _exc:
+                st.warning(f"LLM unavailable ({_exc}) — structured summary:")
+                stance = "defensive" if violation_count > 0 or abs(float(summary.get("total_spx_delta", 0.0))) > 500 else "balanced"
+                tool_names = [tool["name"] for tool in TOOL_SCHEMAS]
+                st.info(
+                    f"- Regime: {regime.name}\n"
+                    f"- Violations: {violation_count}\n"
+                    f"- SPX Delta: {summary['total_spx_delta']:.2f}\n"
+                    f"- Theta/Vega ratio: {summary['theta_vega_ratio']:.3f}\n"
+                    f"- Suggested stance: {stance}\n"
+                    f"- Available tools: {', '.join(tool_names)}"
+                )
 
     with st.expander("Assistant configuration"):
         st.caption(AGENT_SYSTEM_PROMPT)
