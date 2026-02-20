@@ -22,6 +22,7 @@ os.chdir(PROJECT_ROOT)
 from adapters.ibkr_adapter import IBKRAdapter
 from agent_config import AGENT_SYSTEM_PROMPT, TOOL_SCHEMAS
 from dashboard.components.order_builder import render_order_builder
+from dashboard.components.order_management import render_order_management
 from agent_tools.market_data_tools import MarketDataTools
 from agent_tools.portfolio_tools import PortfolioTools
 from ibkr_portfolio_client import load_dotenv
@@ -952,6 +953,12 @@ def main() -> None:
         regime=_regime_key,
     )
 
+    # ── Open Orders Management (T-OM0) ─────────────────────────────────
+    render_order_management(
+        ibkr_gateway_client=adapter.client,
+        account_id=account_id,
+    )
+
     # ── AI Insights: Risk Audit + Market Brief ─────────────────────────
     _urgency_color = {"green": "success", "yellow": "warning", "red": "error"}
     _urgency_emoji = {"green": "✅", "yellow": "⚠️", "red": "🚨"}
@@ -1000,7 +1007,9 @@ def main() -> None:
         with st.spinner("Generating market brief..."):
             try:
                 from agents.llm_market_brief import LLMMarketBrief
-                brief_agent = LLMMarketBrief()
+                from database.db_manager import DBManager
+                _brief_db = DBManager()
+                brief_agent = LLMMarketBrief(db=_brief_db)
                 _run_async(brief_agent.brief_now())
                 _fetch_llm_intel_cached.clear()
                 st.success("Market brief refreshed.")
