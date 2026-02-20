@@ -21,6 +21,7 @@ os.chdir(PROJECT_ROOT)
 
 from adapters.ibkr_adapter import IBKRAdapter
 from agent_config import AGENT_SYSTEM_PROMPT, TOOL_SCHEMAS
+from dashboard.components.order_builder import render_order_builder
 from agent_tools.market_data_tools import MarketDataTools
 from agent_tools.portfolio_tools import PortfolioTools
 from ibkr_portfolio_client import load_dotenv
@@ -909,6 +910,47 @@ def main() -> None:
                 st.rerun()
             except Exception as _exc:
                 st.warning(f"News fetch failed: {_exc}")
+
+    # ── Order Builder — Pre-Trade Simulation (T027) ─────────────────────
+    try:
+        from core.execution import ExecutionEngine
+        from database.local_store import LocalStore as _LS
+        _exec_engine = ExecutionEngine(
+            ibkr_gateway_client=adapter.client,
+            local_store=_LS(),
+            beta_weighter=adapter._beta_weighter,
+        )
+    except Exception as _ee_exc:
+        LOGGER.warning("Could not build ExecutionEngine: %s", _ee_exc)
+        _exec_engine = None
+
+    _current_greeks = None
+    try:
+        from models.order import PortfolioGreeks as _PG
+        _current_greeks = _PG(
+            spx_delta=float(summary.get("total_spx_delta", 0.0)),
+            gamma=float(summary.get("total_gamma", 0.0)),
+            theta=float(summary.get("total_theta", 0.0)),
+            vega=float(summary.get("total_vega", 0.0)),
+        )
+    except Exception:
+        pass
+
+    _regime_key = getattr(regime, "name", "neutral_volatility").lower()
+    _regime_map = {
+        "low_volatility": "low_volatility",
+        "neutral_volatility": "neutral_volatility",
+        "high_volatility": "high_volatility",
+        "crisis_mode": "crisis_mode",
+    }
+    _regime_key = _regime_map.get(_regime_key, "neutral_volatility")
+
+    render_order_builder(
+        execution_engine=_exec_engine,
+        account_id=account_id,
+        current_portfolio_greeks=_current_greeks,
+        regime=_regime_key,
+    )
 
     # ── AI Insights: Risk Audit + Market Brief ─────────────────────────
     _urgency_color = {"green": "success", "yellow": "warning", "red": "error"}
