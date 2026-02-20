@@ -385,11 +385,11 @@ class TestSubmitStub:
         assert not mock_client.session.post.called
 
     def test_flatten_risk_raises_not_implemented(self):
-        """flatten_risk() is not yet implemented — must raise NotImplementedError."""
+        """flatten_risk() now implemented (T067) — verify basic empty list return."""
         engine, _ = _make_engine()
-
-        with pytest.raises(NotImplementedError):
-            engine.flatten_risk("U12345", [])
+        # No positions → empty list (T068: no short positions case)
+        result = engine.flatten_risk([])
+        assert result == []
 
 
 # ===========================================================================
@@ -552,3 +552,196 @@ class TestSubmitBehavior:
         assert result_order is not None
         # PENDING because we couldn't confirm delivery
         assert result_order.status == OrderStatus.PENDING
+
+
+# ===========================================================================
+# T066: flatten_risk() — TDD tests (must FAIL before T067-T068 are implemented)
+# ===========================================================================
+
+from datetime import date
+
+from models.unified_position import UnifiedPosition, InstrumentType
+
+
+def _make_short_put(symbol: str = "SPX_put", qty: float = -2.0) -> UnifiedPosition:
+    """A short put position (qty < 0, instrument_type == OPTION)."""
+    return UnifiedPosition(
+        symbol=symbol,
+        instrument_type=InstrumentType.OPTION,
+        broker="IBKR",
+        quantity=qty,
+        avg_price=5.0,
+        market_value=qty * 500.0,
+        unrealized_pnl=0.0,
+        underlying="SPX",
+        strike=4800.0,
+        expiration=date(2025, 3, 21),
+        option_type="put",
+    )
+
+
+def _make_long_call() -> UnifiedPosition:
+    """A long call position (qty > 0, instrument_type == OPTION)."""
+    return UnifiedPosition(
+        symbol="SPX_call",
+        instrument_type=InstrumentType.OPTION,
+        broker="IBKR",
+        quantity=1.0,
+        avg_price=10.0,
+        market_value=1000.0,
+        unrealized_pnl=0.0,
+        underlying="SPX",
+        strike=5200.0,
+        expiration=date(2025, 3, 21),
+        option_type="call",
+    )
+
+
+def _make_futures_position() -> UnifiedPosition:
+    """A short futures position (qty < 0, instrument_type == FUTURE)."""
+    return UnifiedPosition(
+        symbol="/ES",
+        instrument_type=InstrumentType.FUTURE,
+        broker="IBKR",
+        quantity=-1.0,
+        avg_price=5000.0,
+        market_value=-5000.0,
+        unrealized_pnl=0.0,
+    )
+
+
+def _make_equity_position() -> UnifiedPosition:
+    """A short stock position (qty < 0, instrument_type == EQUITY)."""
+    return UnifiedPosition(
+        symbol="AAPL",
+        instrument_type=InstrumentType.EQUITY,
+        broker="IBKR",
+        quantity=-10.0,
+        avg_price=180.0,
+        market_value=-1800.0,
+        unrealized_pnl=0.0,
+    )
+
+
+class TestFlattenRisk:
+    """T066 tests for ExecutionEngine.flatten_risk()."""
+
+    def _make_engine(self) -> ExecutionEngine:
+        mock_client = MagicMock()
+        mock_client.base_url = "https://localhost:5001"
+        mock_store = MagicMock()
+        mock_weighter = MagicMock()
+        return ExecutionEngine(
+            ibkr_gateway_client=mock_client,
+            local_store=mock_store,
+            beta_weighter=mock_weighter,
+        )
+
+    def test_returns_buy_to_close_for_short_options(self):
+        """flatten_risk() returns one BUY MARKET order per short option leg."""
+        engine = self._make_engine()
+        positions = [_make_short_put("SHORT_PUT_1"), _make_short_put("SHORT_PUT_2")]
+
+        orders = engine.flatten_risk(positions)
+
+        assert len(orders) == 2
+        assert all(isinstance(o, Order) for o in orders)
+        assert all(o.order_type == OrderType.MARKET for o in orders)
+        assert all(o.legs[0].action == OrderAction.BUY for o in orders)
+
+    def test_short_option_quantity_becomes_positive_buy(self):
+        """flatten_risk() converts negative qty to positive for BUY orders."""
+        engine = self._make_engine()
+        positions = [_make_short_put(qty=-3.0)]
+
+        orders = engine.flatten_risk(positions)
+
+        assert len(orders) == 1
+        assert orders[0].legs[0].quantity == 3  # positive int
+
+    def test_long_options_excluded_from_flatten(self):
+        """Long option positions must NOT be included in flatten."""
+        engine = self._make_engine()
+        positions = [_make_long_call()]
+
+        orders = engine.flatten_risk(positions)
+
+        assert orders == []
+
+    def test_futures_excluded_from_flatten(self):
+        """Short futures positions must NOT be included in flatten."""
+        engine = self._make_engine()
+        positions = [_make_futures_position()]
+
+        orders = engine.flatten_risk(positions)
+
+        assert orders == []
+
+    def test_equity_excluded_from_flatten(self):
+        """Short equity positions must NOT be included in flatten."""
+        engine = self._make_engine()
+        positions = [_make_equity_position()]
+
+        orders = engine.flatten_risk(positions)
+
+        assert orders == []
+
+    def test_mixed_portfolio_only_short_options(self):
+        """Only short option legs appear in flatten list; others excluded."""
+        engine = self._make_engine()
+        positions = [
+            _make_short_put("SHORT_PUT"),
+            _make_long_call(),
+            _make_futures_position(),
+            _make_equity_position(),
+        ]
+
+        orders = engine.flatten_risk(positions)
+
+        assert len(orders) == 1
+        assert orders[0].legs[0].symbol == "SHORT_PUT"
+
+    def test_no_short_positions_returns_empty_list(self):
+        """T068 — flatten_risk() returns [] when no short options exist."""
+        engine = self._make_engine()
+        positions = [_make_long_call(), _make_futures_position()]
+
+        orders = engine.flatten_risk(positions)
+
+        assert orders == []
+
+    def test_empty_portfolio_returns_empty_list(self):
+        """flatten_risk([]) returns empty list without raising."""
+        engine = self._make_engine()
+
+        orders = engine.flatten_risk([])
+
+        assert orders == []
+
+    def test_orders_not_transmitted(self):
+        """flatten_risk() must NOT call the broker endpoint — returns dry orders."""
+        engine = self._make_engine()
+        positions = [_make_short_put()]
+
+        engine.flatten_risk(positions)
+
+        # No POST to broker should occur
+        assert not engine._client.session.post.called
+
+    def test_flatten_order_user_rationale(self):
+        """Each flatten order has the standard rationale string."""
+        engine = self._make_engine()
+        positions = [_make_short_put()]
+
+        orders = engine.flatten_risk(positions)
+
+        assert "Flatten Risk" in orders[0].user_rationale
+
+    def test_flatten_order_status_is_simulated(self):
+        """Flattened orders are pre-approved (SIMULATED) status so submit() can be called directly."""
+        engine = self._make_engine()
+        positions = [_make_short_put()]
+
+        orders = engine.flatten_risk(positions)
+
+        assert orders[0].status == OrderStatus.SIMULATED

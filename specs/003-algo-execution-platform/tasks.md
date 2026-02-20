@@ -185,19 +185,19 @@ description: "Task list for 003-algo-execution-platform"
 
 > **Write these tests FIRST — ensure they FAIL before implementing T048–T056**
 
-- [ ] T047 [P] [US5] Write unit tests for `suggest_trades()` in existing test file or new `tests/test_ai_risk_auditor.py` — mock LLM returning 3 structured suggestions; mock LLM timeout → empty list (no exception raised); mock LLM invalid JSON → empty list; suggestion rationale stored in journal when acted upon
+- [x] T047 [P] [US5] Write unit tests for `suggest_trades()` in existing test file or new `tests/test_ai_risk_auditor.py` — mock LLM returning 3 structured suggestions; mock LLM timeout → empty list (no exception raised); mock LLM invalid JSON → empty list; suggestion rationale stored in journal when acted upon
 
 ### Implementation for User Story 5
 
-- [ ] T048 [US5] Extend `agents/llm_risk_auditor.py` — add `suggest_trades(portfolio_greeks: PortfolioGreeks, vix: float, regime: str, breach: RiskBreach, theta_budget: float) -> list[AITradeSuggestion]` method
-- [ ] T049 [US5] Implement `suggest_trades()` prompt — system role: "Quantitative options risk analyst specializing in income strategies"; include: current Greeks, VIX, regime, breach type + threshold + actual value, theta_budget; require response as JSON array of exactly 3 objects with fields: `legs[]`, `projected_delta_change`, `projected_theta_cost`, `rationale`
-- [ ] T050 [US5] Parse `suggest_trades()` LLM JSON response into `list[AITradeSuggestion]` dataclasses — validate field presence; on parse error or exception return empty list (never raise per FR-023); log errors to application log
-- [ ] T051 [US5] Hook risk breach detection → auto-invoke `suggest_trades()` in `dashboard/app.py` — watch `PortfolioGreeks` each refresh cycle; compare against limits in `config/risk_matrix.yaml`; if breach detected, call `llm_risk_auditor.suggest_trades()` in a background thread; store `list[AITradeSuggestion]` in session state
-- [ ] T052 [US5] Create `dashboard/components/ai_suggestions.py` — Streamlit component: displays breach alert banner (always, even if AI unavailable); renders up to 3 suggestion cards (or "AI unavailable — no suggestions" if list empty)
-- [ ] T053 [US5] Implement suggestion cards in `dashboard/components/ai_suggestions.py` — each card shows: underlying + legs summary, projected Greeks improvement delta, estimated Theta cost, rationale text; "Use This Trade" button
-- [ ] T054 [US5] Wire "Use This Trade" button → auto-fill `dashboard/components/order_builder.py` — populate leg fields from `AITradeSuggestion.legs`; store `ai_suggestion_id` in session state for journaling
-- [ ] T055 [US5] Attach `ai_suggestion_id` and `ai_rationale` to `TradeJournalEntry` in `core/execution.py` fill handler — only when trade originated from an AI suggestion (session state `ai_suggestion_id` is set)
-- [ ] T056 [US5] Wire `dashboard/components/ai_suggestions.py` into `dashboard/app.py` sidebar/panel
+- [x] T048 [US5] Extend `agents/llm_risk_auditor.py` — add `suggest_trades(portfolio_greeks: PortfolioGreeks, vix: float, regime: str, breach: RiskBreach, theta_budget: float) -> list[AITradeSuggestion]` method
+- [x] T049 [US5] Implement `suggest_trades()` prompt — system role: "Quantitative options risk analyst specializing in income strategies"; include: current Greeks, VIX, regime, breach type + threshold + actual value, theta_budget; require response as JSON array of exactly 3 objects with fields: `legs[]`, `projected_delta_change`, `projected_theta_cost`, `rationale`
+- [x] T050 [US5] Parse `suggest_trades()` LLM JSON response into `list[AITradeSuggestion]` dataclasses — validate field presence; on parse error or exception return empty list (never raise per FR-023); log errors to application log
+- [x] T051 [US5] Hook risk breach detection → auto-invoke `suggest_trades()` in `dashboard/app.py` — watch `PortfolioGreeks` each refresh cycle; compare against limits in `config/risk_matrix.yaml`; if breach detected, call `llm_risk_auditor.suggest_trades()` in a background thread; store `list[AITradeSuggestion]` in session state
+- [x] T052 [US5] Create `dashboard/components/ai_suggestions.py` — Streamlit component: displays breach alert banner (always, even if AI unavailable); renders up to 3 suggestion cards (or "AI unavailable — no suggestions" if list empty)
+- [x] T053 [US5] Implement suggestion cards in `dashboard/components/ai_suggestions.py` — each card shows: underlying + legs summary, projected Greeks improvement delta, estimated Theta cost, rationale text; "Use This Trade" button
+- [x] T054 [US5] Wire "Use This Trade" button → auto-fill `dashboard/components/order_builder.py` — populate leg fields from `AITradeSuggestion.legs`; store `ai_suggestion_id` in session state for journaling
+- [x] T055 [US5] Attach `ai_suggestion_id` and `ai_rationale` to `TradeJournalEntry` in `core/execution.py` fill handler — only when trade originated from an AI suggestion (session state `ai_suggestion_id` is set)
+- [x] T056 [US5] Wire `dashboard/components/ai_suggestions.py` into `dashboard/app.py` sidebar/panel
 
 **Checkpoint**: AI risk analyst live. Breach → 3 suggestions within 10s. Card → order builder pre-fill. AI unavailable → dashboard fully functional. Run `tests/test_ai_risk_auditor.py` — all pass.
 
@@ -213,19 +213,19 @@ description: "Task list for 003-algo-execution-platform"
 
 > **Write these tests FIRST — ensure they FAIL before implementing T058–T065**
 
-- [ ] T057 [P] [US6] Write `tests/test_trade_journal.py` snapshot section — unit tests: `capture_snapshot()` stores all required fields; `query_snapshots()` filters by date range; `delta_theta_ratio` stored as `theta / delta` (or None when delta = 0); background logger mock confirms rows inserted at interval
+- [x] T057 [P] [US6] Write `tests/test_trade_journal.py` snapshot section — unit tests: `capture_snapshot()` stores all required fields; `query_snapshots()` filters by date range; `delta_theta_ratio` stored as `theta / delta` (or None when delta = 0); background logger mock confirms rows inserted at interval
 
 ### Implementation for User Story 6
 
-- [ ] T058 [US6] Implement `database/local_store.py` `capture_snapshot(snapshot: AccountSnapshot) -> str` — insert row into `account_snapshots`; compute `delta_theta_ratio = theta / delta` if `delta != 0` else `None`; return UUID
-- [ ] T059 [US6] Implement `database/local_store.py` `query_snapshots(start_dt, end_dt, account_id) -> list[AccountSnapshot]` — ORDER BY captured_at ASC for chart rendering
-- [ ] T060 [US6] Implement background snapshot asyncio task in `dashboard/app.py` — use `st.session_state` to store the task handle and only create it once (`if 'snapshot_task' not in st.session_state`), since Streamlit re-runs the full script on every user interaction; use `threading.Thread(target=_snapshot_loop, daemon=True)` as the persistence mechanism (threading survives Streamlit reruns; asyncio tasks do not); `_snapshot_loop()` fetches Net Liquidation + `PortfolioGreeks` + VIX + regime every `SNAPSHOT_INTERVAL_SECONDS` seconds; calls `local_store.capture_snapshot()`; logs errors without crashing
-- [ ] T061 [US6] Add last-snapshot timestamp indicator to `dashboard/app.py` — small status text showing "Last snapshot: HH:MM:SS" (or "Snapshot logger error" if last run failed)
-- [ ] T062 [US6] Create `dashboard/components/historical_charts.py` — `render_account_vs_delta_chart(snapshots)` using Plotly `make_subplots(specs=[[{"secondary_y": True}]])`; primary y: Net Liquidation Value; secondary y: SPX Equivalent Delta; x-axis: timestamps
-- [ ] T063 [US6] Add `render_delta_theta_ratio_chart(snapshots)` to `dashboard/components/historical_charts.py` — Plotly line chart of `delta_theta_ratio` over time; label y-axis "Income-to-Risk Efficiency Ratio (Θ/Δ)"; render "N/A" points as gaps
-- [ ] T064 [US6] Add time-range filter to `dashboard/components/historical_charts.py` — `st.selectbox` with options: 1D, 1W, 1M, All; filters `snapshots` list before rendering both charts
-- [ ] T065 [US6] Wire `dashboard/components/historical_charts.py` into `dashboard/app.py` as a dedicated tab
-- [ ] T065b [US6] Add Sebastian `|Theta|/|Vega|` ratio panel to `dashboard/components/historical_charts.py` **[Constitution §III MANDATORY]** — render as colored gauge or time-series line; green band 0.25–0.40; red band <0.20 or >0.50; label: "Sebastian Ratio (|Θ|/|V|)"; display alongside the Theta/Delta chart; data source: `account_snapshots.theta` and `account_snapshots.vega`
+- [x] T058 [US6] Implement `database/local_store.py` `capture_snapshot(snapshot: AccountSnapshot) -> str` — insert row into `account_snapshots`; compute `delta_theta_ratio = theta / delta` if `delta != 0` else `None`; return UUID
+- [x] T059 [US6] Implement `database/local_store.py` `query_snapshots(start_dt, end_dt, account_id) -> list[AccountSnapshot]` — ORDER BY captured_at ASC for chart rendering
+- [x] T060 [US6] Implement background snapshot asyncio task in `dashboard/app.py` — use `st.session_state` to store the task handle and only create it once (`if 'snapshot_task' not in st.session_state`), since Streamlit re-runs the full script on every user interaction; use `threading.Thread(target=_snapshot_loop, daemon=True)` as the persistence mechanism (threading survives Streamlit reruns; asyncio tasks do not); `_snapshot_loop()` fetches Net Liquidation + `PortfolioGreeks` + VIX + regime every `SNAPSHOT_INTERVAL_SECONDS` seconds; calls `local_store.capture_snapshot()`; logs errors without crashing
+- [x] T061 [US6] Add last-snapshot timestamp indicator to `dashboard/app.py` — small status text showing "Last snapshot: HH:MM:SS" (or "Snapshot logger error" if last run failed)
+- [x] T062 [US6] Create `dashboard/components/historical_charts.py` — `render_account_vs_delta_chart(snapshots)` using Plotly `make_subplots(specs=[[{"secondary_y": True}]])`; primary y: Net Liquidation Value; secondary y: SPX Equivalent Delta; x-axis: timestamps
+- [x] T063 [US6] Add `render_delta_theta_ratio_chart(snapshots)` to `dashboard/components/historical_charts.py` — Plotly line chart of `delta_theta_ratio` over time; label y-axis "Income-to-Risk Efficiency Ratio (Θ/Δ)"; render "N/A" points as gaps
+- [x] T064 [US6] Add time-range filter to `dashboard/components/historical_charts.py` — `st.selectbox` with options: 1D, 1W, 1M, All; filters `snapshots` list before rendering both charts
+- [x] T065 [US6] Wire `dashboard/components/historical_charts.py` into `dashboard/app.py` as a dedicated tab
+- [x] T065b [US6] Add Sebastian `|Theta|/|Vega|` ratio panel to `dashboard/components/historical_charts.py` **[Constitution §III MANDATORY]** — render as colored gauge or time-series line; green band 0.25–0.40; red band <0.20 or >0.50; label: "Sebastian Ratio (|Θ|/|V|)"; display alongside the Theta/Delta chart; data source: `account_snapshots.theta` and `account_snapshots.vega`
 
 **Checkpoint**: Background snapshot logger running. Historical charts tab functional with dual-axis and ratio charts. Time-range filter works. Run `tests/test_trade_journal.py` snapshot section — all pass.
 
@@ -241,17 +241,17 @@ description: "Task list for 003-algo-execution-platform"
 
 > **Write these tests FIRST — ensure they FAIL before implementing T067–T073**
 
-- [ ] T066 [P] [US7] Write `tests/test_execution.py` flatten_risk() section — unit tests: only short option positions included in buy-to-close list; long options and futures excluded; "no short positions" case returns empty list with message; all orders submitted simultaneously on confirm; each fill journaled with correct rationale string
+- [x] T066 [P] [US7] Write `tests/test_execution.py` flatten_risk() section — unit tests: only short option positions included in buy-to-close list; long options and futures excluded; "no short positions" case returns empty list with message; all orders submitted simultaneously on confirm; each fill journaled with correct rationale string
 
 ### Implementation for User Story 7
 
-- [ ] T067 [US7] Implement `ExecutionEngine.flatten_risk(positions: list[Position]) -> list[Order]` in `core/execution.py` — filter positions to short option legs only (qty < 0 and instrument_type in {CALL, PUT}); create one buy-to-close market order per short leg; return order list without transmitting
-- [ ] T068 [US7] Handle "no short positions" edge case in `ExecutionEngine.flatten_risk()` — return empty list; caller displays "No short positions to close"
-- [ ] T069 [US7] Add "Flatten Risk" button to `dashboard/app.py` — visible in main header or first sidebar section (accessible within 2 clicks); opens confirmation dialog on click
-- [ ] T070 [US7] Implement flatten confirmation dialog in `dashboard/app.py` — display all buy-to-close orders in a table; show total estimated margin release; "Confirm Flatten" button and "Cancel" button; Cancel → no orders sent
-- [ ] T071 [US7] Implement "Confirm Flatten" action — `ExecutionEngine.submit()` called for all flatten orders simultaneously (asyncio.gather); orders transmitted in one batch
-- [ ] T072 [US7] Journal each flatten fill in `core/execution.py` fill handler — same flow as US4 fill journaling; hardcode `user_rationale = "Flatten Risk — user-initiated"`; `strategy_tag = "FLATTEN"`
-- [ ] T073 [US7] Add unfilled flatten orders to order blotter in `dashboard/app.py` — remain visible with status PENDING until filled or cancelled
+- [x] T067 [US7] Implement `ExecutionEngine.flatten_risk(positions: list[Position]) -> list[Order]` in `core/execution.py` — filter positions to short option legs only (qty < 0 and instrument_type in {CALL, PUT}); create one buy-to-close market order per short leg; return order list without transmitting
+- [x] T068 [US7] Handle "no short positions" edge case in `ExecutionEngine.flatten_risk()` — return empty list; caller displays "No short positions to close"
+- [x] T069 [US7] Add "Flatten Risk" button to `dashboard/app.py` — visible in main header or first sidebar section (accessible within 2 clicks); opens confirmation dialog on click
+- [x] T070 [US7] Implement flatten confirmation dialog in `dashboard/app.py` — display all buy-to-close orders in a table; show total estimated margin release; "Confirm Flatten" button and "Cancel" button; Cancel → no orders sent
+- [x] T071 [US7] Implement "Confirm Flatten" action — `ExecutionEngine.submit()` called for all flatten orders simultaneously (asyncio.gather); orders transmitted in one batch
+- [x] T072 [US7] Journal each flatten fill in `core/execution.py` fill handler — same flow as US4 fill journaling; hardcode `user_rationale = "Flatten Risk — user-initiated"`; `strategy_tag = "FLATTEN"`
+- [x] T073 [US7] Add unfilled flatten orders to order blotter in `dashboard/app.py` — remain visible with status PENDING until filled or cancelled
 
 **Checkpoint**: Flatten Risk fully functional. Confirmation-to-submission under 30s (SC-006). All fills journaled. Run `tests/test_execution.py` flatten_risk() section — all pass.
 
@@ -261,11 +261,11 @@ description: "Task list for 003-algo-execution-platform"
 
 **Purpose**: Final validation, documentation, and cleanup across all user stories.
 
-- [ ] T074 [P] Run full pytest suite (`pytest tests/ -v --tb=short`) — fix any regressions; target ≥80% coverage for `risk_engine/`, `core/`, `models/`, `adapters/`; confirm all 7 user story test files pass
-- [ ] T075 [P] Update `README.md` — add section for new modules (BetaWeighter, ExecutionEngine, TradeJournal, AI Analyst, Historical Charts, Flatten Risk); update startup instructions with new env vars
-- [ ] T076 Update `docs/IMPROVEMENTS.md` — document architecture decisions, known limitations, and next steps for this feature
-- [ ] T077 [P] Validate `quickstart.md` test scenarios still accurate — update any changed file paths, env vars, or commands
-- [ ] T078 Perform end-to-end manual test per `quickstart.md` — complete all test scenarios in sequence; verify SC-001 through SC-008 met
+- [x] T074 [P] Run full pytest suite (`pytest tests/ -v --tb=short`) — fix any regressions; target ≥80% coverage for `risk_engine/`, `core/`, `models/`, `adapters/`; confirm all 7 user story test files pass
+- [x] T075 [P] Update `README.md` — add section for new modules (BetaWeighter, ExecutionEngine, TradeJournal, AI Analyst, Historical Charts, Flatten Risk); update startup instructions with new env vars
+- [x] T076 Update `docs/IMPROVEMENTS.md` — document architecture decisions, known limitations, and next steps for this feature
+- [x] T077 [P] Validate `quickstart.md` test scenarios still accurate — update any changed file paths, env vars, or commands
+- [x] T078 Perform end-to-end manual test per `quickstart.md` — complete all test scenarios in sequence; verify SC-001 through SC-008 met
 
 ---
 

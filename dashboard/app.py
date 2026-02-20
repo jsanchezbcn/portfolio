@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import threading
+import time
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import json
 import logging
@@ -32,6 +34,121 @@ from risk_engine.regime_detector import RegimeDetector
 
 
 LOGGER = setup_logging("dashboard")
+
+SNAPSHOT_INTERVAL_SECONDS = int(os.getenv("SNAPSHOT_INTERVAL_SECONDS", "900"))  # 15 min default
+
+
+# ---------------------------------------------------------------------------
+# Background snapshot logger (T060)
+# ---------------------------------------------------------------------------
+
+def _snapshot_loop(
+    *,
+    account_id: str,
+    adapter: Any,
+    portfolio_tools: Any,
+    regime_detector: Any,
+    interval: int,
+) -> None:
+    """Thread target: capture a portfolio snapshot every ``interval`` seconds.
+
+    Threading (not asyncio) survives Streamlit reruns.
+    Errors are logged but never crash the thread.
+    """
+    from database.local_store import LocalStore
+    from models.order import AccountSnapshot
+    from agent_tools.market_data_tools import MarketDataTools as _MDT
+
+    store = LocalStore()
+    logger = logging.getLogger(__name__ + ".snapshot_loop")
+
+    while True:
+        try:
+            market_tools = _MDT()
+            vix_info = market_tools.get_vix_data()
+            vix = float(vix_info.get("vix", 0.0))
+
+            adapter_client = getattr(adapter, "client", None)
+            summary_getter = getattr(adapter_client, "get_account_summary", None)
+            ibkr_summary = summary_getter(account_id) if callable(summary_getter) else {}
+            net_liq = None
+            if isinstance(ibkr_summary, dict):
+                raw = ibkr_summary.get("netliquidation")
+                try:
+                    net_liq = float(raw.get("amount")) if isinstance(raw, dict) else float(raw)
+                except (TypeError, ValueError, AttributeError):
+                    net_liq = None
+
+            positions = getattr(adapter, "last_positions", None) or []
+            summary = portfolio_tools.get_portfolio_summary(positions)
+            regime = regime_detector.detect_regime(vix=vix, term_structure=float(vix_info.get("term_structure", 1.0)))
+
+            spx_info = market_tools.get_market_data("SPX") or {}
+            spx_price = None
+            try:
+                spx_price = float(spx_info.get("last") or spx_info.get("close") or 0) or None
+            except (TypeError, ValueError):
+                spx_price = None
+
+            captured_at = datetime.now(timezone.utc).isoformat()
+            snap = AccountSnapshot(
+                captured_at=captured_at,
+                account_id=account_id,
+                broker="IBKR",
+                net_liquidation=net_liq,
+                spx_delta=float(summary.get("total_spx_delta", 0.0)),
+                gamma=float(summary.get("total_gamma", 0.0)),
+                theta=float(summary.get("total_theta", 0.0)),
+                vega=float(summary.get("total_vega", 0.0)),
+                vix=vix,
+                spx_price=spx_price,
+                regime=getattr(regime, "name", str(regime)),
+            )
+            asyncio.run(store.capture_snapshot(snap))
+            logger.info("Snapshot captured at %s (account=%s)", captured_at, account_id)
+            # Record last success timestamp for dashboard indicator
+            import streamlit as _st
+            try:
+                _st.session_state["_snapshot_last_at"] = captured_at
+                _st.session_state["_snapshot_last_error"] = None
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.warning("Snapshot loop error: %s", exc)
+            try:
+                import streamlit as _st
+                _st.session_state["_snapshot_last_error"] = str(exc)[:120]
+            except Exception:
+                pass
+
+        time.sleep(interval)
+
+
+def _start_snapshot_logger(
+    *,
+    account_id: str,
+    adapter: Any,
+    portfolio_tools: Any,
+    regime_detector: Any,
+) -> None:
+    """Start the background snapshot thread once per Streamlit session (T060)."""
+    if st.session_state.get("_snapshot_thread_started"):
+        return
+    st.session_state["_snapshot_thread_started"] = True
+    thread = threading.Thread(
+        target=_snapshot_loop,
+        kwargs=dict(
+            account_id=account_id,
+            adapter=adapter,
+            portfolio_tools=portfolio_tools,
+            regime_detector=regime_detector,
+            interval=SNAPSHOT_INTERVAL_SECONDS,
+        ),
+        daemon=True,
+        name="snapshot-logger",
+    )
+    thread.start()
+    LOGGER.info("Snapshot logger thread started (interval=%ds)", SNAPSHOT_INTERVAL_SECONDS)
 
 
 def positions_cache_path(account_id: str) -> Path:
@@ -396,6 +513,11 @@ def main() -> None:
     ibkr_only_mode = st.sidebar.checkbox("IBKR-only mode (no external Greeks)", value=True)
 
     # ── LLM model picker ──────────────────────────────────────────────
+    # ── Flatten Risk sidebar shortcut (T069: accessible within 2 clicks) ─
+    if st.sidebar.button("🚨 Flatten Risk", key="sidebar_flatten_risk_btn",
+                         help="Buy-to-close all short options — confirmation required"):
+        st.session_state["_sidebar_flatten_requested"] = True
+
     st.sidebar.subheader("🤖 AI / LLM Settings")
     _all_models = _get_available_models()
     _model_labels = [f"{m['name']} {'🆓' if m['is_free'] else '💰'}" for m in _all_models]
@@ -529,6 +651,14 @@ def main() -> None:
     summary = portfolio_tools.get_portfolio_summary(positions)
     violations = portfolio_tools.check_risk_limits(summary, regime)
 
+    # T060: Start background snapshot logger (once per session)
+    _start_snapshot_logger(
+        account_id=account_id,
+        adapter=adapter,
+        portfolio_tools=portfolio_tools,
+        regime_detector=regime_detector,
+    )
+
     previous_regime = st.session_state.get("last_regime_name")
     current_regime = str(regime.name)
     if previous_regime is not None and previous_regime != current_regime:
@@ -563,6 +693,18 @@ def main() -> None:
                 st.caption(f"{label}: {timestamp} UTC ({age_minutes:.1f} min old)")
             else:
                 st.caption(f"{label}: N/A")
+
+        # T061: Last snapshot indicator
+        _snap_at = st.session_state.get("_snapshot_last_at")
+        _snap_err = st.session_state.get("_snapshot_last_error")
+        if _snap_err:
+            st.caption(f"Snapshot logger error: {_snap_err[:60]}")
+        elif _snap_at:
+            _snap_age = _age_minutes_from_iso(_snap_at)
+            _snap_age_str = f" ({_snap_age:.1f} min old)" if _snap_age is not None else ""
+            st.caption(f"Last snapshot: {_snap_at[11:19]} UTC{_snap_age_str}")
+        else:
+            st.caption("Snapshot logger: starting… (first snapshot in 15 min)")
 
     if ibkr_summary:
         st.subheader("IBKR Account Summary")
@@ -974,6 +1116,17 @@ def main() -> None:
         account_id=account_id,
     )
 
+    # ── Flatten Risk (T069-T073) ────────────────────────────────────────
+    try:
+        from dashboard.components.flatten_risk import render_flatten_risk
+        render_flatten_risk(
+            execution_engine=_exec_engine,
+            account_id=account_id,
+            positions=positions,
+        )
+    except Exception as _fr_exc:
+        LOGGER.warning("Flatten Risk panel failed: %s", _fr_exc)
+
     # ── Trade Journal (T046) ────────────────────────────────────────────
     try:
         from dashboard.components.trade_journal_view import render_trade_journal
@@ -982,6 +1135,27 @@ def main() -> None:
         render_trade_journal(_journal_store)
     except Exception as _tj_exc:
         LOGGER.warning("Trade journal panel failed: %s", _tj_exc)
+
+    # ── AI Risk Analyst: Breach Detection + Trade Suggestions (T051/T056) ──
+    try:
+        from dashboard.components.ai_suggestions import render_ai_suggestions
+        render_ai_suggestions(
+            violations=violations,
+            portfolio_greeks=_current_greeks,
+            vix=float(vix_data.get("vix", 0.0)),
+            regime=_regime_key,
+        )
+    except Exception as _ai_exc:
+        LOGGER.warning("AI suggestions panel failed: %s", _ai_exc)
+
+    # ── Historical Charts (T062-T065b) ─────────────────────────────────
+    try:
+        from dashboard.components.historical_charts import render_historical_charts
+        from database.local_store import LocalStore as _LSH
+        _hist_store = _LSH()
+        render_historical_charts(_hist_store)
+    except Exception as _hc_exc:
+        LOGGER.warning("Historical charts panel failed: %s", _hc_exc)
 
     # ── AI Insights: Risk Audit + Market Brief ─────────────────────────
     _urgency_color = {"green": "success", "yellow": "warning", "red": "error"}

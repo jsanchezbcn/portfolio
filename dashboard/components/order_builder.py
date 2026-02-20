@@ -118,6 +118,17 @@ def _render_inner(
         )
         st.stop()
 
+    # ── T054: AI suggestion pre-fill ───────────────────────────────────────
+    ai_prefill_legs = st.session_state.pop("ai_prefill_legs", None)
+    if ai_prefill_legs:
+        st.session_state[_SS_LEG_COUNT] = len(ai_prefill_legs)
+        for i, leg in enumerate(ai_prefill_legs):
+            action_val = getattr(getattr(leg, "action", None), "value", "SELL")
+            st.session_state[f"ob_action_{i}"] = action_val
+            st.session_state[f"ob_symbol_{i}"] = getattr(leg, "symbol", "SPX")
+            st.session_state[f"ob_qty_{i}"] = max(1, int(getattr(leg, "quantity", 1)))
+        st.info("ℹ️ Order builder pre-filled from AI suggestion. Review legs before simulating.")
+
     # ── Leg count + order type ─────────────────────────────────────────────
     if _SS_LEG_COUNT not in st.session_state:
         st.session_state[_SS_LEG_COUNT] = 1
@@ -269,6 +280,11 @@ def _render_inner(
             st.session_state[_SS_SIMULATING] = False
             st.rerun()
         else:
+            # T054/T055: Attach AI suggestion context if trade originated from suggestion
+            ai_sid = st.session_state.get("ai_suggestion_id", "")
+            if ai_sid:
+                order.ai_suggestion_id = ai_sid
+                order.ai_rationale = st.session_state.get("ai_rationale", "")
             st.session_state[_SS_ORDER] = order
             with st.spinner("Sending WhatIf request to IBKR…"):
                 try:

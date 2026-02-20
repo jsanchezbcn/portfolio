@@ -188,6 +188,7 @@ class Order:
 
     # AI context (if trade originated from a suggestion)
     ai_suggestion_id: Optional[str] = None
+    ai_rationale: Optional[str] = None
 
     def __post_init__(self) -> None:
         if len(self.legs) < 1:

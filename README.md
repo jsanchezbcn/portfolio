@@ -1,6 +1,6 @@
 # Portfolio Risk Manager
 
-Portfolio risk dashboard combining IBKR positions with options Greeks enrichment and regime-aware risk monitoring.
+Portfolio risk dashboard combining IBKR positions with options Greeks enrichment, regime-aware risk monitoring, AI trade suggestions, and a full trade journal.
 
 ## Features
 
@@ -11,7 +11,20 @@ Portfolio risk dashboard combining IBKR positions with options Greeks enrichment
 - Theta/Vega profile visualization with target zone
 - IV vs HV analysis with edge classification
 - Regime detection using VIX term structure + Polymarket recession probability
+- **BetaWeighter** — per-position SPX beta-weighted delta (Tastytrade data + yfinance fallback)
+- **ExecutionEngine** — multi-leg BAG combo order routing, WhatIf simulation, PARTIAL fill support
+- **Trade Journal** — persistent SQLite log of all fills with VIX, regime, Greeks captured at fill time; CSV export
+- **AI Risk Analyst** — GPT-4.1 trade suggestions on risk breaches; pre-fills order builder on "Use This Trade"
+- **Historical Charts** — NLV vs SPX-Delta dual-axis, Theta/Delta efficiency ratio, Sebastian |Θ|/|V| ratio
+- **Flatten Risk** — one-click buy-to-close all short options with mandatory confirmation dialog
 - AI assistant scaffolding with tool schema definitions
+
+## New Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_MODEL` | `gpt-4.1` | LLM model for AI Risk Analyst / Market Brief |
+| `SNAPSHOT_INTERVAL_SECONDS` | `900` | Seconds between account snapshot captures (15 min) |
 
 ## Setup
 
@@ -38,13 +51,22 @@ This script ensures IBKR Client Portal is reachable, then launches Streamlit.
 
 ## Testing
 
-Run focused tests with project venv:
+Run the full focused test suite:
 
 ```bash
-./.venv/bin/python -m pytest tests/test_portfolio_tools.py -q
-./.venv/bin/python -m pytest tests/test_iv_hv_calculator.py -q
-./.venv/bin/python -m pytest tests/test_polymarket_adapter.py -q
+./.venv/bin/python -m pytest tests/ --ignore=tests/integration -q
 ```
+
+Key test files:
+
+| File | Coverage |
+|---|---|
+| `tests/test_execution.py` | ExecutionEngine simulate/submit/flatten_risk |
+| `tests/test_trade_journal.py` | LocalStore record_fill/query_journal/export_csv/snapshots |
+| `tests/test_ai_risk_auditor.py` | LLMRiskAuditor.suggest_trades() |
+| `tests/test_orders.py` | Order FSM, OrderLeg, BAG combo |
+| `tests/test_order_builder.py` | Streamlit order builder component |
+| `tests/test_arbitrage.py` | ArbitrageHunter |
 
 Integration tests (require credentials/network):
 

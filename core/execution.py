@@ -32,7 +32,10 @@ import yaml
 
 from models.order import (
     Order,
+    OrderAction,
+    OrderLeg,
     OrderStatus,
+    OrderType,
     PortfolioGreeks,
     SimulationResult,
     TradeJournalEntry,
@@ -502,6 +505,7 @@ class ExecutionEngine:
                 post_greeks_json="{}",  # T042: post-Greeks not yet available at fill time
                 user_rationale=order.user_rationale or None,
                 ai_suggestion_id=order.ai_suggestion_id,
+                ai_rationale=getattr(order, "ai_rationale", None),
             )
 
             def _do_record():
@@ -539,20 +543,56 @@ class ExecutionEngine:
             return None
 
     # ------------------------------------------------------------------
-    # flatten_risk() — BATCH LIVE ORDERS — NOT YET IMPLEMENTED (T066)
+    # flatten_risk() — Generate buy-to-close orders for short options (T067-T068)
     # ------------------------------------------------------------------
 
-    def flatten_risk(self, account_id: str, positions: list) -> list[Order]:
-        """Generate buy-to-close market orders for all short option legs.
+    def flatten_risk(self, positions: list) -> list[Order]:
+        """Generate buy-to-close MARKET orders for all short option legs.
 
-        ⚠ SAFETY: Requires a dedicated confirmation dialog before any call.
+        Filters positions to short options only (qty < 0, instrument_type OPTION).
+        Long options, futures, and equities are excluded.
+        Orders are returned WITHOUT transmitting — caller must confirm and submit.
 
-        Not yet implemented — stub raises ``NotImplementedError`` until T066.
+        Args:
+            positions: List of ``UnifiedPosition`` objects from the adapter.
+
+        Returns:
+            List of ``Order`` objects in SIMULATED status (pre-approved for submit).
+            Empty list if no short options exist (T068).
         """
-        raise NotImplementedError(
-            "flatten_risk() is not yet implemented.  "
-            "Requires T066–T073 implementation + explicit panel confirmation."
-        )
+        from models.unified_position import InstrumentType
+
+        orders: list[Order] = []
+        for pos in positions:
+            # Only short option positions: quantity < 0 and instrument_type OPTION
+            if (
+                getattr(pos, "instrument_type", None) == InstrumentType.OPTION
+                and float(getattr(pos, "quantity", 0)) < 0
+            ):
+                qty = abs(int(getattr(pos, "quantity", 1)))
+                if qty == 0:
+                    qty = 1
+                symbol = getattr(pos, "symbol", "UNKNOWN")
+
+                leg = OrderLeg(
+                    symbol=symbol,
+                    action=OrderAction.BUY,
+                    quantity=qty,
+                    conid=getattr(pos, "broker_id", None),
+                )
+                try:
+                    order = Order(
+                        legs=[leg],
+                        order_type=OrderType.MARKET,
+                        user_rationale="Flatten Risk — user-initiated",
+                    )
+                    # Pre-approve so submit() can be called directly
+                    order.transition_to(OrderStatus.SIMULATED)
+                    orders.append(order)
+                except ValueError as exc:
+                    logger.warning("flatten_risk: skipped %s — %s", symbol, exc)
+
+        return orders
 
     # ------------------------------------------------------------------
     # Internal helpers
