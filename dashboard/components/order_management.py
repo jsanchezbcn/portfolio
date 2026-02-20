@@ -55,19 +55,44 @@ def _status_badge(status: str) -> str:
 
 
 def _fetch_open_orders(client: Any, account_id: str) -> list[dict]:
-    """Call GET /v1/api/iserver/account/orders and return order list."""
+    """Call GET /v1/api/iserver/account/orders and return order list.
+
+    IBKR quirks handled here:
+    - Do NOT pass ``force=true`` — it causes a snapshot-reset returning empty.
+    - Do NOT pass ``filters=active`` — wrong param; use client-side filtering.
+    - When ``snapshot=True`` the CP gateway returns cached data; still usable.
+    - Prime the session with /iserver/accounts before fetching orders so the
+      platform has a valid account context.
+    """
     try:
+        # Prime the CP gateway account context (no-op if already primed)
+        try:
+            client.session.get(
+                f"{client.base_url}/v1/api/iserver/accounts",
+                verify=False,
+                timeout=5,
+            )
+        except Exception:
+            pass  # Non-fatal — worst case we get stale snapshot data
+
         url = f"{client.base_url}/v1/api/iserver/account/orders"
         resp = client.session.get(
             url,
-            params={"accountId": account_id, "filters": "active"},
             verify=False,
-            timeout=10,
+            timeout=15,
         )
         if resp.status_code == 200:
             body = resp.json()
             orders = body.get("orders", []) if isinstance(body, dict) else body
-            return [o for o in (orders if isinstance(orders, list) else [])]
+            all_orders = [o for o in (orders if isinstance(orders, list) else [])]
+            # Filter to the selected account (IBKR returns all accounts' orders)
+            if account_id and account_id.lower() != "all":
+                all_orders = [
+                    o for o in all_orders
+                    if str(o.get("account") or o.get("acctId") or "").upper()
+                    == account_id.upper()
+                ]
+            return all_orders
         logger.warning(
             "fetch_open_orders HTTP %d: %s", resp.status_code, resp.text[:200]
         )
@@ -149,7 +174,139 @@ def _modify_order(
 
 
 # ---------------------------------------------------------------------------
-# UI
+# UI helpers
+# ---------------------------------------------------------------------------
+
+
+def _render_order_list(
+    orders: list[dict],
+    client: Any,
+    account_id: str,
+    *,
+    prefix: str = "o",
+    show_actions: bool = True,
+) -> None:
+    """Render a list of order rows with optional cancel/modify actions."""
+    for idx, order in enumerate(orders):
+        order_id = str(order.get("orderId") or order.get("order_id") or "")
+        symbol = (
+            order.get("ticker")
+            or order.get("symbol")
+            or "—"
+        )
+        side = str(order.get("side") or "").upper()
+        qty = order.get("totalSize") or order.get("remainingQuantity") or order.get("quantity") or 0
+        filled = order.get("filledQuantity") or 0
+        order_type = str(order.get("orderType") or order.get("origOrderType") or "LMT")
+        price_raw = order.get("price") or order.get("lmtPrice")
+        status = str(order.get("status") or "Unknown")
+        # Use the rich description IBKR provides when available
+        desc = (
+            order.get("orderDesc")
+            or order.get("description2")
+            or order.get("description1")
+            or ""
+        )
+        tif = order.get("timeInForce") or ""
+
+        try:
+            price_val: Optional[float] = float(str(price_raw)) if price_raw is not None else None
+        except (ValueError, TypeError):
+            price_val = None
+
+        with st.container(border=True):
+            h_col1, h_col2, h_col3 = st.columns([4, 2, 2])
+            with h_col1:
+                side_color = "green" if side in ("BUY", "B") else "red"
+                filled_str = f" ({filled} filled)" if float(filled or 0) > 0 else ""
+                st.markdown(
+                    f"**{symbol}** &nbsp; :{side_color}[{side}] &nbsp; qty **{qty}**{filled_str}",
+                )
+                if desc:
+                    st.caption(desc)
+            with h_col2:
+                price_str = f"@ {price_val:.2f}" if price_val is not None else "@ MKT"
+                st.markdown(f"`{order_type}` {price_str}")
+                if tif:
+                    st.caption(f"TIF: {tif}")
+            with h_col3:
+                st.markdown(_status_badge(status))
+                if order_id:
+                    st.caption(f"ID: {order_id}")
+
+            if show_actions:
+                action_col1, action_col2 = st.columns(2)
+
+                # ── Cancel ─────────────────────────────────────────
+                with action_col1:
+                    with st.expander("🗑️ Cancel"):
+                        st.warning(
+                            f"Cancel **{side} {qty}× {symbol}** (Order {order_id})?"
+                        )
+                        confirmed = st.checkbox(
+                            "I confirm — cancel this order",
+                            key=f"om_{prefix}_cancel_confirm_{idx}_{order_id}",
+                        )
+                        if st.button(
+                            "Submit Cancellation",
+                            key=f"om_{prefix}_cancel_btn_{idx}_{order_id}",
+                            disabled=not confirmed,
+                            type="primary",
+                        ):
+                            ok, msg = _cancel_order(client, account_id, order_id)
+                            if ok:
+                                st.success(f"✅ {msg}")
+                                st.session_state.pop("om_orders_cache", None)
+                            else:
+                                st.error(f"❌ {msg}")
+
+                # ── Modify ─────────────────────────────────────────
+                with action_col2:
+                    with st.expander("✏️ Modify"):
+                        st.caption("Set 0 to leave a field unchanged.")
+                        new_price_input = st.number_input(
+                            "New Limit Price",
+                            min_value=0.0,
+                            value=abs(price_val) if price_val is not None else 0.0,
+                            step=0.25,
+                            format="%.2f",
+                            key=f"om_{prefix}_mod_price_{idx}_{order_id}",
+                        )
+                        new_qty_input = st.number_input(
+                            "New Quantity",
+                            min_value=0.0,
+                            value=float(qty) if qty else 0.0,
+                            step=1.0,
+                            format="%.0f",
+                            key=f"om_{prefix}_mod_qty_{idx}_{order_id}",
+                        )
+                        mod_confirmed = st.checkbox(
+                            "I confirm the changes",
+                            key=f"om_{prefix}_mod_confirm_{idx}_{order_id}",
+                        )
+                        if st.button(
+                            "Submit Modification",
+                            key=f"om_{prefix}_mod_btn_{idx}_{order_id}",
+                            disabled=not mod_confirmed,
+                        ):
+                            _new_price = new_price_input if new_price_input > 0 else None
+                            _new_qty = new_qty_input if new_qty_input > 0 else None
+                            ok, msg = _modify_order(
+                                client,
+                                account_id,
+                                order_id,
+                                new_price=_new_price,
+                                new_quantity=_new_qty,
+                            )
+                            if ok:
+                                st.success(f"✅ {msg}")
+                                st.session_state.pop("om_orders_cache", None)
+                            else:
+                                st.error(f"❌ {msg}")
+
+
+# ---------------------------------------------------------------------------
+# Main render
 # ---------------------------------------------------------------------------
 
 
@@ -197,131 +354,35 @@ def render_order_management(
         orders = st.session_state["om_orders_cache"]
 
     if not orders:
-        st.info("No open orders for this account.")
+        st.info("No orders found for this account. Use 🔄 Refresh to reload.")
         return
 
-    st.caption(f"Showing **{len(orders)}** order(s)")
+    # Split active vs terminal
+    _terminal = {"Filled", "Cancelled", "Rejected", "Inactive"}
+    active_orders = [o for o in orders if str(o.get("status", "")) not in _terminal]
+    history_orders = [o for o in orders if str(o.get("status", "")) in _terminal]
 
-    # ── Per-order rows ────────────────────────────────────────────────
-    for idx, order in enumerate(orders):
-        order_id = str(order.get("orderId") or order.get("order_id") or "")
-        symbol = order.get("ticker") or order.get("symbol") or order.get("conidex") or "—"
-        side = str(order.get("side") or order.get("sideDescription") or "").upper()
-        qty = order.get("totalSize") or order.get("remainingQuantity") or order.get("quantity") or 0
-        filled = order.get("filledQuantity") or order.get("filled") or 0
-        order_type = str(order.get("orderType") or order.get("order_type") or "MKT")
-        price = order.get("price") or order.get("lmtPrice") or None
-        status = str(order.get("status") or order.get("order_status") or "Unknown")
-        description = order.get("description1") or order.get("description") or ""
+    st.caption(
+        f"**{len(active_orders)}** active order(s) · "
+        f"{len(history_orders)} completed today"
+    )
 
-        # Skip already-terminal orders from the "active" filter response
-        if status in {"Filled", "Cancelled", "Rejected"}:
-            continue
+    # ── Active orders first ───────────────────────────────────────────
+    if active_orders:
+        st.markdown("#### 🟢 Active Orders")
+        _render_order_list(active_orders, ibkr_gateway_client, account_id, prefix="act")
+    else:
+        st.info("No active (open) orders right now.")
 
-        with st.container(border=True):
-            # ── Header row ──────────────────────────────────────────
-            h_col1, h_col2, h_col3, h_col4 = st.columns([3, 2, 2, 2])
-            with h_col1:
-                side_color = "green" if side in ("BUY", "B") else "red"
-                st.markdown(
-                    f"**{symbol}** &nbsp; :{side_color}[{side}] &nbsp; qty **{qty}**"
-                    + (f" (filled {filled})" if filled else ""),
-                    unsafe_allow_html=True,
-                )
-                if description:
-                    st.caption(description)
-            with h_col2:
-                price_str = f"@ {price:.4f}" if price is not None else "@ MKT"
-                st.markdown(f"`{order_type}` {price_str}")
-            with h_col3:
-                st.markdown(_status_badge(status))
-                if order_id:
-                    st.caption(f"Order ID: {order_id}")
-            with h_col4:
-                # Placeholder — action buttons in expanders below
-                pass
-
-            # ── Action expanders ────────────────────────────────────
-            action_col1, action_col2 = st.columns(2)
-
-            # ── Cancel ─────────────────────────────────────────────
-            with action_col1:
-                with st.expander("🗑️ Cancel Order"):
-                    st.warning(
-                        f"Cancel **{side} {qty}x {symbol}** (Order {order_id})?"
-                    )
-                    confirmed = st.checkbox(
-                        "I confirm I want to cancel this order",
-                        key=f"om_cancel_confirm_{idx}_{order_id}",
-                    )
-                    if st.button(
-                        "Submit Cancellation",
-                        key=f"om_cancel_btn_{idx}_{order_id}",
-                        disabled=not confirmed,
-                        type="primary",
-                    ):
-                        ok, msg = _cancel_order(
-                            ibkr_gateway_client, account_id, order_id
-                        )
-                        if ok:
-                            st.success(f"✅ {msg}")
-                            # Bust cache so next render re-fetches
-                            st.session_state.pop("om_orders_cache", None)
-                        else:
-                            st.error(f"❌ {msg}")
-
-            # ── Modify ─────────────────────────────────────────────
-            with action_col2:
-                with st.expander("✏️ Modify Order"):
-                    st.caption("Leave a field at 0 to leave it unchanged.")
-                    new_price_input = st.number_input(
-                        "New Limit Price",
-                        min_value=0.0,
-                        value=float(price) if price is not None else 0.0,
-                        step=0.01,
-                        format="%.4f",
-                        key=f"om_mod_price_{idx}_{order_id}",
-                    )
-                    new_qty_input = st.number_input(
-                        "New Quantity",
-                        min_value=0.0,
-                        value=float(qty) if qty else 0.0,
-                        step=1.0,
-                        format="%.0f",
-                        key=f"om_mod_qty_{idx}_{order_id}",
-                    )
-                    mod_confirmed = st.checkbox(
-                        "I confirm the new parameters",
-                        key=f"om_mod_confirm_{idx}_{order_id}",
-                    )
-                    if st.button(
-                        "Submit Modification",
-                        key=f"om_mod_btn_{idx}_{order_id}",
-                        disabled=not mod_confirmed,
-                    ):
-                        _new_price = new_price_input if new_price_input > 0 else None
-                        _new_qty = new_qty_input if new_qty_input > 0 else None
-                        ok, msg = _modify_order(
-                            ibkr_gateway_client,
-                            account_id,
-                            order_id,
-                            new_price=_new_price,
-                            new_quantity=_new_qty,
-                        )
-                        if ok:
-                            st.success(f"✅ {msg}")
-                            st.session_state.pop("om_orders_cache", None)
-                        else:
-                            st.error(f"❌ {msg}")
+    # ── Recent history (collapsed) ────────────────────────────────────
+    if history_orders:
+        with st.expander(f"📜 Recent order history ({len(history_orders)} orders)"):
+            _render_order_list(history_orders, ibkr_gateway_client, account_id,
+                               prefix="hist", show_actions=False)
 
     # ── Summary strip ─────────────────────────────────────────────────
     st.divider()
-    active_count = sum(
-        1
-        for o in orders
-        if str(o.get("status") or o.get("order_status") or "") not in {"Filled", "Cancelled", "Rejected"}
-    )
     st.caption(
-        f"📊 {active_count} active order(s) shown. "
+        f"📊 {len(active_orders)} active order(s) shown. "
         "Use **🔄 Refresh Orders** to sync with IBKR after any action."
     )
