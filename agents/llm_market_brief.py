@@ -69,7 +69,7 @@ class LLMMarketBrief:
         self.db = db
         self.interval_seconds = interval_seconds
         self._scheduler: AsyncIOScheduler | None = None
-        self._model = os.getenv("LLM_FAST_MODEL", "gpt-4.1-mini")
+        self._model = os.getenv("LLM_FAST_MODEL", "gpt-4o-mini")
         self._latest_market_data: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------

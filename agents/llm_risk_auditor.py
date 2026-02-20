@@ -97,7 +97,7 @@ class LLMRiskAuditor:
         self.db = db
         self.interval_seconds = interval_seconds
         self._scheduler: AsyncIOScheduler | None = None
-        self._model = os.getenv("LLM_MODEL", "gpt-4.1")
+        self._model = os.getenv("LLM_MODEL", "gpt-4o-mini")
         # Latest snapshot pushed externally by the dashboard/streaming pipeline
         self._latest_context: dict[str, Any] | None = None
 

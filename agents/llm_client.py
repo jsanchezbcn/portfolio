@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 async def async_llm_chat(
     prompt: str,
     *,
-    model: str = "gpt-4.1",
+    model: str = "gpt-4o-mini",
     system: str = "",
     timeout: float = 45.0,
 ) -> str:
