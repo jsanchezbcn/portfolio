@@ -48,4 +48,7 @@ fi
 
 echo "Starting Streamlit on port $STREAMLIT_PORT..."
 cd "$ROOT_DIR"
-exec "$PYTHON_BIN" -m streamlit run dashboard/app.py --server.headless true --server.port "$STREAMLIT_PORT"
+exec "$PYTHON_BIN" -m streamlit run dashboard/app.py \
+  --server.headless true \
+  --server.port "$STREAMLIT_PORT" \
+  --server.fileWatcherType none

@@ -494,6 +494,15 @@ async def _run(app: Application) -> None:
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
+    # Register command menu shown in the Telegram UI (the / picker)
+    from telegram import BotCommand
+    await app.bot.set_my_commands([
+        BotCommand("greeks",  "📐 Greek totals + account net-liq"),
+        BotCommand("regime",  "🌡️ VIX, active regime, limit check"),
+        BotCommand("analyze", "🤖 AI risk assessment (LLM)"),
+        BotCommand("journal", "📓 Append note to trade journal"),
+        BotCommand("help",    "📋 Show all commands"),
+    ])
     logger.info(
         "Bot running. Allowed users: %s. Commands: /greeks /regime /analyze /journal /help",
         ALLOWED_TELEGRAM_USERS,
