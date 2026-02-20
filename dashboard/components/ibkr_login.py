@@ -27,6 +27,10 @@ _SS_STATUS   = "_ibkr_login_status"     # latest status string
 _SS_MESSAGE  = "_ibkr_login_message"    # latest human-readable message
 _SS_THREAD   = "_ibkr_login_thread"     # reader thread
 
+# Module-level buffer written by background thread, read by main Streamlit thread.
+# Using plain dict + no lock is safe: single writer, single reader, string values.
+_THREAD_BUF: dict[str, str] = {"status": "", "message": ""}
+
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "ibkr_auto_login.py"
 _PYTHON = sys.executable  # same venv Python as the dashboard
 
@@ -56,8 +60,10 @@ def _read_proc_output(proc: subprocess.Popen) -> None:
                 continue
             try:
                 data = json.loads(raw_line)
-                st.session_state[_SS_STATUS]  = data.get("status", "")
-                st.session_state[_SS_MESSAGE] = data.get("message", "")
+                # Write to module-level buffer, NOT st.session_state.
+                # Streamlit session_state must only be touched on the main thread.
+                _THREAD_BUF["status"]  = data.get("status", "")
+                _THREAD_BUF["message"] = data.get("message", "")
             except json.JSONDecodeError:
                 pass  # non-JSON stdout lines (e.g. from subprocess deps)
     except Exception:
@@ -70,6 +76,11 @@ def render_ibkr_login_button(adapter=None) -> None:
     Render the 'Sign in to IBKR' button in the Streamlit sidebar.
     Handles the full auto-login lifecycle.
     """
+    # ── Sync from thread buffer → session_state (main thread only) ─────────────
+    if _THREAD_BUF["status"]:
+        st.session_state[_SS_STATUS]  = _THREAD_BUF["status"]
+        st.session_state[_SS_MESSAGE] = _THREAD_BUF["message"]
+
     current_status = st.session_state.get(_SS_STATUS, "")
     current_msg    = st.session_state.get(_SS_MESSAGE, "")
 
@@ -124,6 +135,8 @@ def _start_login() -> None:
     # Reset state
     st.session_state[_SS_STATUS]  = "starting"
     st.session_state[_SS_MESSAGE] = ""
+    _THREAD_BUF["status"]  = "starting"
+    _THREAD_BUF["message"] = ""
 
     # Launch the login script as a subprocess with stdout piped
     proc = subprocess.Popen(
