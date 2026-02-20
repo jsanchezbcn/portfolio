@@ -102,11 +102,29 @@ def _fetch_open_orders(client: Any, account_id: str) -> list[dict]:
         return []
 
 
+def _prime_account_context(client: Any, account_id: str) -> None:
+    """Prime the IBKR CP Gateway session with the target account.
+
+    The CP Gateway requires that /iserver/accounts is called at least once per
+    session before account-scoped write operations (cancel, modify) are allowed.
+    Without this, the gateway returns 400 "accountId is not valid".
+    """
+    try:
+        client.session.get(
+            f"{client.base_url}/v1/api/iserver/accounts",
+            verify=False,
+            timeout=5,
+        )
+    except Exception:
+        pass  # Non-fatal; proceed and let the subsequent call fail if needed
+
+
 def _cancel_order(client: Any, account_id: str, order_id: str) -> tuple[bool, str]:
     """Issue DELETE /v1/api/iserver/account/{acctId}/order/{orderId}.
 
     Returns (success, message).
     """
+    _prime_account_context(client, account_id)
     try:
         url = f"{client.base_url}/v1/api/iserver/account/{account_id}/order/{order_id}"
         resp = client.session.delete(url, verify=False, timeout=10)
@@ -140,6 +158,7 @@ def _modify_order(
     if not payload:
         return False, "No changes to submit."
 
+    _prime_account_context(client, account_id)
     try:
         url = f"{client.base_url}/v1/api/iserver/account/{account_id}/order/{order_id}"
         resp = client.session.post(url, json=payload, verify=False, timeout=10)

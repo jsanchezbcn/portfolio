@@ -83,6 +83,10 @@ def render_order_builder(
         When ``None``, price-fetch buttons are disabled.
     """
     with st.expander("📋 Order Builder — Pre-Trade Simulation", expanded=False):
+        if market_data_service is not None:
+            st.caption("📡 Market data connected — use 💲 per-leg to fetch live bid/ask/last")
+        else:
+            st.caption("📡 Market data unavailable — live prices disabled (check IBKR/Tastytrade connection)")
         _render_inner(
             execution_engine,
             account_id,
@@ -317,7 +321,12 @@ def _render_leg_price(
     btn_key = f"ob_fetch_price_{leg_index}"
 
     if market_data_service is None:
-        st.caption("—")
+        st.button(
+            "💲 Price",
+            key=btn_key,
+            disabled=True,
+            help="Market data unavailable — check IBKR/Tastytrade connection",
+        )
         return
 
     # Show cached quote if any
@@ -331,7 +340,7 @@ def _render_leg_price(
             unsafe_allow_html=True,
         )
 
-    if st.button("💲", key=btn_key, help="Fetch current price from broker"):
+    if st.button("💲 Price", key=btn_key, help="Fetch current bid/ask/last from broker"):
         with st.spinner(""):
             try:
                 if instrument_type == "Future":
@@ -613,26 +622,35 @@ def _render_approval_section(
 
 def _render_submission_result(order: Order) -> None:
     """Show the outcome of a live order submission."""
+    import streamlit as _st
     st.divider()
     if order.status == OrderStatus.FILLED:
         st.success(
             f"✅ **Order FILLED** — Broker order ID: `{order.broker_order_id}`  "
             f"at {order.filled_at.strftime('%H:%M:%S UTC') if order.filled_at else '—'}"
         )
+        # T035: Trigger position refresh so next page load re-fetches the portfolio
+        _st.session_state["positions"] = None
     elif order.status == OrderStatus.REJECTED:
-        st.error(
-            f"❌ **Order REJECTED** — "
-            f"{order.rejection_reason or 'No reason provided by broker.'}"
+        # T033: Show broker rejection reason in red
+        rejection_msg = order.rejection_reason or "No reason provided by broker."
+        st.error(f"❌ **Order REJECTED** — {rejection_msg}")
+        st.caption(
+            "The order was NOT transmitted. Review the rejection reason above "
+            "and correct your order before re-simulating."
         )
     elif order.status == OrderStatus.CANCELLED:
         st.warning("🚫 **Order CANCELLED** by broker.")
     elif order.status == OrderStatus.PENDING:
+        # T034: Surface "status unknown" clearly
         st.warning(
-            f"⏳ **Order status UNKNOWN** — Broker order ID: `{order.broker_order_id}`  \n"
-            "Polling timed out. Verify order status directly in your IBKR platform."
+            f"⚠ **Order status UNKNOWN** — Broker order ID: `{order.broker_order_id}`  \n"
+            "Polling timed out before a fill or rejection was confirmed.  \n"
+            "**Verify order status directly in your IBKR platform** before "
+            "placing additional trades."
         )
     else:
-        st.info(f"ℹ Order status: `{order.status.value}`")
+        st.info(f"ℹ Order status: `{order.status.value}`)
 
 
 # ---------------------------------------------------------------------------
