@@ -296,7 +296,9 @@ def _render_inner(
         order: Optional[Order] = st.session_state.get(_SS_ORDER)
         if order is not None and order.status == OrderStatus.SIMULATED:
             _render_approval_section(
-                execution_engine, account_id, order, prior_result
+                execution_engine, account_id, order, prior_result,
+                pre_greeks=current_portfolio_greeks,
+                regime=regime,
             )
 
     # ── Submission result (post-submit) ────────────────────────────────────
@@ -532,6 +534,8 @@ def _render_approval_section(
     account_id: str,
     order: Order,
     sim_result: SimulationResult,
+    pre_greeks=None,      # PortfolioGreeks | None  (T042)
+    regime: str = "neutral_volatility",  # T041
 ) -> None:
     """Render the mandatory 2-step human approval panel (T031).
 
@@ -606,6 +610,8 @@ def _render_approval_section(
                 submitted_order = execution_engine.submit(
                     account_id=account_id,
                     order=order,
+                    pre_greeks=pre_greeks,
+                    regime=regime,
                 )
             except Exception as exc:
                 logger.exception("Unexpected error during submit()")
@@ -650,7 +656,7 @@ def _render_submission_result(order: Order) -> None:
             "placing additional trades."
         )
     else:
-        st.info(f"ℹ Order status: `{order.status.value}`)
+        st.info(f"ℹ Order status: `{order.status.value}`")
 
 
 # ---------------------------------------------------------------------------

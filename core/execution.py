@@ -18,6 +18,9 @@ without an explicit, user-initiated confirmation step.
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import json
 import logging
 import time
 from datetime import datetime
@@ -32,6 +35,7 @@ from models.order import (
     OrderStatus,
     PortfolioGreeks,
     SimulationResult,
+    TradeJournalEntry,
 )
 
 logger = logging.getLogger(__name__)
@@ -227,7 +231,14 @@ class ExecutionEngine:
     # submit() — LIVE ORDER (T030) — REQUIRES HUMAN APPROVAL
     # ------------------------------------------------------------------
 
-    def submit(self, account_id: str, order: Order) -> Order:
+    def submit(
+        self,
+        account_id: str,
+        order: Order,
+        *,
+        pre_greeks: Optional[PortfolioGreeks] = None,
+        regime: Optional[str] = None,
+    ) -> Order:
         """Submit a live order to IBKR after human approval.
 
         ⚠ SAFETY CONTRACT ⚠
@@ -246,6 +257,12 @@ class ExecutionEngine:
             IBKR account ID (e.g. "U12345").
         order:
             The Order to submit. MUST be in OrderStatus.SIMULATED.
+        pre_greeks:
+            Portfolio Greeks snapshot BEFORE this order (T042). Serialised into
+            the trade journal entry on fill.
+        regime:
+            Current risk regime string (e.g. "neutral_volatility") captured at
+            submission time for the trade journal (T041).
 
         Returns
         -------
@@ -376,6 +393,12 @@ class ExecutionEngine:
             order.transition_to(OrderStatus.FILLED)
             order.filled_at = datetime.utcnow()
             logger.info("Order %s FILLED", broker_order_id)
+            self._record_fill_async(order, account_id, pre_greeks, regime)
+        elif final_status == "PartiallyFilled":  # T032: partial combo fill
+            order.transition_to(OrderStatus.PARTIAL)
+            order.filled_at = datetime.utcnow()
+            logger.info("Order %s PARTIALLY FILLED — remainder left as PENDING", broker_order_id)
+            self._record_fill_async(order, account_id, pre_greeks, regime, status="PARTIAL")
         elif final_status in ("Cancelled",):
             order.transition_to(OrderStatus.CANCELLED)
             logger.info("Order %s CANCELLED", broker_order_id)
@@ -392,6 +415,128 @@ class ExecutionEngine:
             )
 
         return order
+
+    # ------------------------------------------------------------------
+    # _record_fill_async — journal a fill to LocalStore (T040-T042)
+    # ------------------------------------------------------------------
+
+    def _record_fill_async(
+        self,
+        order: Order,
+        account_id: str,
+        pre_greeks: Optional[PortfolioGreeks],
+        regime: Optional[str],
+        status: str = "FILLED",
+    ) -> None:
+        """Fire-and-forget: build a TradeJournalEntry and persist it.
+
+        Runs in a dedicated thread so it never blocks the submit() return path.
+        Any failure is logged but not re-raised.
+        """
+        try:
+            vix_at_fill = self._fetch_vix_safe()
+            spx_price = self._fetch_spx_price_safe()
+
+            # Pre-greeks JSON
+            pre_json = "{}"
+            if pre_greeks is not None:
+                try:
+                    pre_json = json.dumps({
+                        "spx_delta": pre_greeks.spx_delta,
+                        "gamma": pre_greeks.gamma,
+                        "theta": pre_greeks.theta,
+                        "vega": pre_greeks.vega,
+                    })
+                except Exception:
+                    pass
+
+            # Legs JSON
+            legs_json = "[]"
+            try:
+                legs_json = json.dumps([
+                    {
+                        "symbol": lg.symbol,
+                        "action": lg.action.value,
+                        "quantity": lg.quantity,
+                        "strike": lg.strike,
+                        "expiration": str(lg.expiration) if lg.expiration else None,
+                        "option_right": lg.option_right.value if lg.option_right else None,
+                        "fill_price": lg.fill_price,
+                    }
+                    for lg in order.legs
+                ])
+            except Exception:
+                pass
+
+            # Strategy tag heuristic
+            strategy_tag = None
+            n_legs = len(order.legs)
+            if n_legs == 2:
+                rights = {lg.option_right for lg in order.legs if lg.option_right}
+                if len(rights) == 2:
+                    strategy_tag = "strangle"
+                elif n_legs == 2:
+                    strategy_tag = "spread"
+            elif n_legs == 4:
+                strategy_tag = "iron_condor"
+            elif n_legs == 1:
+                strategy_tag = "single"
+
+            # Build underlying from first leg
+            underlying = order.legs[0].symbol if order.legs else ""
+            # Strip option suffix if present
+            underlying = underlying.split()[0] if underlying else ""
+
+            entry = TradeJournalEntry(
+                broker="IBKR",
+                account_id=account_id,
+                broker_order_id=order.broker_order_id,
+                underlying=underlying,
+                strategy_tag=strategy_tag,
+                status=status,
+                legs_json=legs_json,
+                vix_at_fill=vix_at_fill,
+                spx_price_at_fill=spx_price,
+                regime=regime,
+                pre_greeks_json=pre_json,
+                post_greeks_json="{}",  # T042: post-Greeks not yet available at fill time
+                user_rationale=order.user_rationale or None,
+                ai_suggestion_id=order.ai_suggestion_id,
+            )
+
+            def _do_record():
+                asyncio.run(self._store.record_fill(entry))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(_do_record).result(timeout=8)
+
+            logger.info("Trade journal entry recorded: %s", entry.entry_id)
+
+        except Exception as exc:
+            logger.warning(
+                "Failed to record fill in trade journal (order=%s): %s",
+                order.broker_order_id,
+                exc,
+            )
+
+    def _fetch_vix_safe(self) -> Optional[float]:
+        """Best-effort VIX fetch at fill time (T041). Never raises."""
+        try:
+            from agent_tools.market_data_tools import MarketDataTools
+            vix_data = MarketDataTools().get_vix_data()
+            return float(vix_data.get("vix") or 0) or None
+        except Exception:
+            return None
+
+    def _fetch_spx_price_safe(self) -> Optional[float]:
+        """Best-effort SPX price fetch at fill time (T042). Never raises."""
+        try:
+            from agent_tools.market_data_tools import MarketDataTools
+            data = MarketDataTools().get_market_data("SPX")
+            price = data.get("last") or data.get("price")
+            return float(price) if price else None
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # flatten_risk() — BATCH LIVE ORDERS — NOT YET IMPLEMENTED (T066)
@@ -480,11 +625,40 @@ class ExecutionEngine:
     def _build_submit_payload(order: Order) -> dict:
         """Build the JSON body for ``POST /v1/api/iserver/account/{id}/orders`` (live).
 
-        Same structure as WhatIf payload but submitted to the execution endpoint.
-        """
-        orders_list: list[dict] = []
+        T032: Multi-leg orders with conids are routed as a single BAG (combo) order
+        so IBKR guarantees linked execution (no leg-by-leg partial submission risk).
 
-        for leg in order.legs:
+        Single-leg without conid falls back to individual order format.
+        """
+        legs = order.legs
+
+        # ── Multi-leg BAG combo (T032): all legs must have conids ──────────────
+        if len(legs) > 1 and all(lg.conid for lg in legs):
+            conidex = ";".join(str(lg.conid) for lg in legs)
+            combo_legs = [
+                {
+                    "conid": int(lg.conid),
+                    "ratio": 1,
+                    "side": lg.action.value,   # "BUY" | "SELL"
+                    "exchange": "SMART",
+                }
+                for lg in legs
+            ]
+            bag_entry: dict = {
+                "conidex": conidex,
+                "secType": "BAG",
+                "orderType": order.order_type.value,
+                "tif": "DAY",
+                "side": "BUY",   # outer side for credit/debit accounting; IBKR ignores it for combos
+                "quantity": str(legs[0].quantity),  # combo quantity = 1 spread
+                "listingExchange": "SMART",
+                "comboLegs": combo_legs,
+            }
+            return {"orders": [bag_entry]}
+
+        # ── Fallback: individual order per leg (single-leg or no conids) ───────
+        orders_list: list[dict] = []
+        for leg in legs:
             entry: dict = {
                 "side": leg.action.value,
                 "quantity": str(leg.quantity),
@@ -497,7 +671,6 @@ class ExecutionEngine:
                 entry["strike"] = str(leg.strike)
             if leg.option_right is not None:
                 entry["right"] = leg.option_right.value
-
             orders_list.append(entry)
 
         return {"orders": orders_list}
@@ -534,7 +707,7 @@ class ExecutionEngine:
 
         url = f"{self._client.base_url}/v1/api/iserver/account/orders"
         deadline = time.monotonic() + timeout_seconds
-        _terminal = {"Filled", "Cancelled", "Rejected", "Inactive", "Error"}
+        terminal = {"Filled", "PartiallyFilled", "Cancelled", "Rejected", "Inactive", "Error"}
 
         while time.monotonic() < deadline:
             try:
@@ -559,7 +732,7 @@ class ExecutionEngine:
                             status = (
                                 o.get("status") or o.get("order_status") or ""
                             )
-                            if status in _terminal:
+                            if status in terminal:
                                 return status
                             # "PreSubmitted" → still waiting; continue polling
             except Exception as exc:

@@ -974,6 +974,15 @@ def main() -> None:
         account_id=account_id,
     )
 
+    # ── Trade Journal (T046) ────────────────────────────────────────────
+    try:
+        from dashboard.components.trade_journal_view import render_trade_journal
+        from database.local_store import LocalStore as _LSJ
+        _journal_store = _LSJ()
+        render_trade_journal(_journal_store)
+    except Exception as _tj_exc:
+        LOGGER.warning("Trade journal panel failed: %s", _tj_exc)
+
     # ── AI Insights: Risk Audit + Market Brief ─────────────────────────
     _urgency_color = {"green": "success", "yellow": "warning", "red": "error"}
     _urgency_emoji = {"green": "✅", "yellow": "⚠️", "red": "🚨"}

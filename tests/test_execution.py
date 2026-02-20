@@ -478,7 +478,7 @@ class TestSubmitBehavior:
         assert order.broker_order_id == "IBKR-TEST-42"
 
     def test_submit_multi_leg_includes_all_legs(self):
-        """Multi-leg combo order payload includes all legs."""
+        """Multi-leg combo order uses BAG format: 1 order entry with comboLegs covering all legs."""
         resp = self._submit_response()
         engine, mock_client = _make_engine(http_response=resp)
         order = self._make_simulated_order(n_legs=2)
@@ -494,7 +494,15 @@ class TestSubmitBehavior:
         )
         assert payload is not None
         orders_in_payload = payload.get("orders", [])
-        assert len(orders_in_payload) >= 2, "All legs must be in the payload"
+        # T032: multi-leg with all conids → single BAG entry with comboLegs
+        assert len(orders_in_payload) == 1, "Multi-leg with conids must use single BAG order entry"
+        bag_entry = orders_in_payload[0]
+        assert bag_entry.get("secType") == "BAG", "BAG secType required for combo order"
+        assert "comboLegs" in bag_entry, "comboLegs must be present in BAG order"
+        assert len(bag_entry["comboLegs"]) == 2, "All 2 legs must appear in comboLegs"
+        conids_in_combo = {str(leg["conid"]) for leg in bag_entry["comboLegs"]}
+        assert "265598" in conids_in_combo
+        assert "265599" in conids_in_combo
 
     # ------------------------------------------------------------------
     # Safety: DRAFT order must NOT reach broker

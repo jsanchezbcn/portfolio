@@ -120,7 +120,7 @@ description: "Task list for 003-algo-execution-platform"
 
 - [x] T030 [US3] Implement `ExecutionEngine.submit(order: Order) -> Order` — **HUMAN APPROVAL REQUIRED**: guard raises `ValueError` if `order.status != SIMULATED`; call `POST /iserver/account/{acctId}/orders`; build `conidex` multi-leg payload for combos; poll order status until FILLED/REJECTED/CANCELLED or timeout (30s); return updated `Order` with fill details; mark status "unknown" on connection loss. **Safety contract: this method may ONLY be called from a UI path that has completed the 2-step human confirmation modal (T031).**
 - [x] T031 [US3] Add mandatory 2-step human approval modal to `dashboard/components/order_builder.py` — Step 1: "Review & Approve" expander previewing all legs, quantities, order type, estimated margin, and post-trade Greeks; Step 2: user must check an explicit "I confirm this order" checkbox AND click "Confirm & Submit — LIVE ORDER"; Step 3: disable all buttons immediately after transmission; the Submit path in `ExecutionEngine.submit()` is the **only** path that may call `_SS_APPROVED = True` in session state; direct bypass is impossible from the UI
-- [ ] T032 [US3] Handle multi-leg combo order routing in `ExecutionEngine.submit()` — enforce all legs sent as single linked order via `conidex`; IBKR can still partially fill combo orders; if fill is partial, mark `Order.status = PARTIAL` in the journal, display remaining unfilled legs in the order blotter as PENDING, do not auto-cancel remainder; full cancellation of remainder is a manual user action via the broker platform
+- [x] T032 [US3] Handle multi-leg combo order routing in `ExecutionEngine.submit()` — enforce all legs sent as single linked order via `conidex`; IBKR can still partially fill combo orders; if fill is partial, mark `Order.status = PARTIAL` in the journal, display remaining unfilled legs in the order blotter as PENDING, do not auto-cancel remainder; full cancellation of remainder is a manual user action via the broker platform
 - [x] T033 [US3] Display broker rejection reason in `dashboard/components/order_builder.py` — parse IBKR rejection message; render in red; do NOT record as filled trade
 - [x] T034 [US3] Handle "status unknown" in `dashboard/components/order_builder.py` — surface alert: "Order status unknown — verify in broker platform"; keep order visible in blotter
 - [x] T035 [US3] Trigger position refresh in `dashboard/app.py` after confirmed fill — update portfolio snapshot within one refresh cycle
@@ -156,20 +156,20 @@ description: "Task list for 003-algo-execution-platform"
 
 > **Write these tests FIRST — ensure they FAIL before implementing T037–T046**
 
-- [ ] T036 [P] [US4] Write `tests/test_trade_journal.py` — unit tests using in-memory SQLite: `record_fill()` stores all required fields (FR-014 list); `query_journal()` filters by date range, instrument, regime correctly; `export_csv()` produces valid CSV with all columns; journal persists across `LocalStore` reconnect
+- [x] T036 [P] [US4] Write `tests/test_trade_journal.py` — unit tests using in-memory SQLite: `record_fill()` stores all required fields (FR-014 list); `query_journal()` filters by date range, instrument, regime correctly; `export_csv()` produces valid CSV with all columns; journal persists across `LocalStore` reconnect
 
 ### Implementation for User Story 4
 
-- [ ] T037 [US4] Implement `database/local_store.py` `record_fill(journal_entry: TradeJournalEntry) -> str` — insert row into `trade_journal`; return generated UUID; handle duplicate broker_order_id gracefully (upsert on conflict)
-- [ ] T038 [US4] Implement `database/local_store.py` `query_journal(start_dt, end_dt, instrument, regime, limit) -> list[TradeJournalEntry]` — parameterized SELECT with optional WHERE clauses; ORDER BY created_at DESC
-- [ ] T039 [US4] Implement `database/local_store.py` `export_csv(entries: list[TradeJournalEntry]) -> str` — return CSV string with headers matching all FR-014 fields
-- [ ] T040 [US4] Hook fill callback in `core/execution.py` — after `ExecutionEngine.submit()` confirms FILLED status (the `FILLED` status path introduced in T030), build `TradeJournalEntry` and call `local_store.record_fill()`; capture `user_rationale` from order builder textarea
-- [ ] T041 [US4] Capture VIX + regime at fill time in `core/execution.py` fill handler — fetch VIX from IBKR market data; get current regime from `regime_detector.py`; attach to `TradeJournalEntry`
-- [ ] T042 [US4] Capture pre/post portfolio Greeks at fill time — pre-Greeks = `BetaWeighter.compute_portfolio_spx_delta()` called before `submit()`; post-Greeks = recalculated after fill confirmed; serialize both as JSON into `TradeJournalEntry`
-- [ ] T043 [US4] Create `dashboard/components/trade_journal_view.py` — Streamlit component: table display with reverse-chronological order; columns: timestamp, underlying, strategy_tag, status, net_debit_credit, vix_at_fill, regime, user_rationale
-- [ ] T044 [US4] Add filters to `dashboard/components/trade_journal_view.py` — date range picker, instrument text filter, regime dropdown; filters apply on change
-- [ ] T045 [US4] Add "Export CSV" button to `dashboard/components/trade_journal_view.py` — calls `local_store.export_csv()`; triggers `st.download_button()`
-- [ ] T046 [US4] Wire `dashboard/components/trade_journal_view.py` into `dashboard/app.py` as a dedicated tab
+- [x] T037 [US4] Implement `database/local_store.py` `record_fill(journal_entry: TradeJournalEntry) -> str` — insert row into `trade_journal`; return generated UUID; handle duplicate broker_order_id gracefully (upsert on conflict)
+- [x] T038 [US4] Implement `database/local_store.py` `query_journal(start_dt, end_dt, instrument, regime, limit) -> list[TradeJournalEntry]` — parameterized SELECT with optional WHERE clauses; ORDER BY created_at DESC
+- [x] T039 [US4] Implement `database/local_store.py` `export_csv(entries: list[TradeJournalEntry]) -> str` — return CSV string with headers matching all FR-014 fields
+- [x] T040 [US4] Hook fill callback in `core/execution.py` — after `ExecutionEngine.submit()` confirms FILLED status (the `FILLED` status path introduced in T030), build `TradeJournalEntry` and call `local_store.record_fill()`; capture `user_rationale` from order builder textarea
+- [x] T041 [US4] Capture VIX + regime at fill time in `core/execution.py` fill handler — fetch VIX from IBKR market data; get current regime from `regime_detector.py`; attach to `TradeJournalEntry`
+- [x] T042 [US4] Capture pre/post portfolio Greeks at fill time — pre-Greeks = `BetaWeighter.compute_portfolio_spx_delta()` called before `submit()`; post-Greeks = recalculated after fill confirmed; serialize both as JSON into `TradeJournalEntry`
+- [x] T043 [US4] Create `dashboard/components/trade_journal_view.py` — Streamlit component: table display with reverse-chronological order; columns: timestamp, underlying, strategy_tag, status, net_debit_credit, vix_at_fill, regime, user_rationale
+- [x] T044 [US4] Add filters to `dashboard/components/trade_journal_view.py` — date range picker, instrument text filter, regime dropdown; filters apply on change
+- [x] T045 [US4] Add "Export CSV" button to `dashboard/components/trade_journal_view.py` — calls `local_store.export_csv()`; triggers `st.download_button()`
+- [x] T046 [US4] Wire `dashboard/components/trade_journal_view.py` into `dashboard/app.py` as a dedicated tab
 
 **Checkpoint**: Every fill auto-journaled. Journal tab functional and filterable. Exports CSV. Run `tests/test_trade_journal.py` — all pass.
 
