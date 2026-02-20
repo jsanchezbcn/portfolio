@@ -417,8 +417,14 @@ def main() -> None:
         value=bool(getattr(adapter, "force_refresh_on_miss", True)),
         disabled=disable_tasty_cache,
     )
-    adapter.disable_tasty_cache = bool(disable_tasty_cache)
-    adapter.force_refresh_on_miss = bool(force_refresh_on_miss)
+    # ibkr_only_mode mirrors CLI --ibkr-only: disable Tastytrade, use IBKR snapshot only.
+    # The adapter flags must be set BEFORE fetch_greeks is called below.
+    if ibkr_only_mode:
+        adapter.disable_tasty_cache = True
+        adapter.force_refresh_on_miss = False
+    else:
+        adapter.disable_tasty_cache = bool(disable_tasty_cache)
+        adapter.force_refresh_on_miss = bool(force_refresh_on_miss)
 
     if refresh:
         get_cached_vix_data.clear()
@@ -462,7 +468,10 @@ def main() -> None:
         else:
             fallback_saved_at = st.session_state.get("fallback_saved_at")
 
-        if positions and not ibkr_only_mode:
+        # Always enrich greeks via fetch_greeks. When ibkr_only_mode=True the
+        # adapter flags above ensure only IBKR snapshot is used (no Tastytrade),
+        # exactly matching CLI behaviour with --ibkr-only.
+        if positions:
             positions = asyncio.run(adapter.fetch_greeks(positions))
             data_refresh["greeks"] = _safe_iso_now()
 
@@ -581,8 +590,8 @@ def main() -> None:
 
     if ibkr_only_mode:
         st.info(
-            "IBKR-only mode is enabled. External options Greek enrichment is skipped. "
-            "Use this mode to compare account/position structure directly with IBKR CPAPI data."
+            "IBKR-only mode: Greeks sourced exclusively from IBKR market-data snapshot (no Tastytrade). "
+            "Disable to allow Tastytrade as fallback for options IBKR cannot price."
         )
 
     if not positions:
@@ -888,7 +897,7 @@ def main() -> None:
     else:
         st.info("No market intelligence rows — run NewsSentry or check DB connection.")
 
-    _portfolio_symbols = list({p.get("symbol", "") for p in (positions or []) if p.get("symbol")})
+    _portfolio_symbols = list({p.symbol for p in (positions or []) if p.symbol})
     if st.button("📰 Fetch News Now", help="Fetch and score news for all portfolio symbols"):
         with st.spinner("Fetching news..."):
             try:
@@ -974,9 +983,9 @@ def main() -> None:
         _pos_lines = []
         for _p in (positions or [])[:30]:
             _pos_lines.append(
-                f"  {_p.get('symbol','?')} qty={_p.get('quantity',0)} "
-                f"spx_delta={_p.get('spx_delta',_p.get('delta',0)):.2f} "
-                f"theta={_p.get('theta',0):.2f}"
+                f"  {_p.symbol} qty={_p.quantity} "
+                f"spx_delta={float(_p.spx_delta or 0):.2f} "
+                f"theta={float(_p.theta or 0):.2f}"
             )
         context_block = (
             f"Portfolio snapshot (IBKR-only={ibkr_only_mode}):\n"
