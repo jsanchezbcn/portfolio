@@ -332,13 +332,10 @@ class MarketDataService:
         if self._tt is None:
             return []
         try:
-            # Use the synchronous simulate_prefetch path which uses the cache
-            cached: dict = self._tt.simulate_prefetch(underlying)  # {key: OptionData}
-            if not cached:
-                # Try the async fetch path via run_in_executor
-                cached = _run_sync(
-                    self._tt.fetch_and_cache_options_for_underlying(underlying)
-                )
+            # Fetch via async path (uses TTrade cache if valid, else fetches live)
+            cached: dict = _run_sync(
+                self._tt.fetch_and_cache_options_for_underlying(underlying)
+            )
 
             result: List[OptionQuote] = []
             for key, od in cached.items():

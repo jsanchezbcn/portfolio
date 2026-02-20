@@ -277,10 +277,10 @@ class TestGetOptionsChain:
     def test_returns_option_quotes_from_tastytrade(self, svc_with_tt):
         # Tastytrade fetcher is stored as _tt
         tt = svc_with_tt._tt
-        tt.simulate_prefetch.return_value = {
+        tt.fetch_and_cache_options_for_underlying = AsyncMock(return_value={
             "SPX_C_5000": self._make_option_data(5000, "Call"),
             "SPX_P_5000": self._make_option_data(5000, "Put"),
-        }
+        })
         chain = svc_with_tt.get_options_chain("SPX")
         assert len(chain) == 2
         assert all(isinstance(q, OptionQuote) for q in chain)
@@ -295,16 +295,18 @@ class TestGetOptionsChain:
 
     def test_filters_by_expiry_when_provided(self, svc_with_tt):
         tt = svc_with_tt._tt
-        tt.simulate_prefetch.return_value = {
+        tt.fetch_and_cache_options_for_underlying = AsyncMock(return_value={
             "a": self._make_option_data(5000, "Call", "2025-01-17"),
             "b": self._make_option_data(5000, "Call", "2025-02-21"),
-        }
+        })
         chain = svc_with_tt.get_options_chain("SPX", expiry="2025-01-17")
         assert all(q.expiry == "2025-01-17" for q in chain)
         assert len(chain) == 1
 
     def test_returns_empty_on_tastytrade_exception(self, svc_with_tt):
         tt = svc_with_tt._tt
-        tt.simulate_prefetch.side_effect = RuntimeError("TT unavailable")
+        tt.fetch_and_cache_options_for_underlying = AsyncMock(
+            side_effect=RuntimeError("TT unavailable")
+        )
         chain = svc_with_tt.get_options_chain("SPX")
         assert chain == []

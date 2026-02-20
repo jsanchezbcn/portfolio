@@ -21,6 +21,7 @@ os.chdir(PROJECT_ROOT)
 
 from adapters.ibkr_adapter import IBKRAdapter
 from agent_config import AGENT_SYSTEM_PROMPT, TOOL_SCHEMAS
+from core.market_data import MarketDataService
 from dashboard.components.order_builder import render_order_builder
 from dashboard.components.order_management import render_order_management
 from agent_tools.market_data_tools import MarketDataTools
@@ -946,11 +947,25 @@ def main() -> None:
     }
     _regime_key = _regime_map.get(_regime_key, "neutral_volatility")
 
+    # ── MarketDataService for live bid/ask/last + options chain (T-RT4/T-RT5) ─
+    _mds_key = "_market_data_service"
+    if _mds_key not in st.session_state or st.session_state[_mds_key] is None:
+        try:
+            st.session_state[_mds_key] = MarketDataService(
+                ibkr_client=adapter.client,
+                tastytrade_fetcher=adapter.client.options_cache,
+            )
+        except Exception as _mds_exc:
+            LOGGER.warning("Could not build MarketDataService: %s", _mds_exc)
+            st.session_state[_mds_key] = None
+    _market_data_svc = st.session_state.get(_mds_key)
+
     render_order_builder(
         execution_engine=_exec_engine,
         account_id=account_id,
         current_portfolio_greeks=_current_greeks,
         regime=_regime_key,
+        market_data_service=_market_data_svc,
     )
 
     # ── Open Orders Management (T-OM0) ─────────────────────────────────
