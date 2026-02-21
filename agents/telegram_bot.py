@@ -156,12 +156,16 @@ async def _fetch_greeks_summary(account_id: str) -> dict[str, Any]:
 
     # Fetch positions
     try:
-        positions = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: adapter.fetch_positions(account_id)
-        )
+        positions = await adapter.fetch_positions(account_id)
     except Exception as exc:
         logger.warning("fetch_positions failed: %s", exc)
         positions = getattr(adapter, "last_positions", None) or []
+
+    # Enrich with live Greeks snapshot
+    try:
+        positions = await adapter.fetch_greeks(positions)
+    except Exception as exc:
+        logger.warning("fetch_greeks failed: %s", exc)
 
     # Compute portfolio summary
     summary = portfolio.get_portfolio_summary(positions)
