@@ -16,3 +16,4 @@ tastytrade-sdk>=0.0.0
 python-dotenv>=1.0.0
 playwright>=1.44
 python-telegram-bot[job-queue]>=20.0
+ib_async>=2.1.0
