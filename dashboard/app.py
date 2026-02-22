@@ -84,10 +84,10 @@ def _snapshot_loop(
             summary = portfolio_tools.get_portfolio_summary(positions)
             regime = regime_detector.detect_regime(vix=vix, term_structure=float(vix_info.get("term_structure", 1.0)))
 
-            spx_info = market_tools.get_market_data("SPX") or {}
+            spx_info = market_tools.get_spx_data() or {}
             spx_price = None
             try:
-                spx_price = float(spx_info.get("last") or spx_info.get("close") or 0) or None
+                spx_price = float(spx_info.get("spx") or spx_info.get("last") or spx_info.get("close") or 0) or None
             except (TypeError, ValueError):
                 spx_price = None
 
