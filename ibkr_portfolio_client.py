@@ -859,7 +859,12 @@ def load_dotenv(env_file: str = '.env') -> None:
             if line and not line.startswith('#') and '=' in line:
                 key, value = line.split('=', 1)
                 key = key.strip()
+                # Strip inline comments: value = value before any ' #' or '\t#'
                 value = value.strip().strip('"\'')
+                if '  #' in value:
+                    value = value[:value.index('  #')].strip()
+                elif '\t#' in value:
+                    value = value[:value.index('\t#')].strip()
                 os.environ[key] = value
 
 

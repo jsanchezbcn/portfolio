@@ -154,13 +154,23 @@ class IBKRAdapter(BrokerAdapter):
         ibkr_snapshot_errors: list[str] = []
         if _options_needing_greeks:
             _conids = [conid for _, conid in _options_needing_greeks]
-            try:
-                _ibkr_greeks = await asyncio.to_thread(
-                    self.client.get_market_greeks_batch, _conids
-                )
-            except Exception as _exc:
-                LOGGER.warning("IBKR snapshot greeks batch failed: %s", _exc)
-                _ibkr_greeks = {}
+            _api_mode = os.getenv("IB_API_MODE", "PORTAL").split("#")[0].strip().upper()
+            if _api_mode == "SOCKET":
+                # TWS socket mode: use ib_async modelGreeks instead of Client Portal
+                # snapshot REST API (which returns 401/400 when portal is not authenticated)
+                try:
+                    _ibkr_greeks = await self._fetch_greeks_via_tws_socket(_conids)
+                except Exception as _exc:
+                    LOGGER.warning("TWS socket greeks batch failed: %s", _exc)
+                    _ibkr_greeks = {}
+            else:
+                try:
+                    _ibkr_greeks = await asyncio.to_thread(
+                        self.client.get_market_greeks_batch, _conids
+                    )
+                except Exception as _exc:
+                    LOGGER.warning("IBKR snapshot greeks batch failed: %s", _exc)
+                    _ibkr_greeks = {}
             for pos, cid in _options_needing_greeks:
                 g = _ibkr_greeks.get(cid)
                 if not g:
@@ -181,14 +191,15 @@ class IBKRAdapter(BrokerAdapter):
                 pos.theta = (theta or 0.0) * pos.quantity * tv_mult
                 pos.vega  = (vega  or 0.0) * pos.quantity * tv_mult
                 pos.iv    = self._safe_optional_float(g.get("iv"))
-                pos.greeks_source = "ibkr_snapshot"
+                pos.greeks_source = g.get("source", "ibkr_snapshot")
                 ibkr_snapshot_hits += 1
 
         LOGGER.debug(
-            "IBKR snapshot greeks: %d/%d enriched, %d failed",
+            "Greeks enrichment: %d/%d enriched, %d failed (source: %s)",
             ibkr_snapshot_hits,
             len(_options_needing_greeks),
             len(ibkr_snapshot_errors),
+            "tws_socket" if os.getenv("IB_API_MODE", "PORTAL").split("#")[0].strip().upper() == "SOCKET" else "ibkr_snapshot",
         )
 
         # Fetch SPX price once for the entire batch (used by BetaWeighter, T016)
@@ -264,7 +275,7 @@ class IBKRAdapter(BrokerAdapter):
                     # Last-resort fallback when underlier quote is not available.
                     position.underlying_price = float(position.strike)
 
-            if position.greeks_source in {"ibkr_native", "ibkr_snapshot"}:
+            if position.greeks_source in {"ibkr_native", "ibkr_snapshot", "tws_socket"}:
                 # Already have IBKR-sourced greeks — still need SPX delta via BetaWeighter
                 if _spx_price_for_batch_num > 0:
                     bw_result = await self._beta_weighter.compute_spx_equivalent_delta(
@@ -429,6 +440,115 @@ class IBKRAdapter(BrokerAdapter):
                 LOGGER.error("SPX price unavailable — portfolio delta cannot be computed: %s", exc)
                 spx_price = 0.0
         return await self._beta_weighter.compute_portfolio_spx_delta(positions, spx_price)
+
+    async def _fetch_greeks_via_tws_socket(self, conids: list[int]) -> dict[int, dict]:
+        """Fetch per-contract Greeks from TWS via ib_async modelGreeks.
+
+        Used when IB_API_MODE=SOCKET and the Client Portal REST snapshot API
+        is unavailable (401/400).  Returns {conid: {'delta', 'gamma', 'theta',
+        'vega', 'iv'}} for each conid that returned data within the timeout.
+        """
+        try:
+            from ib_async import IB, Contract
+        except ImportError:
+            LOGGER.warning("ib_async not installed – cannot fetch Greeks via TWS socket")
+            return {}
+
+        host      = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
+        port      = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        client_id = int(os.getenv("IB_GREEKS_CLIENT_ID", "12"))  # distinct from bridge (10)
+
+        conid_set = set(conids)
+        ib = IB()
+        result: dict[int, dict] = {}
+        try:
+            await ib.connectAsync(host=host, port=port, clientId=client_id)
+            LOGGER.debug("IBKRAdapter Greeks socket connected (clientId=%d)", client_id)
+
+            # Wait for TWS synchronization to complete (portfolio data arrives ~1-5s after connect)
+            # `connectAsync` returns before account data is fully pushed, so poll until non-empty.
+            loop = asyncio.get_running_loop()
+            sync_deadline = loop.time() + 8.0
+            while loop.time() < sync_deadline:
+                if ib.portfolio():
+                    break
+                await asyncio.sleep(0.2)
+
+            # Use ib.portfolio() to get fully-qualified contracts (secType, exchange,
+            # currency set) — TWS fills these in; a bare Contract(conId=N) won't work.
+            portfolio_items = ib.portfolio()
+            contract_map: dict[int, object] = {
+                item.contract.conId: item.contract
+                for item in portfolio_items
+                if item.contract.conId in conid_set
+            }
+
+            # For conids not found in portfolio (e.g. expired / zero-qty), try to
+            # qualify them explicitly so we still attempt data subscription.
+            missing_conids = conid_set - set(contract_map.keys())
+            if missing_conids:
+                raw = [Contract(conId=cid) for cid in missing_conids]
+                try:
+                    qualified = await ib.qualifyContractsAsync(*raw)
+                    for c in qualified:
+                        if c.conId:
+                            contract_map[c.conId] = c
+                except Exception as qe:
+                    LOGGER.debug("Qualification failed for %s: %s", missing_conids, qe)
+
+            if not contract_map:
+                LOGGER.warning("No contracts resolved for conids %s", conids)
+                return {}
+
+            # Subscribe to market data for all target contracts concurrently
+            tickers: list[tuple[int, object]] = []
+            for cid, contract in contract_map.items():
+                ticker = ib.reqMktData(contract, "", False, False)
+                tickers.append((cid, ticker))
+
+            # Poll until modelGreeks arrive or 5-second timeout
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5.0
+            pending = set(range(len(tickers)))
+            while pending and loop.time() < deadline:
+                await asyncio.sleep(0.1)
+                pending = {i for i in pending if tickers[i][1].modelGreeks is None}
+
+            # Collect results
+            for cid, ticker in tickers:
+                g = ticker.modelGreeks
+                if g is None:
+                    LOGGER.debug("No modelGreeks for conid %d after timeout", cid)
+                    continue
+                result[cid] = {
+                    "delta": g.delta,
+                    "gamma": g.gamma,
+                    "theta": g.theta,
+                    "vega":  g.vega,
+                    "iv":    g.impliedVol,
+                    "source": "tws_socket",
+                }
+
+            # Cancel all market data subscriptions
+            for cid, _ in tickers:
+                try:
+                    ib.cancelMktData(contract_map[cid])
+                except Exception:
+                    pass
+
+            LOGGER.info(
+                "TWS socket Greeks: %d/%d enriched via modelGreeks",
+                len(result), len(conids),
+            )
+        except Exception as exc:
+            LOGGER.warning("TWS socket Greek fetch failed: %s", exc)
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+        return result
 
     def _build_prefetch_targets(self, positions: list[UnifiedPosition]) -> dict[str, set[tuple[str, float, str]]]:
         """Build per-underlying option requests used for cache prewarming."""

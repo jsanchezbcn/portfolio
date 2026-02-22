@@ -548,6 +548,26 @@ def main() -> None:
     ]
 
     if not account_options:
+        # SOCKET mode fallback: use IB_ACCOUNTS env var when Client Portal is unavailable
+        # Note: custom load_dotenv keeps inline comments in values, so use startswith()
+        _api_mode = os.getenv("IB_API_MODE", "PORTAL").split("#")[0].strip().upper()
+        if _api_mode == "SOCKET":
+            _env_accts = [
+                a.strip()
+                for a in os.getenv("IB_ACCOUNTS", "").split(",")
+                if a.strip() and not a.strip().startswith("DU")
+            ]
+            if not _env_accts:
+                # Last resort: discover from cached position snapshot files
+                import glob as _glob
+                _env_accts = sorted({
+                    Path(f).stem.replace(".positions_snapshot_", "")
+                    for f in _glob.glob(str(PROJECT_ROOT / ".positions_snapshot_*.json"))
+                    if not Path(f).stem.replace(".positions_snapshot_", "").startswith("DU")
+                })
+            account_options = _env_accts or account_options
+
+    if not account_options:
         st.error("No IBKR accounts available from gateway. Use 'Sign in to IBKR' in the sidebar, then click 'Reload Accounts'.")
         st.stop()
 
