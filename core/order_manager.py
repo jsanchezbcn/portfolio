@@ -21,7 +21,43 @@ import httpx
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Literal
 
+from models.order import OrderStatus
+from core.event_bus import get_event_bus
+
 logger = logging.getLogger(__name__)
+
+class OrderStateMachine:
+    """
+    Strict state machine for orders.
+    Valid transitions:
+    - DRAFT -> SIMULATED
+    - SIMULATED -> STAGED
+    - STAGED -> SUBMITTED
+    - SUBMITTED -> PENDING
+    - PENDING -> PARTIAL_FILL, FILLED, CANCELED, REJECTED
+    - PARTIAL_FILL -> FILLED, CANCELED
+    """
+    VALID_TRANSITIONS = {
+        OrderStatus.DRAFT: {OrderStatus.SIMULATED},
+        OrderStatus.SIMULATED: {OrderStatus.STAGED},
+        OrderStatus.STAGED: {OrderStatus.SUBMITTED, OrderStatus.CANCELED},
+        OrderStatus.SUBMITTED: {OrderStatus.PENDING, OrderStatus.REJECTED},
+        OrderStatus.PENDING: {OrderStatus.PARTIAL_FILL, OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED},
+        OrderStatus.PARTIAL_FILL: {OrderStatus.FILLED, OrderStatus.CANCELED},
+        OrderStatus.FILLED: set(),
+        OrderStatus.CANCELED: set(),
+        OrderStatus.REJECTED: set(),
+    }
+
+    @classmethod
+    def can_transition(cls, current_state: OrderStatus, next_state: OrderStatus) -> bool:
+        return next_state in cls.VALID_TRANSITIONS.get(current_state, set())
+
+    @classmethod
+    def transition(cls, current_state: OrderStatus, next_state: OrderStatus) -> OrderStatus:
+        if not cls.can_transition(current_state, next_state):
+            raise ValueError(f"Invalid state transition from {current_state} to {next_state}")
+        return next_state
 
 # ---------------------------------------------------------------------------
 # T013 — OrderRequest Pydantic model
@@ -205,8 +241,18 @@ class OrderManager:
                 limit_price=request.limit_price,
                 expiration=request.expiration,
                 strike=request.strike,
-                status="STAGED",
+                status=OrderStatus.STAGED.value,
             )
+            
+            event_bus = get_event_bus()
+            if event_bus._running:
+                await event_bus.publish("order_updates", {
+                    "event": "ORDER_STAGED",
+                    "tws_order_id": tws_order_id,
+                    "account_id": account_id,
+                    "symbol": request.symbol,
+                    "status": OrderStatus.STAGED.value
+                })
         except Exception:
             logger.exception(
                 "DB write failed for order %s — attempting TWS cancellation",

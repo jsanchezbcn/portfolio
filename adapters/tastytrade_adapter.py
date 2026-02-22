@@ -9,10 +9,47 @@ from adapters.base_adapter import BrokerAdapter
 from models.order import PortfolioGreeks
 from models.unified_position import InstrumentType, UnifiedPosition
 from risk_engine.beta_weighter import BetaWeighter
-
+from core.event_bus import get_event_bus
+import json
 
 LOGGER = logging.getLogger(__name__)
 
+class TastytradeWebSocketClient:
+    """
+    Basic WebSocket client for Tastytrade DxLink.
+    Connects to wss://tastytrade.com/ws and publishes updates to EventBus.
+    """
+    def __init__(self, base_url: str = "wss://tastytrade.com/ws"):
+        self.base_url = base_url
+        self._running = False
+        self._ws = None
+
+    async def start(self):
+        import websockets
+        self._running = True
+        
+        try:
+            async with websockets.connect(self.base_url) as ws:
+                self._ws = ws
+                LOGGER.info("Connected to Tastytrade WebSocket")
+                
+                while self._running:
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+                    
+                    # Publish to event bus
+                    event_bus = get_event_bus()
+                    if event_bus._running:
+                        await event_bus.publish("market_data", data)
+                        
+        except Exception as e:
+            LOGGER.error(f"Tastytrade WebSocket error: {e}")
+            self._running = False
+
+    async def stop(self):
+        self._running = False
+        if self._ws:
+            await self._ws.close()
 
 class TastytradeAdapter(BrokerAdapter):
     """Adapter that converts Tastytrade payloads into normalized positions."""

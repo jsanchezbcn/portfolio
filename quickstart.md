@@ -43,20 +43,24 @@ Open Streamlit URL shown by the script.
 ## 5) Validate Algo Execution Platform (US3-US7)
 
 ### Order Builder + Trade Journal
+
 - Open the `Order Builder` panel and add a leg (e.g., SPX PUT, qty -1)
 - Click `Simulate` -- confirm the simulated order appears in the Trade Journal table
 
 ### AI Risk Analyst
+
 - Trigger a risk breach (set a very low delta limit in config/risk_matrix.yaml temporarily)
 - Confirm the `AI Risk Analyst` section shows a red breach banner
 - Confirm suggestion cards appear within ~10s (requires LLM_API_KEY set)
 
 ### Historical Charts
+
 - Scroll to `Historical Charts` section
 - Confirm `Account NLV vs Delta` dual-axis chart renders (may show empty if no snapshots yet)
 - Confirm `Sebastian Ratio |theta|/|vega|` chart renders with green 0.25-0.40 band
 
 ### Flatten Risk
+
 - Scroll to `Flatten Risk` section
 - Click `Flatten Risk` button (or sidebar shortcut)
 - Confirm confirmation dialog with order table appears

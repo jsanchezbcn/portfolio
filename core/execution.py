@@ -41,6 +41,8 @@ from models.order import (
     TradeJournalEntry,
 )
 
+from core.event_bus import get_event_bus
+
 logger = logging.getLogger(__name__)
 
 # Path to risk matrix config (relative to project root)
@@ -510,6 +512,17 @@ class ExecutionEngine:
 
             def _do_record():
                 asyncio.run(self._store.record_fill(entry))
+                
+                # Publish event
+                event_bus = get_event_bus()
+                if event_bus._running:
+                    asyncio.run(event_bus.publish("order_updates", {
+                        "event": "ORDER_FILLED",
+                        "broker_order_id": order.broker_order_id,
+                        "account_id": account_id,
+                        "underlying": underlying,
+                        "status": status
+                    }))
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 pool.submit(_do_record).result(timeout=8)

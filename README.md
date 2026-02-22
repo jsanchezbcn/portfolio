@@ -21,10 +21,10 @@ Portfolio risk dashboard combining IBKR positions with options Greeks enrichment
 
 ## New Environment Variables
 
-| Variable | Default | Description |
-|---|---|---|
-| `LLM_MODEL` | `gpt-4.1` | LLM model for AI Risk Analyst / Market Brief |
-| `SNAPSHOT_INTERVAL_SECONDS` | `900` | Seconds between account snapshot captures (15 min) |
+| Variable                    | Default   | Description                                        |
+| --------------------------- | --------- | -------------------------------------------------- |
+| `LLM_MODEL`                 | `gpt-4.1` | LLM model for AI Risk Analyst / Market Brief       |
+| `SNAPSHOT_INTERVAL_SECONDS` | `900`     | Seconds between account snapshot captures (15 min) |
 
 ## Setup
 
@@ -59,14 +59,14 @@ Run the full focused test suite:
 
 Key test files:
 
-| File | Coverage |
-|---|---|
-| `tests/test_execution.py` | ExecutionEngine simulate/submit/flatten_risk |
-| `tests/test_trade_journal.py` | LocalStore record_fill/query_journal/export_csv/snapshots |
-| `tests/test_ai_risk_auditor.py` | LLMRiskAuditor.suggest_trades() |
-| `tests/test_orders.py` | Order FSM, OrderLeg, BAG combo |
-| `tests/test_order_builder.py` | Streamlit order builder component |
-| `tests/test_arbitrage.py` | ArbitrageHunter |
+| File                            | Coverage                                                  |
+| ------------------------------- | --------------------------------------------------------- |
+| `tests/test_execution.py`       | ExecutionEngine simulate/submit/flatten_risk              |
+| `tests/test_trade_journal.py`   | LocalStore record_fill/query_journal/export_csv/snapshots |
+| `tests/test_ai_risk_auditor.py` | LLMRiskAuditor.suggest_trades()                           |
+| `tests/test_orders.py`          | Order FSM, OrderLeg, BAG combo                            |
+| `tests/test_order_builder.py`   | Streamlit order builder component                         |
+| `tests/test_arbitrage.py`       | ArbitrageHunter                                           |
 
 Integration tests (require credentials/network):
 

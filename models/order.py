@@ -37,11 +37,15 @@ class OrderStatus(str, Enum):
     """Finite-state machine for order lifecycle."""
     DRAFT = "DRAFT"          # Being built in the order builder
     SIMULATED = "SIMULATED"  # WhatIf simulation completed
+    STAGED = "STAGED"        # Staged in broker but not transmitted
     PENDING = "PENDING"      # Submitted to broker, awaiting fill
+    SUBMITTED = "SUBMITTED"  # Submitted to broker
     FILLED = "FILLED"        # Fully filled
     PARTIAL = "PARTIAL"      # Partially filled — remainder still PENDING
+    PARTIAL_FILL = "PARTIAL_FILL" # Partially filled
     REJECTED = "REJECTED"    # Broker rejected the order
     CANCELLED = "CANCELLED"  # User or broker cancelled
+    CANCELED = "CANCELED"    # User or broker cancelled
 
 
 # Valid FSM transitions

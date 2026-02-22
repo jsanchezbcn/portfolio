@@ -68,10 +68,10 @@ These principles from quantitative trading books are CONSTITUTIONAL:
 
 **Natenberg ("Option Volatility and Pricing"):**
 
-- IV vs HV comparison MUST be used for edge analysis (US7)
+- IV vs HV comparison MUST be used for edge analysis.
 - If IV > HV → selling edge (overpriced options)
 - If IV < HV → buying edge (underpriced options)
-- US7 MUST display this analysis with clear recommendations
+- The system MUST display this analysis with clear recommendations.
 
 **Sebastian ("The Option Trader's Hedge Fund"):**
 
@@ -79,14 +79,14 @@ These principles from quantitative trading books are CONSTITUTIONAL:
 - Formula MUST use absolute values: `abs(portfolio_theta) / abs(portfolio_vega)`
 - Green zone: 0.25 <= ratio <= 0.40
 - Red zone: ratio < 0.20 or ratio > 0.50
-- US3 MUST implement this visualization
+- The system MUST implement this visualization.
 
 **Taleb ("Dynamic Hedging"):**
 
 - Gamma risk increases exponentially near expiration
 - 0-7 DTE positions MUST be flagged when |net_gamma| > 5.0
 - Threshold of 5.0 is HARDCODED for MVP (portfolio-level net gamma per bucket)
-- US2 MUST display warning: "⚠️ High gamma in 0-7 DTE bucket. Taleb warns: 'Gamma risk explodes near expiration.'"
+- The system MUST display warning: "⚠️ High gamma in 0-7 DTE bucket. Taleb warns: 'Gamma risk explodes near expiration.'"
 
 **Passarelli ("Trading Options Greeks") — DEFERRED:**
 
