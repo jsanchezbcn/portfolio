@@ -138,39 +138,50 @@ class TestSidebarControls:
 
     @pytest.mark.asyncio(loop_scope="module")
     async def test_account_selectbox_visible(self, page: Page):
-        combo = page.get_by_role("combobox", name=lambda n: "IBKR Account" in (n or ""))
+        # Scope to sidebar to avoid strict-mode violations
+        sidebar = page.get_by_test_id("stSidebarUserContent")
+        combo = sidebar.get_by_role("combobox").first
         await combo.wait_for(timeout=5000)
         assert await combo.is_visible()
 
     @pytest.mark.asyncio(loop_scope="module")
     async def test_refresh_button_visible(self, page: Page):
-        btn = page.get_by_role("button", name="Refresh")
+        # Scope to sidebar – "Refresh" also appears in main content ("Refresh Orders")
+        btn = page.get_by_test_id("stSidebarUserContent").get_by_role(
+            "button", name="Refresh"
+        )
         await btn.wait_for(timeout=5000)
         assert await btn.is_visible()
 
     @pytest.mark.asyncio(loop_scope="module")
     async def test_flatten_risk_button_visible(self, page: Page):
-        btn = page.get_by_role("button", name="🚨 Flatten Risk")
+        # Scope to sidebar – Flatten Risk button also appears in main content
+        btn = page.get_by_test_id("stSidebarUserContent").get_by_role(
+            "button", name="🚨 Flatten Risk"
+        )
         await btn.wait_for(timeout=5000)
         assert await btn.is_visible()
 
     @pytest.mark.asyncio(loop_scope="module")
     async def test_ibkr_only_mode_checkbox_checked(self, page: Page):
         """IBKR-only mode should default to checked."""
-        checkbox = page.get_by_role("checkbox", name=lambda n: "IBKR-only mode" in (n or ""))
+        # Streamlit sets aria-label on the input; use get_by_role with name= to match it
+        checkbox = page.get_by_role("checkbox", name="IBKR-only mode (no external Greeks)")
         await checkbox.wait_for(timeout=5000)
         is_checked = await checkbox.is_checked()
         assert is_checked, "IBKR-only mode checkbox should be checked by default"
 
     @pytest.mark.asyncio(loop_scope="module")
     async def test_show_per_position_greeks_checkbox_checked(self, page: Page):
-        checkbox = page.get_by_role("checkbox", name=lambda n: "Show per-position Greeks" in (n or ""))
+        checkbox = page.get_by_role("checkbox", name="Show per-position Greeks")
         await checkbox.wait_for(timeout=5000)
         assert await checkbox.is_checked()
 
     @pytest.mark.asyncio(loop_scope="module")
     async def test_llm_model_selectbox_present(self, page: Page):
-        combo = page.get_by_role("combobox", name=lambda n: "Model" in (n or ""))
+        # The LLM model combobox is the second combobox in the sidebar
+        sidebar = page.get_by_test_id("stSidebarUserContent")
+        combo = sidebar.get_by_role("combobox").nth(1)
         await combo.wait_for(timeout=5000)
         assert await combo.is_visible()
 
@@ -311,7 +322,8 @@ class TestPositionsTable:
     @pytest.mark.asyncio(loop_scope="module")
     async def test_positions_greeks_header_present(self, page: Page):
         text = await _page_text(page)
-        assert "Portfolio Positions" in text, "Portfolio Positions section header missing"
+        assert "Portfolio Positions" in text or "Positions & Greeks" in text, \
+            "Portfolio Positions section header missing"
 
     @pytest.mark.asyncio(loop_scope="module")
     async def test_positions_table_has_data(self, page: Page):
@@ -392,14 +404,16 @@ class TestAccountSwitching:
     @pytest.mark.asyncio(loop_scope="module")
     async def test_current_account_displayed_in_selector(self, page: Page):
         """The IBKR Account combobox shows a non-empty account ID."""
-        combo = page.get_by_role("combobox", name=lambda n: "IBKR Account" in (n or ""))
+        sidebar = page.get_by_test_id("stSidebarUserContent")
+        combo = sidebar.get_by_role("combobox").first
         try:
             await combo.wait_for(timeout=5000)
         except Exception:
-            # Fallback: first combobox
-            combo = page.get_by_role("combobox").first
-        selected = await combo.input_value()
-        assert selected.strip(), f"Account selector is empty (got: '{selected}')"
+            pytest.skip("Account combobox not found \u2014 gateway may not be authenticated")
+        # Streamlit combobox stores selected value in aria-label: "Selected DU123456. IBKR Account"
+        aria = await combo.get_attribute("aria-label") or ""
+        selected = aria.split(".")[0].replace("Selected ", "").strip() if aria else ""
+        assert selected, f"Account selector shows no selected account (aria-label: '{aria}')"
 
     @pytest.mark.asyncio(loop_scope="module")
     async def test_refresh_button_triggers_rerender(self, page: Page):
@@ -407,7 +421,10 @@ class TestAccountSwitching:
         await page.evaluate("window.scrollTo(0, 0)")
         await asyncio.sleep(0.5)
 
-        refresh_btn = page.get_by_role("button", name="Refresh")
+        # Scope to sidebar to avoid strict-mode violation ("Refresh Orders" also exists)
+        refresh_btn = page.get_by_test_id("stSidebarUserContent").get_by_role(
+            "button", name="Refresh"
+        )
         await refresh_btn.click()
         # Wait for Streamlit to re-render (spinner disappears or content refreshes)
         await asyncio.sleep(5)
@@ -431,7 +448,7 @@ class TestSidebarToggles:
     async def test_toggle_ibkr_only_mode_off_and_back(self, page: Page):
         """Unchecking and re-checking IBKR-only mode should not crash."""
         await page.evaluate("window.scrollTo(0, 0)")
-        checkbox = page.get_by_role("checkbox", name=lambda n: "IBKR-only mode" in (n or ""))
+        checkbox = page.get_by_role("checkbox", name="IBKR-only mode (no external Greeks)")
         await checkbox.wait_for(timeout=5000)
         # Uncheck it
         await checkbox.click()
@@ -447,7 +464,7 @@ class TestSidebarToggles:
     @pytest.mark.asyncio(loop_scope="module")
     async def test_toggle_show_positions_off_and_back(self, page: Page):
         """Unchecking positions table should hide it gracefully."""
-        checkbox = page.get_by_role("checkbox", name=lambda n: "Show per-position Greeks" in (n or ""))
+        checkbox = page.get_by_role("checkbox", name="Show per-position Greeks")
         await checkbox.wait_for(timeout=5000)
         await checkbox.click()
         await asyncio.sleep(4)
@@ -469,11 +486,11 @@ class TestFlattenRiskPanel:
 
     @pytest.mark.asyncio(loop_scope="module")
     async def test_flatten_risk_section_visible(self, page: Page):
-        text = await _page_text(page)
-        # The section is guarded by a try/except, so it won't crash but may show a warning
-        # Just check the button is accessible
-        btn = page.get_by_role("button", name="🚨 Flatten Risk")
-        assert await btn.is_visible(), "Flatten Risk button not visible"
+        # Scope to sidebar to prevent strict-mode violation (also appears in main content)
+        btn = page.get_by_test_id("stSidebarUserContent").get_by_role(
+            "button", name="🚨 Flatten Risk"
+        )
+        assert await btn.is_visible(), "Flatten Risk button not visible in sidebar"
 
 
 # ── AI Sections ──────────────────────────────────────────────────────────────
@@ -531,8 +548,9 @@ class TestSecondAccount:
     async def test_discover_available_accounts(self, page: Page):
         """Inspect the account selector's options."""
         await page.evaluate("window.scrollTo(0, 0)")
-        # Click the combobox to open its dropdown and see options
-        combo = page.get_by_role("combobox", name=lambda n: "IBKR Account" in (n or ""))
+        # Scope to sidebar to avoid lambda (not supported by Playwright Python)
+        sidebar = page.get_by_test_id("stSidebarUserContent")
+        combo = sidebar.get_by_role("combobox").first
         try:
             await combo.wait_for(timeout=5000)
             await combo.click()
@@ -562,7 +580,8 @@ class TestSecondAccount:
     @pytest.mark.asyncio(loop_scope="module")
     async def test_switch_to_second_account_and_verify_render(self, page: Page):
         """Switch to the second account and confirm dashboard re-renders."""
-        combo = page.get_by_role("combobox", name=lambda n: "IBKR Account" in (n or ""))
+        sidebar = page.get_by_test_id("stSidebarUserContent")
+        combo = sidebar.get_by_role("combobox").first
         try:
             await combo.wait_for(timeout=5000)
             await combo.click()

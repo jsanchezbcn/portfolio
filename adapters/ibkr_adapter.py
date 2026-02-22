@@ -80,27 +80,6 @@ class IBKRAdapter(BrokerAdapter):
 
     async def fetch_positions(self, account_id: str) -> list[UnifiedPosition]:
         """Fetch IBKR positions and convert to unified schema."""
-        if os.getenv("MOCK_IBKR") == "1":
-            return [
-                UnifiedPosition(
-                    symbol="AAPL240621C200",
-                    instrument_type=InstrumentType.OPTION,
-                    broker="ibkr",
-                    quantity=2,
-                    avg_price=1,
-                    market_value=1,
-                    unrealized_pnl=0,
-                    underlying="AAPL",
-                    strike=200,
-                    expiration=date(2026, 6, 21),
-                    option_type="call",
-                    iv=0.40,
-                    gamma=1.5,
-                    theta=25,
-                    vega=80,
-                )
-            ]
-
         try:
             raw_positions = await asyncio.to_thread(self.client.get_positions, account_id)
         except Exception as exc:
