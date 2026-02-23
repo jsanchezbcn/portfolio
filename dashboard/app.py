@@ -84,10 +84,10 @@ def _snapshot_loop(
             summary = portfolio_tools.get_portfolio_summary(positions)
             regime = regime_detector.detect_regime(vix=vix, term_structure=float(vix_info.get("term_structure", 1.0)))
 
-            spx_info = market_tools.get_market_data("SPX") or {}
+            spx_info = market_tools.get_spx_data() or {}
             spx_price = None
             try:
-                spx_price = float(spx_info.get("last") or spx_info.get("close") or 0) or None
+                spx_price = float(spx_info.get("spx") or spx_info.get("last") or spx_info.get("close") or 0) or None
             except (TypeError, ValueError):
                 spx_price = None
 
@@ -546,6 +546,26 @@ def main() -> None:
         for account in ibkr_accounts
         if (account.get("accountId") or account.get("id"))
     ]
+
+    if not account_options:
+        # SOCKET mode fallback: use IB_ACCOUNTS env var when Client Portal is unavailable
+        # Note: custom load_dotenv keeps inline comments in values, so use startswith()
+        _api_mode = os.getenv("IB_API_MODE", "PORTAL").split("#")[0].strip().upper()
+        if _api_mode == "SOCKET":
+            _env_accts = [
+                a.strip()
+                for a in os.getenv("IB_ACCOUNTS", "").split(",")
+                if a.strip() and not a.strip().startswith("DU")
+            ]
+            if not _env_accts:
+                # Last resort: discover from cached position snapshot files
+                import glob as _glob
+                _env_accts = sorted({
+                    Path(f).stem.replace(".positions_snapshot_", "")
+                    for f in _glob.glob(str(PROJECT_ROOT / ".positions_snapshot_*.json"))
+                    if not Path(f).stem.replace(".positions_snapshot_", "").startswith("DU")
+                })
+            account_options = _env_accts or account_options
 
     if not account_options:
         st.error("No IBKR accounts available from gateway. Use 'Sign in to IBKR' in the sidebar, then click 'Reload Accounts'.")

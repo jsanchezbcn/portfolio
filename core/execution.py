@@ -549,8 +549,8 @@ class ExecutionEngine:
         """Best-effort SPX price fetch at fill time (T042). Never raises."""
         try:
             from agent_tools.market_data_tools import MarketDataTools
-            data = MarketDataTools().get_market_data("SPX")
-            price = data.get("last") or data.get("price")
+            data = MarketDataTools().get_spx_data()
+            price = data.get("spx") or data.get("last") or data.get("price")
             return float(price) if price else None
         except Exception:
             return None

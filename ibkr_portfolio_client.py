@@ -859,7 +859,12 @@ def load_dotenv(env_file: str = '.env') -> None:
             if line and not line.startswith('#') and '=' in line:
                 key, value = line.split('=', 1)
                 key = key.strip()
+                # Strip inline comments: value = value before any ' #' or '\t#'
                 value = value.strip().strip('"\'')
+                if '  #' in value:
+                    value = value[:value.index('  #')].strip()
+                elif '\t#' in value:
+                    value = value[:value.index('\t#')].strip()
                 os.environ[key] = value
 
 
@@ -1033,8 +1038,6 @@ class IBKRClient:
     
     def get_accounts(self) -> List[Dict]:
         """Fetch portfolio accounts."""
-        if os.getenv("MOCK_IBKR") == "1":
-            return [{"id": "DU123456", "accountId": "DU123456"}]
         try:
             response = self.session.get(f"{self.base_url}/v1/api/portfolio/accounts")
             if response.status_code == 200:
@@ -1049,13 +1052,6 @@ class IBKRClient:
 
     def get_account_summary(self, account_id: str) -> Dict[str, Any]:
         """Fetch account summary metrics from IBKR CPAPI portfolio endpoint."""
-        if os.getenv("MOCK_IBKR") == "1":
-            return {
-                "netliquidation": {"amount": 100000.0},
-                "buyingpower": {"amount": 50000.0},
-                "maintmarginreq": {"amount": 20000.0},
-                "excessliquidity": {"amount": 80000.0}
-            }
         try:
             response = self.session.get(
                 f"{self.base_url}/v1/api/portfolio/{account_id}/summary",
