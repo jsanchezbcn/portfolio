@@ -6,6 +6,7 @@ import logging
 import os
 import re
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 from adapters.base_adapter import BrokerAdapter
@@ -74,12 +75,34 @@ class IBKRAdapter(BrokerAdapter):
         self.disable_tasty_cache = disable_cache_raw in {"1", "true", "yes", "on"}
         force_refresh_raw = str(os.getenv("GREEKS_FORCE_REFRESH_ON_MISS", "1")).strip().lower()
         self.force_refresh_on_miss = force_refresh_raw in {"1", "true", "yes", "on"}
+        self._stock_option_greeks_cache_path = Path(
+            os.getenv("STOCK_OPTION_GREEKS_CACHE_FILE", ".stock_option_greeks_cache.json")
+        )
+        self._stock_option_greeks_cache: dict[str, dict[str, Any]] = self._load_stock_option_greeks_cache()
         # BetaWeighter provides the SPX beta waterfall used by compute_portfolio_greeks().
         # Session is injected later if a Tastytrade session is available.
         self._beta_weighter = BetaWeighter(tastytrade_session=None, ibkr_client=self.client)
 
     async def fetch_positions(self, account_id: str) -> list[UnifiedPosition]:
-        """Fetch IBKR positions and convert to unified schema."""
+        """Fetch IBKR positions and convert to unified schema.
+
+        In SOCKET mode (IB_API_MODE=SOCKET) positions are retrieved via ib_async
+        directly from TWS/IB Gateway so the Client Portal REST API is not required.
+        Falls back to Client Portal if the socket fetch returns nothing.
+        """
+        _api_mode = os.getenv("IB_API_MODE", "PORTAL").split("#")[0].strip().upper()
+        if _api_mode == "SOCKET":
+            try:
+                socket_positions = await self._fetch_positions_via_tws_socket(account_id)
+                if socket_positions:
+                    return socket_positions
+                LOGGER.warning(
+                    "TWS socket positions returned 0 items for %s – falling back to Client Portal",
+                    account_id,
+                )
+            except Exception as _exc:
+                LOGGER.warning("TWS socket positions failed (%s); falling back to Client Portal", _exc)
+
         try:
             raw_positions = await asyncio.to_thread(self.client.get_positions, account_id)
         except Exception as exc:
@@ -118,6 +141,7 @@ class IBKRAdapter(BrokerAdapter):
                     prefetch_results[underlying] = 0
 
         cache_miss_count = 0
+        stock_option_cache_hits = 0
 
         def _normalize_greeks_source(value: Any) -> str:
             if isinstance(value, str):
@@ -157,12 +181,31 @@ class IBKRAdapter(BrokerAdapter):
             _api_mode = os.getenv("IB_API_MODE", "PORTAL").split("#")[0].strip().upper()
             if _api_mode == "SOCKET":
                 # TWS socket mode: use ib_async modelGreeks instead of Client Portal
-                # snapshot REST API (which returns 401/400 when portal is not authenticated)
+                # snapshot REST API (which returns 401/400 when portal is not authenticated).
+                # Pass full position objects so contracts can be built from metadata.
                 try:
-                    _ibkr_greeks = await self._fetch_greeks_via_tws_socket(_conids)
+                    _ibkr_greeks = await self._fetch_greeks_via_tws_socket(_options_needing_greeks)
                 except Exception as _exc:
                     LOGGER.warning("TWS socket greeks batch failed: %s", _exc)
                     _ibkr_greeks = {}
+                # Fallback for contracts still missing modelGreeks (common on some equity options).
+                # If Client Portal is authenticated, snapshot greeks can fill the remainder.
+                _remaining_conids = [
+                    conid for _, conid in _options_needing_greeks if conid not in _ibkr_greeks
+                ]
+                if _remaining_conids:
+                    try:
+                        _snapshot_greeks = await asyncio.to_thread(
+                            self.client.get_market_greeks_batch, _remaining_conids
+                        )
+                        if _snapshot_greeks:
+                            _ibkr_greeks.update(_snapshot_greeks)
+                    except Exception as _exc:
+                        LOGGER.debug(
+                            "IBKR snapshot fallback unavailable for %d contracts: %s",
+                            len(_remaining_conids),
+                            _exc,
+                        )
             else:
                 try:
                     _ibkr_greeks = await asyncio.to_thread(
@@ -192,6 +235,7 @@ class IBKRAdapter(BrokerAdapter):
                 pos.vega  = (vega  or 0.0) * pos.quantity * tv_mult
                 pos.iv    = self._safe_optional_float(g.get("iv"))
                 pos.greeks_source = g.get("source", "ibkr_snapshot")
+                self._update_stock_option_greeks_cache(pos)
                 ibkr_snapshot_hits += 1
 
         LOGGER.debug(
@@ -341,6 +385,17 @@ class IBKRAdapter(BrokerAdapter):
 
             source = str(greeks.get("source") or "")
             if source in {"cache_miss", "error", "session_error", "live_miss", "cache_and_live_miss"}:
+                if self._apply_stock_option_cache(position):
+                    stock_option_cache_hits += 1
+                    if _spx_price_for_batch_num > 0:
+                        bw_result = await self._beta_weighter.compute_spx_equivalent_delta(
+                            position, _spx_price_for_batch_num
+                        )
+                        position.spx_delta = bw_result.spx_equivalent_delta
+                        position.beta_unavailable = bw_result.beta_unavailable
+                    updated_positions.append(position)
+                    continue
+
                 cache_miss_count += 1
                 raw_contract_multiplier = self._safe_optional_float(getattr(position, "contract_multiplier", None))
                 contract_multiplier = raw_contract_multiplier if raw_contract_multiplier and raw_contract_multiplier > 0 else 1.0
@@ -378,6 +433,7 @@ class IBKRAdapter(BrokerAdapter):
             position.vega = per_contract_vega * position.quantity * theta_vega_multiplier
             position.iv = self._safe_optional_float(greeks.get("impliedVol"))
             position.greeks_source = "tastytrade"
+            self._update_stock_option_greeks_cache(position)
 
             # Use BetaWeighter for accurate SPX-equivalent delta (T016).
             # underlying_price is already populated on the position (T005 fix).
@@ -410,6 +466,7 @@ class IBKRAdapter(BrokerAdapter):
             "ibkr_snapshot_total": len(_options_needing_greeks),
             "ibkr_snapshot_hits": ibkr_snapshot_hits,
             "ibkr_snapshot_errors": ibkr_snapshot_errors,
+            "stock_option_cache_hits": stock_option_cache_hits,
             "cache_miss_count": cache_miss_count,
             "missing_greeks_details": missing_greeks_details,
             "last_session_error": getattr(self.client.options_cache, "last_session_error", None),
@@ -441,12 +498,242 @@ class IBKRAdapter(BrokerAdapter):
                 spx_price = 0.0
         return await self._beta_weighter.compute_portfolio_spx_delta(positions, spx_price)
 
-    async def _fetch_greeks_via_tws_socket(self, conids: list[int]) -> dict[int, dict]:
+    async def _fetch_positions_via_tws_socket(self, account_id: str) -> list[UnifiedPosition]:
+        """Fetch portfolio positions from TWS via ib_async reqAccountUpdates.
+
+        Returns a list of UnifiedPosition objects built directly from the ib_async
+        PortfolioItem stream.  Greeks are intentionally left at zero so the
+        subsequent fetch_greeks() call can enrich them via modelGreeks.
+        """
+        try:
+            from ib_async import IB
+        except ImportError:
+            LOGGER.warning("ib_async not installed – cannot fetch positions via TWS socket")
+            return []
+
+        host      = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
+        port      = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        client_id = int(os.getenv("IB_POSITIONS_CLIENT_ID", "11"))
+
+        ib = IB()
+        result: list[UnifiedPosition] = []
+        try:
+            await ib.connectAsync(host=host, port=port, clientId=client_id)
+            LOGGER.info(
+                "IBKRAdapter positions socket connected (clientId=%d, account=%s)",
+                client_id, account_id,
+            )
+
+            # ib_async automatically sends reqPositions on connect.  Positions
+            # arrive via positionEvent and are stored in ib._positions.
+            # Give TWS up to 2 s to deliver the full snapshot, then fall back
+            # to whatever arrived so far.
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.1)
+                if ib.positions():   # positions have started arriving
+                    break
+            await asyncio.sleep(0.5)  # allow remaining items to flush
+
+            # Use Position stream directly (robust in SOCKET mode and available
+            # immediately after connect). These objects do not include market
+            # value fields, but are sufficient for downstream Greeks enrichment.
+            for p in ib.positions():
+                if account_id and p.account and p.account != account_id:
+                    continue
+                try:
+                    pos = self._position_to_unified_position(p)
+                    if pos is not None:
+                        result.append(pos)
+                except Exception as exc:
+                    sym = getattr(p.contract, "symbol", "?")
+                    LOGGER.warning("Skipping TWS position %s: %s", sym, exc)
+            LOGGER.info(
+                "TWS socket positions (Position): %d positions for account %s",
+                len(result), account_id,
+            )
+
+        except Exception as exc:
+            LOGGER.warning("TWS socket positions fetch failed: %s", exc)
+            return []
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+        return result
+
+    def _position_to_unified_position(self, p: Any) -> UnifiedPosition | None:
+        """Convert an ib_async Position (reqPositions) to UnifiedPosition.
+
+        Position has: account, contract, position (qty), avgCost.
+        Market value and unrealizedPNL are NOT available – set to 0.
+        """
+        # Reuse the PortfolioItem converter by building a thin wrapper
+        class _FakeItem:
+            contract     = p.contract
+            position     = p.position
+            averageCost  = p.avgCost
+            marketValue  = 0.0
+            unrealizedPNL = 0.0
+            marketPrice  = 0.0
+            account      = p.account
+
+        return self._portfolio_item_to_unified_position(_FakeItem())
+
+    def _portfolio_item_to_unified_position(self, item: Any) -> UnifiedPosition | None:
+        """Convert an ib_async PortfolioItem to UnifiedPosition.
+
+        PortfolioItem fields used:
+            item.contract  – Contract(conId, symbol, secType, lastTradeDateOrContractMonth,
+                              strike, right, multiplier, localSymbol)
+            item.position  – signed quantity
+            item.averageCost, item.marketValue, item.unrealizedPNL, item.marketPrice
+        """
+        c         = item.contract
+        sec_type  = (c.secType or "").upper()
+        qty       = float(item.position or 0.0)
+        avg_cost  = float(item.averageCost  or 0.0)
+        mkt_value = float(item.marketValue  or 0.0)
+        upnl      = float(item.unrealizedPNL or 0.0)
+        mkt_price = float(item.marketPrice  or 0.0)
+        conid     = str(c.conId or "")
+
+        # Multiplier from contract string
+        try:
+            mult = float(c.multiplier) if c.multiplier else 0.0
+        except (TypeError, ValueError):
+            mult = 0.0
+
+        if sec_type in ("OPT", "FOP"):
+            underlying = (c.symbol or "").upper()
+            expiry_str = c.lastTradeDateOrContractMonth or ""
+            right      = (c.right or "C").upper()
+            option_type = "call" if right == "C" else "put"
+            strike     = float(c.strike or 0.0)
+
+            expiration: date | None = None
+            if expiry_str:
+                try:
+                    expiration = datetime.strptime(expiry_str[:8], "%Y%m%d").date()
+                except (ValueError, TypeError):
+                    pass
+
+            dte = (expiration - date.today()).days if expiration else None
+
+            # Determine contract multiplier (contract field → symbol default)
+            if mult <= 0:
+                _mult_defaults: dict[str, float] = {
+                    "ES": 50.0, "MES": 5.0, "NQ": 20.0, "MNQ": 2.0,
+                    "RTY": 50.0, "M2K": 10.0, "YM": 5.0, "MYM": 0.5,
+                    "SPX": 100.0, "SPXW": 100.0, "NDX": 100.0,
+                }
+                mult = _mult_defaults.get(underlying, 100.0)  # default for equity opts
+
+            # Use localSymbol as display symbol if available (matches portal format)
+            symbol = c.localSymbol or (
+                f"{underlying} {expiry_str} {strike:.0f} {right[0]}"
+            )
+
+            return UnifiedPosition(
+                symbol              = symbol,
+                instrument_type     = InstrumentType.OPTION,
+                broker              = "ibkr",
+                quantity            = qty,
+                contract_multiplier = mult,
+                avg_price           = avg_cost / mult if mult > 0 else avg_cost,
+                market_value        = mkt_value,
+                unrealized_pnl      = upnl,
+                underlying          = underlying,
+                strike              = strike,
+                expiration          = expiration,
+                option_type         = option_type,
+                days_to_expiration  = dte,
+                delta               = 0.0,
+                gamma               = 0.0,
+                theta               = 0.0,
+                vega                = 0.0,
+                greeks_source       = "none",
+                broker_id           = conid,
+            )
+
+        elif sec_type == "FUT":
+            ticker = (c.symbol or "").upper()
+            _fut_mult_defaults: dict[str, float] = {
+                "ES": 50.0, "MES": 5.0, "NQ": 20.0, "MNQ": 2.0,
+                "RTY": 50.0, "M2K": 10.0, "YM": 5.0, "MYM": 0.5,
+                "GC": 100.0, "MGC": 10.0, "SI": 5000.0, "CL": 1000.0,
+            }
+            if mult <= 0:
+                mult = _fut_mult_defaults.get(ticker, 1.0)
+            spx_delta = self.client.calculate_spx_weighted_delta(
+                symbol           = ticker,
+                position_qty     = qty,
+                price            = mkt_price,
+                underlying_delta = 1.0,
+                multiplier       = mult,
+            )
+            return UnifiedPosition(
+                symbol              = c.localSymbol or ticker,
+                instrument_type     = InstrumentType.FUTURE,
+                broker              = "ibkr",
+                quantity            = qty,
+                contract_multiplier = mult,
+                avg_price           = avg_cost / mult if mult > 0 else avg_cost,
+                market_value        = mkt_value,
+                unrealized_pnl      = upnl,
+                delta               = qty * mult,
+                spx_delta           = spx_delta,
+                greeks_source       = "ibkr_native",
+                broker_id           = conid,
+            )
+
+        elif sec_type == "STK":
+            ticker = (c.symbol or "").upper()
+            spx_delta = self.client.calculate_spx_weighted_delta(
+                symbol           = ticker,
+                position_qty     = qty,
+                price            = mkt_price,
+                underlying_delta = 1.0,
+                multiplier       = 1.0,
+            )
+            return UnifiedPosition(
+                symbol              = ticker,
+                instrument_type     = InstrumentType.EQUITY,
+                broker              = "ibkr",
+                quantity            = qty,
+                contract_multiplier = 1.0,
+                avg_price           = avg_cost,
+                market_value        = mkt_value,
+                unrealized_pnl      = upnl,
+                delta               = qty,
+                spx_delta           = spx_delta,
+                greeks_source       = "ibkr_native",
+                broker_id           = conid,
+            )
+
+        else:
+            LOGGER.debug(
+                "_portfolio_item_to_unified_position: skipping unhandled secType=%s symbol=%s",
+                sec_type, c.symbol,
+            )
+            return None
+
+    async def _fetch_greeks_via_tws_socket(
+        self,
+        options: list[tuple["UnifiedPosition", int]],
+    ) -> dict[int, dict]:
         """Fetch per-contract Greeks from TWS via ib_async modelGreeks.
 
-        Used when IB_API_MODE=SOCKET and the Client Portal REST snapshot API
-        is unavailable (401/400).  Returns {conid: {'delta', 'gamma', 'theta',
-        'vega', 'iv'}} for each conid that returned data within the timeout.
+        Builds ib_async Contract objects directly from position metadata so
+        there is no portfolio() sync wait or qualifyContractsAsync round-trip
+        (the previous approach left 192/266 positions unenriched because the
+        8-second portfolio sync only returned a subset of open positions and
+        qualifyContractsAsync silently failed for the rest).
+
+        Returns {conid: {'delta','gamma','theta','vega','iv','source'}} for
+        every contract that returned modelGreeks within the polling window.
         """
         try:
             from ib_async import IB, Contract
@@ -454,95 +741,173 @@ class IBKRAdapter(BrokerAdapter):
             LOGGER.warning("ib_async not installed – cannot fetch Greeks via TWS socket")
             return {}
 
+        # ── Exchange lookup for futures options ───────────────────────────────
+        _FOP_EXCHANGE: dict[str, str] = {
+            "ES": "CME",  "MES": "CME", "NQ": "CME",  "MNQ": "CME",
+            "RTY": "CME", "M2K": "CME",
+            "YM": "CBOT", "MYM": "CBOT",
+            "GC": "COMEX", "MGC": "COMEX", "SI": "COMEX", "HG": "COMEX",
+            "CL": "NYMEX", "QM": "NYMEX", "NG": "NYMEX",
+            "ZB": "CBOT",  "ZN": "CBOT",  "ZF": "CBOT", "ZT": "CBOT",
+            "6E": "CME",  "6B": "CME",  "6J": "CME", "6A": "CME", "6C": "CME",
+            "ZC": "CBOT",  "ZS": "CBOT",  "ZW": "CBOT",
+            "PL": "NYMEX",
+        }
+
+        def _build_contract(pos: "UnifiedPosition", cid: int) -> Contract:
+            """Construct a fully-specified Contract from position metadata."""
+            right    = "C" if (pos.option_type or "").lower().startswith("c") else "P"
+            expiry   = str(pos.expiration).replace("-", "")[:8] if pos.expiration else ""
+            undl     = (pos.underlying or "").upper().split()[0]  # strip any suffix
+            mult = str(int(pos.contract_multiplier)) if pos.contract_multiplier else ""
+            if undl in _FOP_EXCHANGE:
+                sec_type = "FOP"
+                exchange = _FOP_EXCHANGE[undl]
+                return Contract(
+                    conId    = cid,
+                    secType  = sec_type,
+                    symbol   = undl,
+                    lastTradeDateOrContractMonth = expiry,
+                    strike   = float(pos.strike or 0.0),
+                    right    = right,
+                    exchange = exchange,
+                    currency = "USD",
+                    multiplier = mult,
+                )
+            # For equity/index options, include full option metadata so TWS can
+            # resolve option-computation ticks reliably in SOCKET mode.
+            return Contract(
+                conId=cid,
+                secType="OPT",
+                symbol=undl,
+                lastTradeDateOrContractMonth=expiry,
+                strike=float(pos.strike or 0.0),
+                right=right,
+                exchange="SMART",
+                currency="USD",
+                multiplier=mult,
+            )
+
+        # ── Filter: skip truly expired / zero-qty (belt-and-suspenders) ──────
+        active = [
+            (pos, cid) for pos, cid in options
+            if abs(float(pos.quantity or 0.0)) > 1e-9
+            and pos.strike
+            and pos.expiration
+            and (pos.days_to_expiration is None or int(pos.days_to_expiration) >= 0)
+        ]
+        if not active:
+            return {}
+
         host      = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
         port      = int(os.getenv("IB_SOCKET_PORT", "7496"))
-        client_id = int(os.getenv("IB_GREEKS_CLIENT_ID", "12"))  # distinct from bridge (10)
+        client_id = int(os.getenv("IB_GREEKS_CLIENT_ID", "12"))
+        poll_secs = float(os.getenv("IB_GREEKS_POLL_SECS", "12"))
+        market_data_type = int(os.getenv("IB_GREEKS_MARKET_DATA_TYPE", "3"))
 
-        conid_set = set(conids)
         ib = IB()
+        built_contracts: list[Contract] = []
         result: dict[int, dict] = {}
         try:
             await ib.connectAsync(host=host, port=port, clientId=client_id)
-            LOGGER.debug("IBKRAdapter Greeks socket connected (clientId=%d)", client_id)
+            try:
+                ib.reqMarketDataType(market_data_type)
+            except Exception:
+                pass
+            LOGGER.info(
+                "IBKRAdapter Greeks socket connected (clientId=%d, %d options to enrich)",
+                client_id, len(active),
+            )
 
-            # Wait for TWS synchronization to complete (portfolio data arrives ~1-5s after connect)
-            # `connectAsync` returns before account data is fully pushed, so poll until non-empty.
-            loop = asyncio.get_running_loop()
-            sync_deadline = loop.time() + 8.0
-            while loop.time() < sync_deadline:
-                if ib.portfolio():
+            contract_by_cid: dict[int, Contract] = {}
+            for pos, cid in active:
+                c = _build_contract(pos, cid)
+                built_contracts.append(c)
+                contract_by_cid[cid] = c
+
+            base_types = [market_data_type, 1, 2, 3, 4]
+            requested_types: list[int] = []
+            for mdt in base_types:
+                if mdt not in requested_types:
+                    requested_types.append(mdt)
+
+            pending_conids = {cid for _, cid in active}
+            enriched = 0
+            for mdt in requested_types:
+                if not pending_conids:
                     break
-                await asyncio.sleep(0.2)
 
-            # Use ib.portfolio() to get fully-qualified contracts (secType, exchange,
-            # currency set) — TWS fills these in; a bare Contract(conId=N) won't work.
-            portfolio_items = ib.portfolio()
-            contract_map: dict[int, object] = {
-                item.contract.conId: item.contract
-                for item in portfolio_items
-                if item.contract.conId in conid_set
-            }
-
-            # For conids not found in portfolio (e.g. expired / zero-qty), try to
-            # qualify them explicitly so we still attempt data subscription.
-            missing_conids = conid_set - set(contract_map.keys())
-            if missing_conids:
-                raw = [Contract(conId=cid) for cid in missing_conids]
                 try:
-                    qualified = await ib.qualifyContractsAsync(*raw)
-                    for c in qualified:
-                        if c.conId:
-                            contract_map[c.conId] = c
-                except Exception as qe:
-                    LOGGER.debug("Qualification failed for %s: %s", missing_conids, qe)
-
-            if not contract_map:
-                LOGGER.warning("No contracts resolved for conids %s", conids)
-                return {}
-
-            # Subscribe to market data for all target contracts concurrently
-            tickers: list[tuple[int, object]] = []
-            for cid, contract in contract_map.items():
-                ticker = ib.reqMktData(contract, "", False, False)
-                tickers.append((cid, ticker))
-
-            # Poll until modelGreeks arrive or 5-second timeout
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + 5.0
-            pending = set(range(len(tickers)))
-            while pending and loop.time() < deadline:
-                await asyncio.sleep(0.1)
-                pending = {i for i in pending if tickers[i][1].modelGreeks is None}
-
-            # Collect results
-            for cid, ticker in tickers:
-                g = ticker.modelGreeks
-                if g is None:
-                    LOGGER.debug("No modelGreeks for conid %d after timeout", cid)
-                    continue
-                result[cid] = {
-                    "delta": g.delta,
-                    "gamma": g.gamma,
-                    "theta": g.theta,
-                    "vega":  g.vega,
-                    "iv":    g.impliedVol,
-                    "source": "tws_socket",
-                }
-
-            # Cancel all market data subscriptions
-            for cid, _ in tickers:
-                try:
-                    ib.cancelMktData(contract_map[cid])
+                    ib.reqMarketDataType(mdt)
                 except Exception:
                     pass
 
+                tickers: list[tuple[int, Any]] = []
+                for c, (pos, cid) in zip(built_contracts, active, strict=False):
+                    if cid not in pending_conids:
+                        continue
+                    ticker = ib.reqMktData(c, "", False, False)
+                    tickers.append((cid, ticker))
+
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + poll_secs
+                pending_idx = set(range(len(tickers)))
+                while pending_idx and loop.time() < deadline:
+                    await asyncio.sleep(0.2)
+                    pending_idx = {
+                        i for i in pending_idx if getattr(tickers[i][1], "modelGreeks", None) is None
+                    }
+
+                resolved: set[int] = set()
+                for cid, ticker in tickers:
+                    g = getattr(ticker, "modelGreeks", None)
+                    if g is None:
+                        continue
+                    result[cid] = {
+                        "delta": g.delta,
+                        "gamma": g.gamma,
+                        "theta": g.theta,
+                        "vega": g.vega,
+                        "iv": g.impliedVol,
+                        "source": "tws_socket",
+                    }
+                    resolved.add(cid)
+
+                if resolved:
+                    enriched += len(resolved)
+                    pending_conids -= resolved
+
+                for cid, ticker in tickers:
+                    if cid in resolved:
+                        try:
+                            contract = contract_by_cid.get(cid)
+                            if contract is not None:
+                                ib.cancelMktData(contract)
+                        except Exception:
+                            pass
+
+            for pos, cid in active:
+                if cid in result:
+                    continue
+                LOGGER.debug(
+                    "No modelGreeks for conid %d (%s) after %.0fs timeout across market data types",
+                    cid,
+                    pos.symbol,
+                    poll_secs,
+                )
+
             LOGGER.info(
                 "TWS socket Greeks: %d/%d enriched via modelGreeks",
-                len(result), len(conids),
+                enriched, len(active),
             )
         except Exception as exc:
             LOGGER.warning("TWS socket Greek fetch failed: %s", exc)
         finally:
+            for c in built_contracts:
+                try:
+                    ib.cancelMktData(c)
+                except Exception:
+                    pass
             try:
                 ib.disconnect()
             except Exception:
@@ -788,6 +1153,110 @@ class IBKRAdapter(BrokerAdapter):
         if self._is_futures_option(position):
             return 1.0
         return 100.0
+
+    @staticmethod
+    def _is_stock_option(position: UnifiedPosition) -> bool:
+        return (
+            position.instrument_type == InstrumentType.OPTION
+            and not IBKRAdapter._is_futures_option(position)
+        )
+
+    def _stock_option_cache_key(self, position: UnifiedPosition) -> str:
+        broker_id = str(getattr(position, "broker_id", "") or "").strip()
+        if broker_id:
+            return f"conid:{broker_id}"
+        expiration = position.expiration.isoformat() if position.expiration else ""
+        strike = f"{float(position.strike):.6f}" if position.strike is not None else ""
+        return "|".join(
+            [
+                str(position.underlying or "").upper().lstrip("/"),
+                expiration,
+                strike,
+                str(position.option_type or "").upper(),
+            ]
+        )
+
+    def _load_stock_option_greeks_cache(self) -> dict[str, dict[str, Any]]:
+        path = self._stock_option_greeks_cache_path
+        if not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOGGER.debug("Unable to read stock option Greeks cache %s: %s", path, exc)
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+
+        normalized: dict[str, dict[str, Any]] = {}
+        for key, payload in raw.items():
+            if not isinstance(key, str) or not isinstance(payload, dict):
+                continue
+            normalized[key] = {
+                "delta": self._safe_optional_float(payload.get("delta")),
+                "gamma": self._safe_optional_float(payload.get("gamma")),
+                "theta": self._safe_optional_float(payload.get("theta")),
+                "vega": self._safe_optional_float(payload.get("vega")),
+                "iv": self._safe_optional_float(payload.get("iv")),
+                "updated_at": str(payload.get("updated_at") or ""),
+            }
+        return normalized
+
+    def _save_stock_option_greeks_cache(self) -> None:
+        path = self._stock_option_greeks_cache_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(self._stock_option_greeks_cache, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            LOGGER.debug("Unable to write stock option Greeks cache %s: %s", path, exc)
+
+    def _update_stock_option_greeks_cache(self, position: UnifiedPosition) -> None:
+        if not self._is_stock_option(position):
+            return
+
+        has_value = any(
+            self._safe_optional_float(value) is not None
+            for value in (position.delta, position.gamma, position.theta, position.vega)
+        )
+        if not has_value:
+            return
+
+        key = self._stock_option_cache_key(position)
+        self._stock_option_greeks_cache[key] = {
+            "delta": float(position.delta),
+            "gamma": float(position.gamma),
+            "theta": float(position.theta),
+            "vega": float(position.vega),
+            "iv": self._safe_optional_float(position.iv),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        self._save_stock_option_greeks_cache()
+
+    def _apply_stock_option_cache(self, position: UnifiedPosition) -> bool:
+        if not self._is_stock_option(position):
+            return False
+
+        payload = self._stock_option_greeks_cache.get(self._stock_option_cache_key(position))
+        if not payload:
+            return False
+
+        delta = self._safe_optional_float(payload.get("delta"))
+        gamma = self._safe_optional_float(payload.get("gamma"))
+        theta = self._safe_optional_float(payload.get("theta"))
+        vega = self._safe_optional_float(payload.get("vega"))
+        if delta is None and gamma is None and theta is None and vega is None:
+            return False
+
+        position.delta = float(delta or 0.0)
+        position.gamma = float(gamma or 0.0)
+        position.theta = float(theta or 0.0)
+        position.vega = float(vega or 0.0)
+        position.iv = self._safe_optional_float(payload.get("iv"))
+        position.greeks_source = "stock_option_cache"
+        return True
 
     @staticmethod
     def _parse_expiration(expiry: str) -> date:
