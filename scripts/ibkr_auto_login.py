@@ -14,6 +14,9 @@ Prints JSON status lines to stdout so the Streamlit dashboard can parse them:
   {"status": "authenticated"}
   {"status": "error", "message": "..."}
 
+Status is ALSO written to /tmp/ibkr_login_status.json for file-based IPC
+(used by the Streamlit component so no pipe/fd connects to this process).
+
 Usage:
   python scripts/ibkr_auto_login.py
   python scripts/ibkr_auto_login.py --headless   # CI/headless mode
@@ -49,8 +52,8 @@ GATEWAY_BASE    = os.getenv("IBKR_GATEWAY_URL", "https://localhost:5001")
 if GATEWAY_BASE.startswith("http://"):
     GATEWAY_BASE = GATEWAY_BASE.replace("http://", "https://", 1)
 LOGIN_URL       = f"{GATEWAY_BASE}/"
-TICKLE_URL      = f"{GATEWAY_BASE}/v1/tickle"
-AUTH_STATUS_URL = f"{GATEWAY_BASE}/v1/iserver/auth/status"
+TICKLE_URL      = f"{GATEWAY_BASE}/v1/api/tickle"
+AUTH_STATUS_URL = f"{GATEWAY_BASE}/v1/api/iserver/auth/status"
 
 # Handle dual spelling in .env (IBKR_UUSERNAME typo is in the current .env)
 IBKR_USER = (
@@ -63,18 +66,26 @@ IBKR_PASS = os.getenv("IBKR_PASSWORD", "")
 RESTART_SCRIPT = PROJECT_ROOT / "scripts" / "restart_ibkr_portal.sh"
 GATEWAY_JAR    = PROJECT_ROOT / "clientportal" / "bin" / "run.sh"
 
+# File used for IPC with the Streamlit dashboard (avoids stdout pipe)
+_STATUS_FILE = Path("/tmp/ibkr_login_status.json")
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def emit(status: str, **extra):
-    """Write a JSON status line to stdout (read by the dashboard)."""
+    """Write a JSON status to the IPC file AND stdout."""
     payload = {"status": status, **extra}
-    print(json.dumps(payload), flush=True)
+    line = json.dumps(payload)
+    print(line, flush=True)
+    try:
+        _STATUS_FILE.write_text(line)
+    except Exception:
+        pass
 
 
 def gateway_alive(timeout: float = 4.0) -> bool:
     try:
         r = requests.get(TICKLE_URL, verify=False, timeout=timeout)
-        return r.status_code == 200
+        return r.status_code in (200, 401)
     except Exception:
         return False
 

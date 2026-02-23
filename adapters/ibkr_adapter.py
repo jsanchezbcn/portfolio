@@ -13,10 +13,54 @@ from ibkr_portfolio_client import IBKRClient
 from models.order import PortfolioGreeks
 from models.unified_position import InstrumentType, UnifiedPosition
 from risk_engine.beta_weighter import BetaWeighter
-
+from core.event_bus import get_event_bus
+import json
+import ssl
 
 LOGGER = logging.getLogger(__name__)
 
+class IBKRWebSocketClient:
+    """
+    Basic WebSocket client for IBKR CPAPI.
+    Connects to wss://localhost:5001/v1/api/ws and publishes updates to EventBus.
+    """
+    def __init__(self, base_url: str = "wss://localhost:5001/v1/api/ws"):
+        self.base_url = base_url
+        self._running = False
+        self._ws = None
+
+    async def start(self):
+        import websockets
+        self._running = True
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        try:
+            async with websockets.connect(self.base_url, ssl=ssl_context) as ws:
+                self._ws = ws
+                LOGGER.info("Connected to IBKR WebSocket")
+                
+                # Send initial session message
+                await ws.send(json.dumps({"session": "portfolio_ws"}))
+                
+                while self._running:
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+                    
+                    # Publish to event bus
+                    event_bus = get_event_bus()
+                    if event_bus._running:
+                        await event_bus.publish("market_data", data)
+                        
+        except Exception as e:
+            LOGGER.error(f"IBKR WebSocket error: {e}")
+            self._running = False
+
+    async def stop(self):
+        self._running = False
+        if self._ws:
+            await self._ws.close()
 
 class IBKRAdapter(BrokerAdapter):
     """IBKR-backed adapter that normalizes positions and enriches Greeks."""
@@ -36,6 +80,26 @@ class IBKRAdapter(BrokerAdapter):
 
     async def fetch_positions(self, account_id: str) -> list[UnifiedPosition]:
         """Fetch IBKR positions and convert to unified schema."""
+        if os.getenv("MOCK_IBKR") == "1":
+            return [
+                UnifiedPosition(
+                    symbol="AAPL240621C200",
+                    instrument_type=InstrumentType.OPTION,
+                    broker="ibkr",
+                    quantity=2,
+                    avg_price=1,
+                    market_value=1,
+                    unrealized_pnl=0,
+                    underlying="AAPL",
+                    strike=200,
+                    expiration=date(2026, 6, 21),
+                    option_type="call",
+                    iv=0.40,
+                    gamma=1.5,
+                    theta=25,
+                    vega=80,
+                )
+            ]
 
         try:
             raw_positions = await asyncio.to_thread(self.client.get_positions, account_id)

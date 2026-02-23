@@ -885,11 +885,72 @@ def main() -> None:
                     "Set TASTYTRADE_REFRESH_TOKEN (OAuth, preferred), or use TASTYTRADE_REMEMBER_TOKEN / TASTYTRADE_2FA_CODE in .env and refresh."
                 )
 
-    metrics = st.columns(6)
+    # --- RISK FIRST VIEW ---
+    st.markdown("---")
+    st.header("🚨 Risk First Dashboard")
+    
+    risk_cols = st.columns(4)
+    
+    # 1. Margin Usage
+    margin_usage_pct = 0.0
+    if ibkr_summary:
+        net_liq = _to_float(ibkr_summary.get("netliquidation"))
+        maint_margin = _to_float(ibkr_summary.get("maintmarginreq"))
+        if net_liq and maint_margin and net_liq > 0:
+            margin_usage_pct = (maint_margin / net_liq) * 100
+            
+    margin_color = "normal"
+    if margin_usage_pct > 50:
+        margin_color = "inverse" # Red if high
+        
+    risk_cols[0].metric(
+        "Margin Usage", 
+        f"{margin_usage_pct:.1f}%",
+        delta="High Risk" if margin_usage_pct > 50 else "Safe",
+        delta_color=margin_color,
+        help="Maintenance Margin / Net Liquidation Value"
+    )
+    
+    # 2. SPX Beta-Weighted Delta
+    _total_spx_delta = float(summary.get('total_spx_delta', 0.0))
+    _spx_color = "normal" if abs(_total_spx_delta) <= 100 else "inverse"
+    risk_cols[1].metric(
+        "SPX β-Weighted Delta",
+        f"{_total_spx_delta:.1f}",
+        delta="Directional Risk" if abs(_total_spx_delta) > 100 else "Neutral",
+        delta_color=_spx_color,
+        help="Sum of beta-weighted SPX-equivalent deltas across all positions."
+    )
+    
+    # 3. Vega Exposure
+    _total_vega = float(summary.get('total_vega', 0.0))
+    _vega_color = "normal" if _total_vega > -1000 else "inverse"
+    risk_cols[2].metric(
+        "Vega Exposure", 
+        f"{_total_vega:.1f}",
+        delta="Short Vol Risk" if _total_vega < -1000 else "Vol Neutral/Long",
+        delta_color=_vega_color,
+        help="Total portfolio Vega. Negative means short volatility."
+    )
+    
+    # 4. Theta/Vega Ratio
+    _theta_vega_ratio = float(summary.get('theta_vega_ratio', 0.0))
+    risk_cols[3].metric(
+        "Theta/Vega Ratio", 
+        f"{_theta_vega_ratio:.3f}",
+        help="Ratio of daily Theta decay to Vega risk."
+    )
+    
+    st.markdown("---")
+    
+    # Standard Greeks
+    st.subheader("Portfolio Greeks")
+    metrics = st.columns(4)
     metrics[0].metric("Delta", f"{summary['total_delta']:.2f}")
     metrics[1].metric("Theta", f"{summary['total_theta']:.2f}")
     metrics[2].metric("Vega", f"{summary['total_vega']:.2f}")
     metrics[3].metric("Gamma", f"{summary['total_gamma']:.2f}")
+    
     _spx_price_for_display = adapter.last_greeks_status.get("spx_price", 0.0) or 0.0
     # T020: SPX price unavailable error banner
     if not _spx_price_for_display or _spx_price_for_display <= 0:
@@ -897,16 +958,6 @@ def main() -> None:
             "⛔ **SPX price unavailable** — portfolio SPX delta cannot be computed. "
             "Ensure the IBKR gateway is authenticated and SPX market data is subscribed."
         )
-    # T018: Prominent Portfolio SPX Equivalent Beta-Weighted Delta
-    _total_spx_delta = float(summary.get('total_spx_delta', 0.0))
-    _spx_color = "normal" if abs(_total_spx_delta) <= 100 else "inverse"
-    metrics[4].metric(
-        "Portfolio SPX Delta (β-wtd)",
-        f"{_total_spx_delta:.1f}",
-        help="Sum of beta-weighted SPX-equivalent deltas across all positions. "
-             "Formula: Δ × Q × M × β × P_underlying / P_SPX",
-    )
-    metrics[5].metric("Theta/Vega", f"{summary['theta_vega_ratio']:.3f}")
 
     iv_analysis: list[dict] = []
     if positions:

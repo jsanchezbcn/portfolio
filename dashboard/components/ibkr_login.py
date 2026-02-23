@@ -129,8 +129,6 @@ def _start_login() -> None:
     # Reset state
     st.session_state[_SS_STATUS]  = "starting"
     st.session_state[_SS_MESSAGE] = ""
-    _THREAD_BUF["status"]  = "starting"
-    _THREAD_BUF["message"] = ""
 
     # Launch the login script as a subprocess with stdout piped.
     # start_new_session=True puts the child in its own process group so that

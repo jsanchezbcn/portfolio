@@ -1,0 +1,576 @@
+- generic [active]:
+  - generic [ref=e2]:
+    - generic [ref=e11]:
+      - heading "Inputs" [level=2] [ref=e15]
+      - button "Reload Accounts" [ref=e18] [cursor=pointer]:
+        - paragraph [ref=e22]: Reload Accounts
+      - button "Sign in to IBKR" [ref=e25] [cursor=pointer]:
+        - paragraph [ref=e29]: Sign in to IBKR
+      - group [ref=e32]:
+        - generic "keyboard_arrow_right Client Portal Controls" [ref=e33] [cursor=pointer]:
+          - generic [ref=e34]:
+            - generic [ref=e36]: keyboard_arrow_right
+            - paragraph [ref=e39]: Client Portal Controls
+      - generic [ref=e41]:
+        - paragraph [ref=e45]: IBKR Account
+        - generic [ref=e47]:
+          - generic [ref=e48]:
+            - generic [ref=e49]: U19664833
+            - combobox "Selected U19664833. IBKR Account" [ref=e51]
+          - img "open" [ref=e53]
+      - button "Refresh" [ref=e57] [cursor=pointer]:
+        - paragraph [ref=e61]: Refresh
+      - generic [ref=e64] [cursor=pointer]:
+        - checkbox "Show per-position Greeks" [checked]
+        - paragraph [ref=e69]: Show per-position Greeks
+      - generic [ref=e72] [cursor=pointer]:
+        - checkbox "IBKR-style option scaling (x100)"
+        - paragraph [ref=e77]: IBKR-style option scaling (x100)
+      - generic [ref=e80] [cursor=pointer]:
+        - checkbox "Use latest cached portfolio if IBKR unavailable" [checked]
+        - paragraph [ref=e85]: Use latest cached portfolio if IBKR unavailable
+      - generic [ref=e88] [cursor=pointer]:
+        - checkbox "IBKR-only mode (no external Greeks)" [checked]
+        - paragraph [ref=e93]: IBKR-only mode (no external Greeks)
+      - heading "🤖 AI / LLM Settings" [level=3] [ref=e97]
+      - generic [ref=e99]:
+        - paragraph [ref=e103]: Model
+        - generic [ref=e105]:
+          - generic [ref=e106]:
+            - generic [ref=e107]: GPT-4.1 🆓
+            - combobox "Selected GPT-4.1 🆓. Model" [ref=e109]
+          - img "open" [ref=e111]
+      - heading "Greeks Diagnostics" [level=3] [ref=e116]
+      - generic [ref=e119] [cursor=pointer]:
+        - checkbox "Disable Tasty cache (live fetch only)"
+        - paragraph [ref=e124]: Disable Tasty cache (live fetch only)
+      - generic [ref=e127] [cursor=pointer]:
+        - checkbox "Force live fetch on cache miss" [checked]
+        - paragraph [ref=e132]: Force live fetch on cache miss
+      - group [ref=e135]:
+        - generic "keyboard_arrow_right Data Freshness" [ref=e136] [cursor=pointer]:
+          - generic [ref=e137]:
+            - generic [ref=e139]: keyboard_arrow_right
+            - paragraph [ref=e142]: Data Freshness
+    - generic [ref=e3]:
+      - banner [ref=e145]:
+        - generic [ref=e148]:
+          - button "Deploy" [ref=e150] [cursor=pointer]:
+            - generic [ref=e152]: Deploy
+          - button [ref=e154] [cursor=pointer]:
+            - img [ref=e155]
+      - generic [ref=e158]:
+        - heading "Portfolio Risk Manager" [level=1] [ref=e163]:
+          - text: Portfolio Risk Manager
+          - generic [ref=e164]:
+            - link "Link to heading":
+              - /url: "#portfolio-risk-manager"
+              - img
+        - generic [ref=e169]: "Regime: Neutral Volatility | VIX: 20.23 | Term Structure: 1.082 | Recession Prob: N/A (polymarket) | Macro Ts: 2026-02-20T05:58:56.563482"
+        - heading "IBKR Account Summary" [level=3] [ref=e174]:
+          - text: IBKR Account Summary
+          - generic [ref=e175]:
+            - link "Link to heading":
+              - /url: "#ibkr-account-summary"
+              - img
+        - generic [ref=e177]:
+          - generic [ref=e182]:
+            - paragraph [ref=e186]: Net Liquidation
+            - paragraph [ref=e190]: 26,221.91
+          - generic [ref=e195]:
+            - paragraph [ref=e199]: Buying Power
+            - paragraph [ref=e203]: 1,710.59
+          - generic [ref=e208]:
+            - paragraph [ref=e212]: Maint Margin
+            - paragraph [ref=e216]: 6,028.54
+          - generic [ref=e221]:
+            - paragraph [ref=e225]: Excess Liquidity
+            - paragraph [ref=e229]: 3,163.21
+        - alert [ref=e232]:
+          - paragraph [ref=e237]: "IBKR-only mode: Greeks sourced exclusively from IBKR market-data snapshot (no Tastytrade). Disable to allow Tastytrade as fallback for options IBKR cannot price."
+        - paragraph [ref=e242]: "Greeks timestamp: 2026-02-20T05:58:42.774296 UTC (0.2 minutes old)"
+        - paragraph [ref=e247]: Greeks diagnostics mode — disable_cache=True, force_refresh_on_miss=False
+        - generic [ref=e253]:
+          - generic [ref=e255] [cursor=pointer]:
+            - img [ref=e258]
+            - generic [ref=e260]: "{"
+          - generic [ref=e262]:
+            - generic [ref=e263]:
+              - generic [ref=e265] [cursor=pointer]:
+                - img [ref=e268]
+                - generic [ref=e270]:
+                  - generic [ref=e271]: "\"greeks_source_counts\""
+                  - generic [ref=e272]: ":"
+                - generic [ref=e273]: "{"
+              - generic [ref=e276]:
+                - generic [ref=e277]:
+                  - generic [ref=e278]:
+                    - text: "\""
+                    - generic [ref=e279]: none
+                    - text: "\""
+                  - generic [ref=e280]: ":"
+                - generic [ref=e282] [cursor=pointer]: "17"
+              - generic [ref=e284] [cursor=pointer]: "}"
+            - generic [ref=e285]:
+              - generic [ref=e287] [cursor=pointer]:
+                - img [ref=e290]
+                - generic [ref=e292]:
+                  - generic [ref=e293]: "\"missing_reason_counts\""
+                  - generic [ref=e294]: ":"
+                - generic [ref=e295]: "{"
+              - generic [ref=e298]:
+                - generic [ref=e299]:
+                  - generic [ref=e300]:
+                    - text: "\""
+                    - generic [ref=e301]: ibkr_no_data_no_fallback
+                    - text: "\""
+                  - generic [ref=e302]: ":"
+                - generic [ref=e304] [cursor=pointer]: "17"
+              - generic [ref=e306] [cursor=pointer]: "}"
+          - generic [ref=e308] [cursor=pointer]: "}"
+        - alert [ref=e311]:
+          - paragraph [ref=e316]: Option Greeks missing for 17/17 option positions. Tastytrade cache/session issue detected.
+        - heading "Options Missing Greeks (IBKR-first diagnostics)" [level=3] [ref=e321]:
+          - text: Options Missing Greeks (IBKR-first diagnostics)
+          - generic [ref=e322]:
+            - link "Link to heading":
+              - /url: "#options-missing-greeks-ibkr-first-diagnostics"
+              - img
+        - generic [ref=e327]:
+          - button "Download as CSV" [ref=e330] [cursor=pointer]:
+            - img [ref=e331]
+          - button "Search" [ref=e336] [cursor=pointer]:
+            - img [ref=e337]
+          - button "Fullscreen" [ref=e342] [cursor=pointer]:
+            - img [ref=e343]
+        - generic [ref=e355]:
+          - button "Download Missing Greeks CSV" [ref=e360] [cursor=pointer]:
+            - paragraph [ref=e364]: Download Missing Greeks CSV
+          - button "Download Missing Greeks JSON" [ref=e369] [cursor=pointer]:
+            - paragraph [ref=e373]: Download Missing Greeks JSON
+        - generic [ref=e375]:
+          - generic [ref=e380]:
+            - paragraph [ref=e384]: Delta
+            - paragraph [ref=e388]: "135.18"
+          - generic [ref=e393]:
+            - paragraph [ref=e397]: Theta
+            - paragraph [ref=e401]: "0.00"
+          - generic [ref=e406]:
+            - paragraph [ref=e410]: Vega
+            - paragraph [ref=e414]: "0.00"
+          - generic [ref=e419]:
+            - paragraph [ref=e423]: Gamma
+            - paragraph [ref=e427]: "0.00"
+          - generic [ref=e432]:
+            - generic [ref=e433]:
+              - paragraph [ref=e436]: Portfolio SPX Delta (β-wtd)
+              - button "Help for Portfolio SPX Delta (β-wtd)" [ref=e440] [cursor=pointer]:
+                - img [ref=e441]
+            - paragraph [ref=e447]: "2.6"
+          - generic [ref=e452]:
+            - paragraph [ref=e456]: Theta/Vega
+            - paragraph [ref=e460]: "0.000"
+        - heading "IV vs HV Analysis" [level=3] [ref=e465]:
+          - text: IV vs HV Analysis
+          - generic [ref=e466]:
+            - link "Link to heading":
+              - /url: "#iv-vs-hv-analysis"
+              - img
+        - alert [ref=e469]:
+          - paragraph [ref=e474]: IV/HV analysis unavailable for current positions (missing IV or insufficient price history).
+        - heading "Portfolio Positions & Greeks" [level=3] [ref=e479]:
+          - text: Portfolio Positions & Greeks
+          - generic [ref=e480]:
+            - link "Link to heading":
+              - /url: "#portfolio-positions-and-greeks"
+              - img
+        - generic [ref=e485]:
+          - button "Download as CSV" [ref=e488] [cursor=pointer]:
+            - img [ref=e489]
+          - button "Search" [ref=e494] [cursor=pointer]:
+            - img [ref=e495]
+          - button "Fullscreen" [ref=e500] [cursor=pointer]:
+            - img [ref=e501]
+        - heading "Risk Compliance" [level=3] [ref=e516]:
+          - text: Risk Compliance
+          - generic [ref=e517]:
+            - link "Link to heading":
+              - /url: "#risk-compliance"
+              - img
+        - alert [ref=e520]:
+          - paragraph [ref=e525]: One or more risk limits are violated.
+        - generic [ref=e530]:
+          - button "Download as CSV" [ref=e533] [cursor=pointer]:
+            - img [ref=e534]
+          - button "Search" [ref=e539] [cursor=pointer]:
+            - img [ref=e540]
+          - button "Fullscreen" [ref=e545] [cursor=pointer]:
+            - img [ref=e546]
+        - heading "Gamma Risk by DTE" [level=3] [ref=e561]:
+          - text: Gamma Risk by DTE
+          - generic [ref=e562]:
+            - link "Link to heading":
+              - /url: "#gamma-risk-by-dte"
+              - img
+        - generic [ref=e568]:
+          - img:
+            - generic:
+              - generic:
+                - generic:
+                  - generic:
+                    - generic: 0-7
+                  - generic:
+                    - generic: 8-30
+                  - generic:
+                    - generic: 31-60
+                  - generic:
+                    - generic: 60+
+                - generic:
+                  - generic:
+                    - generic: −1
+                  - generic:
+                    - generic: −0.5
+                  - generic:
+                    - generic: "0"
+                  - generic:
+                    - generic: "0.5"
+                  - generic:
+                    - generic: "1"
+          - img:
+            - generic:
+              - generic:
+                - generic: DTE Bucket
+              - generic:
+                - generic: Gamma
+          - toolbar [ref=e582]:
+            - button "Download plot as a PNG" [ref=e584] [cursor=pointer]:
+              - img [ref=e585]
+            - generic [ref=e587]:
+              - button "Zoom" [ref=e588] [cursor=pointer]:
+                - img [ref=e589]
+              - button "Pan" [ref=e591] [cursor=pointer]:
+                - img [ref=e592]
+            - generic [ref=e594]:
+              - button "Zoom in" [ref=e595] [cursor=pointer]:
+                - img [ref=e596]
+              - button "Zoom out" [ref=e598] [cursor=pointer]:
+                - img [ref=e599]
+              - button "Autoscale" [ref=e601] [cursor=pointer]:
+                - img [ref=e602]
+              - button "Reset axes" [ref=e604] [cursor=pointer]:
+                - img [ref=e605]
+            - button "Fullscreen" [ref=e608] [cursor=pointer]:
+              - img [ref=e609]
+          - img
+        - heading "Theta/Vega Profile" [level=3] [ref=e615]:
+          - text: Theta/Vega Profile
+          - generic [ref=e616]:
+            - link "Link to heading":
+              - /url: "#theta-vega-profile"
+              - img
+        - generic [ref=e622]:
+          - img:
+            - generic:
+              - generic:
+                - generic:
+                  - generic:
+                    - generic:
+                      - generic:
+                        - generic:
+                          - generic:
+                            - generic: Current (0.000)
+                - generic:
+                  - generic:
+                    - generic: "0"
+                  - generic:
+                    - generic: "20"
+                  - generic:
+                    - generic: "40"
+                  - generic:
+                    - generic: "60"
+                  - generic:
+                    - generic: "80"
+                  - generic:
+                    - generic: "100"
+                - generic:
+                  - generic:
+                    - generic: "0"
+                  - generic:
+                    - generic: "10"
+                  - generic:
+                    - generic: "20"
+                  - generic:
+                    - generic: "30"
+                  - generic:
+                    - generic: "40"
+                  - generic:
+                    - generic: "50"
+          - img:
+            - generic:
+              - generic [ref=e639]:
+                - generic [ref=e641]: Current portfolio
+                - generic [ref=e648]: 1:3 reference (0.33)
+                - generic [ref=e651]: Target zone (0.25-0.40)
+              - generic:
+                - generic: Abs Vega (dollars)
+              - generic:
+                - generic: Abs Theta (dollars)
+          - toolbar [ref=e656]:
+            - button "Download plot as a PNG" [ref=e658] [cursor=pointer]:
+              - img [ref=e659]
+            - generic [ref=e661]:
+              - button "Zoom" [ref=e662] [cursor=pointer]:
+                - img [ref=e663]
+              - button "Pan" [ref=e665] [cursor=pointer]:
+                - img [ref=e666]
+            - generic [ref=e668]:
+              - button "Zoom in" [ref=e669] [cursor=pointer]:
+                - img [ref=e670]
+              - button "Zoom out" [ref=e672] [cursor=pointer]:
+                - img [ref=e673]
+              - button "Autoscale" [ref=e675] [cursor=pointer]:
+                - img [ref=e676]
+              - button "Reset axes" [ref=e678] [cursor=pointer]:
+                - img [ref=e679]
+            - button "Fullscreen" [ref=e682] [cursor=pointer]:
+              - img [ref=e683]
+          - img
+        - paragraph [ref=e689]: "Target zone: 0.25 ≤ |Theta|/|Vega| ≤ 0.40 (Sebastian 1:3 framework)."
+        - heading "Market Data" [level=3] [ref=e694]:
+          - text: Market Data
+          - generic [ref=e695]:
+            - link "Link to heading":
+              - /url: "#market-data"
+              - img
+        - generic [ref=e701]:
+          - generic [ref=e703] [cursor=pointer]:
+            - img [ref=e706]
+            - generic [ref=e708]: "{"
+          - generic [ref=e710]:
+            - generic [ref=e711]:
+              - generic [ref=e712]:
+                - generic [ref=e713]:
+                  - text: "\""
+                  - generic [ref=e714]: VIX
+                  - text: "\""
+                - generic [ref=e715]: ":"
+              - generic [ref=e717] [cursor=pointer]: "20.23"
+            - generic [ref=e718]:
+              - generic [ref=e719]:
+                - generic [ref=e720]:
+                  - text: "\""
+                  - generic [ref=e721]: VIX3M
+                  - text: "\""
+                - generic [ref=e722]: ":"
+              - generic [ref=e724] [cursor=pointer]: "21.88"
+            - generic [ref=e725]:
+              - generic [ref=e726]:
+                - generic [ref=e727]:
+                  - text: "\""
+                  - generic [ref=e728]: TermStructure
+                  - text: "\""
+                - generic [ref=e729]: ":"
+              - generic [ref=e731] [cursor=pointer]: "1.082"
+            - generic [ref=e732]:
+              - generic [ref=e733]:
+                - generic [ref=e734]:
+                  - text: "\""
+                  - generic [ref=e735]: Backwardation
+                  - text: "\""
+                - generic [ref=e736]: ":"
+              - generic [ref=e738] [cursor=pointer]: "false"
+            - generic [ref=e739]:
+              - generic [ref=e740]:
+                - generic [ref=e741]:
+                  - text: "\""
+                  - generic [ref=e742]: UpdatedAtUTC
+                  - text: "\""
+                - generic [ref=e743]: ":"
+              - generic [ref=e746]: "\"2026-02-20T05:58:57.006261\""
+          - generic [ref=e748] [cursor=pointer]: "}"
+        - heading "Market Intelligence (Sentiment)" [level=3] [ref=e753]:
+          - text: Market Intelligence (Sentiment)
+          - generic [ref=e754]:
+            - link "Link to heading":
+              - /url: "#market-intelligence-sentiment"
+              - img
+        - generic [ref=e759]:
+          - button "Download as CSV" [ref=e762] [cursor=pointer]:
+            - img [ref=e763]
+          - button "Search" [ref=e768] [cursor=pointer]:
+            - img [ref=e769]
+          - button "Fullscreen" [ref=e774] [cursor=pointer]:
+            - img [ref=e775]
+        - generic [ref=e788]:
+          - generic [ref=e790]:
+            - button "Show data" [ref=e793] [cursor=pointer]:
+              - img [ref=e794]
+            - button "Fullscreen" [ref=e799] [cursor=pointer]:
+              - img [ref=e800]
+          - generic [ref=e803]:
+            - generic "Vega visualization" [ref=e804]:
+              - img [ref=e805]:
+                - generic [ref=e810]:
+                  - 'generic "X-axis for a discrete scale with 19 values: AAPL, AMAT, AMD, AMZN, ARTY, ending with XYLD" [ref=e814]':
+                    - generic [ref=e816]:
+                      - generic:
+                        - generic: AAPL
+                        - generic: AMAT
+                        - generic: AMD
+                        - generic: AMZN
+                        - generic: ARTY
+                        - generic: ES
+                        - generic: FXE
+                        - generic: GOOG
+                        - generic: HPQ
+                        - generic: ITOT
+                        - generic: IWM
+                        - generic: MES
+                        - generic: NVDA
+                        - generic: QQQ
+                        - generic: SPY
+                        - generic: VOO
+                        - generic: VRT
+                        - generic: VTI
+                        - generic: XYLD
+                  - generic "Y-axis for a linear scale with values from −0.4 to 0.9" [ref=e817]:
+                    - generic [ref=e819]:
+                      - generic:
+                        - generic: "0.0"
+                        - generic: −0.4
+                        - generic: −0.2
+                        - generic: "0.2"
+                        - generic: "0.4"
+                        - generic: "0.6"
+                        - generic: "0.8"
+                  - generic [ref=e820]:
+                    - 'generic "symbol: MES; sentiment_score: −0.4" [ref=e821]'
+                    - 'generic "symbol: HPQ; sentiment_score: −0.4" [ref=e822]'
+                    - 'generic "symbol: AMZN; sentiment_score: −0.2" [ref=e823]'
+                    - 'generic "symbol: QQQ; sentiment_score: −0.2" [ref=e824]'
+                    - 'generic "symbol: SPY; sentiment_score: 0.1" [ref=e825]'
+                    - 'generic "symbol: VTI; sentiment_score: 0.15" [ref=e826]'
+                    - 'generic "symbol: XYLD; sentiment_score: 0.2" [ref=e827]'
+                    - 'generic "symbol: VOO; sentiment_score: 0.2" [ref=e828]'
+                    - 'generic "symbol: AMD; sentiment_score: 0.2" [ref=e829]'
+                    - 'generic "symbol: FXE; sentiment_score: 0.2" [ref=e830]'
+                    - 'generic "symbol: AAPL; sentiment_score: 0.25" [ref=e831]'
+                    - 'generic "symbol: IWM; sentiment_score: 0.25" [ref=e832]'
+                    - 'generic "symbol: GOOG; sentiment_score: 0.3" [ref=e833]'
+                    - 'generic "symbol: ES; sentiment_score: 0.3" [ref=e834]'
+                    - 'generic "symbol: NVDA; sentiment_score: 0.45" [ref=e835]'
+                    - 'generic "symbol: ARTY; sentiment_score: 0.7" [ref=e836]'
+                    - 'generic "symbol: ITOT; sentiment_score: 0.7" [ref=e837]'
+                    - 'generic "symbol: AMAT; sentiment_score: 0.75" [ref=e838]'
+                    - 'generic "symbol: VRT; sentiment_score: 0.85" [ref=e839]'
+            - group "Click to view actions":
+              - img [ref=e841] [cursor=pointer]
+        - button "📰 Fetch News Now" [ref=e850] [cursor=pointer]:
+          - paragraph [ref=e854]: 📰 Fetch News Now
+        - group [ref=e857]:
+          - generic "keyboard_arrow_right 📋 Order Builder — Pre-Trade Simulation" [ref=e858] [cursor=pointer]:
+            - generic [ref=e859]:
+              - generic [ref=e861]: keyboard_arrow_right
+              - paragraph [ref=e864]: 📋 Order Builder — Pre-Trade Simulation
+        - heading "📋 Open Orders" [level=3] [ref=e869]:
+          - text: 📋 Open Orders
+          - generic [ref=e870]:
+            - link "Link to heading":
+              - /url: "#open-orders"
+              - img
+        - generic [ref=e872]:
+          - button "🔄 Refresh Orders" [ref=e877] [cursor=pointer]:
+            - paragraph [ref=e881]: 🔄 Refresh Orders
+          - paragraph [ref=e888]:
+            - text: "Account:"
+            - strong [ref=e889]: U19664833
+        - alert [ref=e894]:
+          - paragraph [ref=e899]: No orders found for this account. Use 🔄 Refresh to reload.
+        - heading "📓 Trade Journal" [level=3] [ref=e904]:
+          - text: 📓 Trade Journal
+          - generic [ref=e905]:
+            - link "Link to heading":
+              - /url: "#trade-journal"
+              - img
+        - group [ref=e908]:
+          - generic "keyboard_arrow_right 🔍 Filters" [ref=e909] [cursor=pointer]:
+            - generic [ref=e910]:
+              - generic [ref=e912]: keyboard_arrow_right
+              - paragraph [ref=e915]: 🔍 Filters
+        - alert [ref=e918]:
+          - paragraph [ref=e923]: No fills match the current filters.
+        - generic [ref=e925]:
+          - generic [ref=e927]:
+            - heading "🔍 Live Risk Audit" [level=3] [ref=e932]:
+              - text: 🔍 Live Risk Audit
+              - generic [ref=e933]:
+                - link "Link to heading":
+                  - /url: "#live-risk-audit"
+                  - img
+            - alert [ref=e936]:
+              - paragraph [ref=e941]: "🚨 URGENT: Gamma exposure is critically high, immediate action required."
+            - paragraph [ref=e946]:
+              - text: Portfolio gamma is -104.24, breaching the regime limit of 35.00. This level of negative gamma exposes the portfolio to large, nonlinear losses if SPX moves sharply. While theta (
+              - generic [ref=e947]:
+                - math [ref=e949]:
+                  - generic [ref=e951]:
+                    - generic [ref=e952]: "173.06"
+                    - generic [ref=e953]: /
+                    - generic [ref=e954]: d
+                    - generic [ref=e955]: a
+                    - generic [ref=e956]: "y"
+                    - generic [ref=e957]: )
+                    - generic [ref=e958]: a
+                    - generic [ref=e959]: "n"
+                    - generic [ref=e960]: d
+                    - generic [ref=e961]: v
+                    - generic [ref=e962]: e
+                    - generic [ref=e963]: g
+                    - generic [ref=e964]: a
+                    - generic [ref=e965]: (
+                - generic [ref=e967]: 173.06/day)andvega(
+              - text: 772.59) are within neutral ranges, the excessive negative gamma poses a significant risk of rapid P&L swings. The current beta-delta (20.58) is modest, but gamma risk dominates. Immediate reduction of negative gamma is essential to stabilize risk.
+            - paragraph [ref=e972]:
+              - strong [ref=e973]: "Suggested actions:"
+            - list [ref=e978]:
+              - listitem [ref=e979]: Buy back short-dated SPX options or spreads to reduce negative gamma by at least 70 points.
+            - list [ref=e984]:
+              - listitem [ref=e985]: Add long gamma positions (e.g., buy SPX backspreads or long straddles) with 7-21 DTE.
+            - list [ref=e990]:
+              - listitem [ref=e991]: Reduce position count by closing high gamma-risk structures, prioritizing those near the money.
+            - paragraph [ref=e996]: "Last updated: 2026-02-19T02:40:54"
+          - generic [ref=e998]:
+            - heading "📊 Market Brief" [level=3] [ref=e1003]:
+              - text: 📊 Market Brief
+              - generic [ref=e1004]:
+                - link "Link to heading":
+                  - /url: "#market-brief"
+                  - img
+            - alert [ref=e1007]:
+              - paragraph [ref=e1012]: No market brief available.
+        - button "📰 Refresh Brief" [ref=e1018] [cursor=pointer]:
+          - paragraph [ref=e1022]: 📰 Refresh Brief
+        - heading "Arbitrage Signals" [level=3] [ref=e1027]:
+          - text: Arbitrage Signals
+          - generic [ref=e1028]:
+            - link "Link to heading":
+              - /url: "#arbitrage-signals"
+              - img
+        - alert [ref=e1031]:
+          - paragraph [ref=e1036]: No active arbitrage signals.
+        - heading "AI Assistant" [level=3] [ref=e1041]:
+          - text: AI Assistant
+          - generic [ref=e1042]:
+            - link "Link to heading":
+              - /url: "#ai-assistant"
+              - img
+        - generic [ref=e1044]:
+          - paragraph [ref=e1048]: Ask for a risk adjustment
+          - textbox "Ask for a risk adjustment" [ref=e1051]:
+            - /placeholder: How should I reduce near-term gamma?
+        - group [ref=e1054]:
+          - generic "keyboard_arrow_right Assistant configuration" [ref=e1055] [cursor=pointer]:
+            - generic [ref=e1056]:
+              - generic [ref=e1058]: keyboard_arrow_right
+              - paragraph [ref=e1061]: Assistant configuration
+  - img [ref=e1062]
