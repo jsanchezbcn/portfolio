@@ -1,0 +1,41 @@
+{
+  "_comment": "Mock IBKR Client Portal /iserver/account/{acctId}/orders/whatif response",
+  "amount": {
+    "amount": "12450.00",
+    "commission": "-1.30",
+    "total": "12451.30"
+  },
+  "equity": {
+    "current": "145320.50",
+    "change": "-12450.00",
+    "projected": "132870.50"
+  },
+  "equityWithLoanAfter": {
+    "current": "145320.50",
+    "change": "-12450.00",
+    "projected": "132870.50"
+  },
+  "initMarginAfter": {
+    "current": "8200.00",
+    "change": "12450.00",
+    "projected": "20650.00"
+  },
+  "maintMarginAfter": {
+    "current": "7500.00",
+    "change": "11200.00",
+    "projected": "18700.00"
+  },
+  "fullInitMarginAfter": {
+    "current": "8200.00",
+    "change": "12450.00",
+    "projected": "20650.00"
+  },
+  "fullMaintMarginAfter": {
+    "current": "7500.00",
+    "change": "11200.00",
+    "projected": "18700.00"
+  },
+  "ticker": "SPX",
+  "error": null,
+  "warn": null
+}

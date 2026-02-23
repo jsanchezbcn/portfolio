@@ -44,15 +44,15 @@ try:
 except Exception:
     TASTYWORKS_AVAILABLE = False
 
-# Tastytrade integration
+# Tastytrade SDK integration
 try:
     from tastytrade import Session, OAuthSession
     from tastytrade.instruments import get_option_chain, NestedFutureOptionChain
     from tastytrade.dxfeed import Quote, Greeks
     from tastytrade import DXLinkStreamer
-    TASTYTRADE_AVAILABLE = True
+    TASTYTRADE_SDK_AVAILABLE = True
 except ImportError:
-    TASTYTRADE_AVAILABLE = False
+    TASTYTRADE_SDK_AVAILABLE = False
 
 
 @dataclass
@@ -83,7 +83,7 @@ class CacheEntry:
     """Cache entry for options data."""
     data: Dict[str, OptionData]  # key: option_key, value: OptionData
     timestamp: datetime
-    expiry_minutes: int = 1
+    expiry_minutes: int = 5
     
     def is_valid(self) -> bool:
         """Check if cache entry is still valid."""
@@ -128,7 +128,7 @@ class BetaConfig:
 class TastytradeOptionsCache:
     """Cache manager for Tastytrade options data."""
     
-    def __init__(self, cache_file: str = '.tastytrade_cache.pkl', default_expiry_minutes: int = 1):
+    def __init__(self, cache_file: str = '.tastytrade_cache.pkl', default_expiry_minutes: int = 5):
         self.cache_file = cache_file
         self.default_expiry_minutes = default_expiry_minutes
         self.cache: Dict[str, CacheEntry] = {}
@@ -348,9 +348,7 @@ class TastytradeOptionsCache:
         by a simulated prefetch.
         """
         self._cleanup_expired()
-        # Normalize the underlying before lookup so '/MES' and 'MES' resolve to the same key.
-        norm_underlying = self._normalize_underlying_key(underlying)
-        option_key = self._make_option_key(norm_underlying, expiry, strike, option_type)
+        option_key = self._make_option_key(underlying, expiry, strike, option_type)
         for entry in self.cache.values():
             if option_key in entry.data:
                 return entry.data[option_key]
@@ -425,28 +423,27 @@ class TastytradeOptionsCache:
         try:
             # Prefer futures check if symbol is a known futures root
             is_future = underlying.startswith('/') or underlying.upper() in self.futures_roots
-
+            
             if is_future:
                 tasty_sym = underlying if underlying.startswith('/') else self._to_tasty_underlying(underlying)
-                # Use asyncio.to_thread for blocking HTTP calls to avoid freezing the event loop
-                nested_chain = await asyncio.to_thread(NestedFutureOptionChain.get, session, tasty_sym)
-                return bool(nested_chain and nested_chain.option_chains and
+                nested_chain = NestedFutureOptionChain.get(session, tasty_sym)
+                return bool(nested_chain and nested_chain.option_chains and 
                            len(nested_chain.option_chains) > 0 and
                            len(nested_chain.option_chains[0].expirations) > 0)
             else:
-                chain = await asyncio.to_thread(get_option_chain, session, underlying)
+                chain = get_option_chain(session, underlying)
                 if chain and len(chain) > 0:
                     return True
                 # If equity failed but this is a known futures root, try futures path
                 u = underlying.upper()
                 if u in self.futures_roots:
                     tasty_sym = self._to_tasty_underlying(underlying)
-                    nested_chain = await asyncio.to_thread(NestedFutureOptionChain.get, session, tasty_sym)
-                    return bool(nested_chain and nested_chain.option_chains and
+                    nested_chain = NestedFutureOptionChain.get(session, tasty_sym)
+                    return bool(nested_chain and nested_chain.option_chains and 
                                 len(nested_chain.option_chains) > 0 and
                                 len(nested_chain.option_chains[0].expirations) > 0)
                 return False
-
+                
         except Exception as e:
             if retry_auth and ("unauthorized" in str(e).lower() or "401" in str(e)):
                 # Session token can expire mid-run; refresh once and retry.
@@ -496,11 +493,10 @@ class TastytradeOptionsCache:
         try:
             if is_future:
                 tasty_sym = underlying if underlying.startswith('/') else self._to_tasty_underlying(underlying)
-                # Use asyncio.to_thread for blocking HTTP call to avoid freezing the event loop
-                nested_chain = await asyncio.to_thread(NestedFutureOptionChain.get, session, tasty_sym)
+                nested_chain = NestedFutureOptionChain.get(session, tasty_sym)
                 if not nested_chain or not nested_chain.option_chains:
                     return {}
-
+                
                 chain_data = nested_chain.option_chains[0]
                 if not chain_data.expirations:
                     return {}
@@ -515,14 +511,13 @@ class TastytradeOptionsCache:
                         print(f"Futures chain loaded for {tasty_sym}: 0 expirations")
                 except Exception:
                     pass
-
+                
                 # Convert to a format similar to equity options
                 chain = {}
                 for exp in chain_data.expirations:
                     chain[exp.expiration_date] = exp.strikes
             else:
-                # Use asyncio.to_thread for blocking HTTP call to avoid freezing the event loop
-                chain = await asyncio.to_thread(get_option_chain, session, underlying)
+                chain = get_option_chain(session, underlying)
             
             if not chain:
                 return {}
@@ -755,7 +750,7 @@ class TastytradeOptionsCache:
                 return cache_entry.data[option_key]
 
         # Need to fetch fresh data
-        if not TASTYTRADE_AVAILABLE:
+        if not TASTYTRADE_SDK_AVAILABLE:
             return None
 
         session = self._get_session()
@@ -899,7 +894,7 @@ async def initialize_streaming_runtime() -> tuple[Any, Any]:
     return STREAM_DB_MANAGER, STREAM_PROCESSOR
 
 class IBKRClient:
-    def __init__(self, base_url: str = "https://localhost:5001", cache_expiry_minutes: int = 1):
+    def __init__(self, base_url: str = "https://localhost:5001", cache_expiry_minutes: int = 5):
         self.base_url = base_url
         self.session = requests.Session()
         # Disable SSL verification for localhost
@@ -971,6 +966,32 @@ class IBKRClient:
             print(f"Error starting gateway: {e}")
             return False
     
+    def stop_gateway(self) -> bool:
+        """Stop the running IBKR Client Portal Gateway process."""
+        try:
+            result = subprocess.run(
+                ["pkill", "-f", "clientportal.*run.sh"],
+                capture_output=True,
+                timeout=10,
+            )
+            # Also kill any lingering Java process spawned by run.sh
+            subprocess.run(
+                ["pkill", "-f", "root/conf.yaml"],
+                capture_output=True,
+                timeout=10,
+            )
+            # Give the process a moment to die
+            time.sleep(2)
+            return True
+        except Exception as e:
+            print(f"Error stopping gateway: {e}")
+            return False
+
+    def restart_gateway(self) -> bool:
+        """Stop the current gateway instance and start a fresh one."""
+        self.stop_gateway()
+        return self.start_gateway()
+
     def check_auth_status(self) -> Dict:
         """Check authentication status."""
         try:
@@ -1043,29 +1064,69 @@ class IBKRClient:
         """Fetch positions for a specific account."""
         try:
             all_positions: List[Dict] = []
-            seen_conids: set[int] = set()
+            seen_rows: set[tuple[Any, ...]] = set()
+
+            def _row_key(position: Dict[str, Any]) -> tuple[Any, ...]:
+                return (
+                    position.get("acctId"),
+                    position.get("conid"),
+                    position.get("contractDesc"),
+                    position.get("position"),
+                    position.get("avgCost"),
+                    position.get("mktValue"),
+                    position.get("unrealizedPnl"),
+                )
 
             for page in range(0, 20):
-                response = self.session.get(
-                    f"{self.base_url}/v1/api/portfolio/{account_id}/positions/{page}",
-                    timeout=15,
-                )
-                if response.status_code != 200:
-                    print(f"Error fetching positions for {account_id} page {page}: Status code {response.status_code}")
-                    print(f"Response: {response.text}")
+                page_positions: List[Dict] | None = None
+                last_error_text = ""
+                for attempt in range(1, 4):
+                    try:
+                        response = self.session.get(
+                            f"{self.base_url}/v1/api/portfolio/{account_id}/positions/{page}",
+                            timeout=20,
+                        )
+                        if response.status_code != 200:
+                            last_error_text = f"status {response.status_code}: {response.text}"
+                            time.sleep(0.4 * attempt)
+                            continue
+                        payload = response.json()
+                        page_positions = payload if isinstance(payload, list) else []
+                        break
+                    except Exception as exc:
+                        last_error_text = str(exc)
+                        time.sleep(0.4 * attempt)
+
+                if page_positions is None:
+                    print(
+                        f"Error fetching positions for {account_id} page {page} after retries: {last_error_text}"
+                    )
                     break
 
-                page_positions = response.json()
                 if not page_positions:
                     break
 
                 for position in page_positions:
-                    conid = position.get("conid")
-                    if isinstance(conid, int) and conid in seen_conids:
+                    key = _row_key(position)
+                    if key in seen_rows:
                         continue
-                    if isinstance(conid, int):
-                        seen_conids.add(conid)
+                    seen_rows.add(key)
                     all_positions.append(position)
+
+            # Cache the ES/MES front-month conid and current price for get_spx_price()
+            for p in all_positions:
+                if p.get("assetClass") == "FUT":
+                    desc = str(p.get("contractDesc", "")).upper()
+                    m = re.match(r"^(MES|ES)\b", desc)
+                    if m:
+                        cid = p.get("conid")
+                        mkt = p.get("mktPrice")
+                        if cid:
+                            self._last_es_conid = int(cid)
+                        if mkt and float(mkt) > 5000:
+                            self._last_es_price_hint = float(mkt)
+                        if m.group(1) == "ES":  # Prefer outright ES over MES
+                            break
 
             if not all_positions:
                 time.sleep(1)
@@ -1108,15 +1169,282 @@ class IBKRClient:
             print(f"Warning: could not load snapshot {path}: {e}")
             return [], {}
     
-    def get_option_greeks(self, conid: str) -> Dict:
-        """Fetch Greeks for an option contract."""
+    # ---------------------------------------------------------------------------
+    # IBKR Client Portal market-data snapshot helpers
+    # ---------------------------------------------------------------------------
+    # Field reference (Client Portal snapshot API):
+    #   31  = last price        84  = bid        86  = ask
+    #   7308 = delta            7309 = gamma
+    #   7310 = theta            7311 = vega
+    #   7633 = implied vol (%)
+    # The first call *subscribes* to the feed; data arrives on the second call.
+    # ---------------------------------------------------------------------------
+
+    _SNAPSHOT_GREEKS_FIELDS = "31,7308,7309,7310,7311,7633"
+    _SNAPSHOT_PRICE_FIELDS  = "31,84,86"
+    # Batch size: stay well below the undocumented ~300 conid limit
+    _SNAPSHOT_BATCH_SIZE = 50
+
+    def get_market_snapshot(
+        self,
+        conids: list,
+        fields: str | None = None,
+        subscribe_sleep: float = 1.0,
+    ) -> dict:
+        """Fetch a marketdata snapshot for *conids* and return {conid(int): raw_dict}.
+
+        IBKR Client Portal delivers market data immediately if the symbol has
+        been recently subscribed.  We make the call directly; if the response
+        contains empty items (first-time subscription), we wait ``subscribe_sleep``
+        seconds and retry once.  Batches are processed in groups of
+        ``_SNAPSHOT_BATCH_SIZE`` to stay within gateway limits.
+        """
+        if not conids:
+            return {}
+        fields_str = fields if fields is not None else self._SNAPSHOT_GREEKS_FIELDS
+        url = f"{self.base_url}/v1/api/iserver/marketdata/snapshot"
+        result: dict = {}
+        batch_size = self._SNAPSHOT_BATCH_SIZE
+        conid_list = [str(c) for c in conids]
+
+        for i in range(0, len(conid_list), batch_size):
+            chunk = conid_list[i : i + batch_size]
+            params = {"conids": ",".join(chunk), "fields": fields_str}
+            try:
+                requested_fields = [f.strip() for f in str(fields_str).split(",") if f.strip()]
+
+                def _has_requested_values(item: dict) -> bool:
+                    for fld in requested_fields:
+                        if item.get(fld) is not None:
+                            return True
+                    return False
+
+                # First fetch — usually returns data immediately
+                resp = self.session.get(url, params=params, verify=False, timeout=10)
+                resp.raise_for_status()
+                items = resp.json()
+
+                # Retry once for conids that still have no requested field values
+                missing_conids = [
+                    str(item.get("conid"))
+                    for item in items
+                    if item.get("conid") is not None and not _has_requested_values(item)
+                ]
+                if missing_conids:
+                    time.sleep(subscribe_sleep)
+                    retry_params = {"conids": ",".join(missing_conids), "fields": fields_str}
+                    retry_resp = self.session.get(url, params=retry_params, verify=False, timeout=10)
+                    retry_resp.raise_for_status()
+                    retry_items = retry_resp.json()
+                    retry_by_conid = {
+                        int(item.get("conid")): item
+                        for item in retry_items
+                        if item.get("conid") is not None
+                    }
+                    merged: list[dict] = []
+                    for item in items:
+                        cid = item.get("conid")
+                        if cid is not None and int(cid) in retry_by_conid and _has_requested_values(retry_by_conid[int(cid)]):
+                            merged.append(retry_by_conid[int(cid)])
+                        else:
+                            merged.append(item)
+                    items = merged
+
+                for item in items:
+                    cid = item.get("conid")
+                    if cid is not None:
+                        result[int(cid)] = item
+            except Exception as exc:
+                logging.warning("IBKR snapshot batch %d failed: %s", i, exc)
+        return result
+
+    def get_market_greeks_batch(self, conids: list) -> dict:
+        """Fetch per-contract Greeks from the IBKR market-data snapshot for *conids*.
+
+        Returns {conid(int): {delta, gamma, theta, vega, iv, last, source}} where
+        all numeric values are native floats (or None when unavailable).
+        """
+
+        def _f(val) -> float | None:
+            if val is None:
+                return None
+            try:
+                return float(str(val).replace("%", "").strip())
+            except (ValueError, TypeError):
+                return None
+
+        requested_conids = [int(c) for c in conids]
+        snapshot = self.get_market_snapshot(requested_conids, fields=self._SNAPSHOT_GREEKS_FIELDS)
+
+        def _has_any_greek(raw: dict) -> bool:
+            return any(raw.get(field) is not None for field in ("7308", "7309", "7310", "7311"))
+
+        # Targeted retries for symbols that still have no greek fields.
+        # This frequently happens on first subscription pass when the gateway
+        # has not warmed quote subscriptions yet.
+        missing = [cid for cid in requested_conids if cid not in snapshot or not _has_any_greek(snapshot.get(cid, {}))]
+        for attempt in range(1, 4):
+            if not missing:
+                break
+            time.sleep(0.5 * attempt)
+            retry_snapshot = self.get_market_snapshot(
+                missing,
+                fields=self._SNAPSHOT_GREEKS_FIELDS,
+                subscribe_sleep=0.6 + 0.4 * attempt,
+            )
+            for cid, payload in retry_snapshot.items():
+                if _has_any_greek(payload):
+                    snapshot[cid] = payload
+            missing = [cid for cid in requested_conids if cid not in snapshot or not _has_any_greek(snapshot.get(cid, {}))]
+
+        result: dict = {}
+        for conid, data in snapshot.items():
+            iv_raw = data.get("7633")
+            iv: float | None = None
+            if iv_raw is not None:
+                try:
+                    iv = float(str(iv_raw).replace("%", "").strip()) / 100.0
+                except (ValueError, TypeError):
+                    iv = None
+            result[conid] = {
+                "delta":  _f(data.get("7308")),
+                "gamma":  _f(data.get("7309")),
+                "theta":  _f(data.get("7310")),
+                "vega":   _f(data.get("7311")),
+                "iv":     iv,
+                "last":   _f(data.get("31")),
+                "source": "ibkr_snapshot",
+            }
+        return result
+
+    def _lookup_es_conid(self) -> int | None:
+        """Find the front-month ES futures conid using IBKR secdef search + info APIs.
+
+        Two-step process:
+          1. ``/iserver/secdef/search?symbol=ES&secType=FUT`` → parent conid
+          2. ``/iserver/secdef/info?conid=<parent>&sectype=FUT&month=MAR26&exchange=CME``
+             → actual contract conid for the front expiry month
+        """
+        import calendar as _cal
+        from datetime import timezone as _tz
+
+        def _front_month_code() -> str:
+            """Return IBKR expiry-month code, e.g. 'MAR26', for the front ES contract."""
+            now = datetime.now(_tz.utc)
+            # ES quarterly cycle: March(3), June(6), Sep(9), Dec(12)
+            quarterly = [3, 6, 9, 12]
+            month, year = now.month, now.year
+            # Third Friday of the candidate month (ES expiry)
+            for candidate_month in quarterly:
+                candidate_year = year if candidate_month >= month else year + 1
+                # find third Friday
+                _, days_in_month = _cal.monthrange(candidate_year, candidate_month)
+                fridays = [
+                    d for d in range(1, days_in_month + 1)
+                    if _cal.weekday(candidate_year, candidate_month, d) == 4
+                ]
+                third_friday = datetime(candidate_year, candidate_month, fridays[2], tzinfo=_tz.utc)
+                if third_friday > now:
+                    abbr = _cal.month_abbr[candidate_month].upper()
+                    return f"{abbr}{str(candidate_year)[2:]}"
+            return "MAR26"
+
         try:
-            # Return safe placeholder values so the UI shows 'N/A' instead of making network calls.
-            # The real Greeks will be fetched via Tastytrade integration
-            return {'delta': 'N/A', 'gamma': 'N/A', 'theta': 'N/A', 'vega': 'N/A', 'impliedVol': 'N/A'}
+            # Step 1: get parent conid
+            r1 = self.session.get(
+                f"{self.base_url}/v1/api/iserver/secdef/search",
+                params={"symbol": "ES", "secType": "FUT"},
+                verify=False,
+                timeout=5,
+            )
+            if r1.status_code != 200:
+                return None
+            items = r1.json() if isinstance(r1.json(), list) else []
+            parent_conid = None
+            for item in items:
+                sections = item.get("sections") or []
+                if any(s.get("secType") == "FUT" for s in sections):
+                    parent_conid = item.get("conid")
+                    break
+            if not parent_conid:
+                return None
+
+            # Step 2: get front-month contract conid
+            month_code = _front_month_code()
+            r2 = self.session.get(
+                f"{self.base_url}/v1/api/iserver/secdef/info",
+                params={
+                    "conid":    parent_conid,
+                    "sectype":  "FUT",
+                    "month":    month_code,
+                    "exchange": "CME",
+                },
+                verify=False,
+                timeout=5,
+            )
+            if r2.status_code == 200:
+                contracts = r2.json() if isinstance(r2.json(), list) else []
+                if contracts:
+                    cid = contracts[0].get("conid")
+                    if cid:
+                        self._last_es_conid = int(cid)
+                        return int(cid)
+        except Exception as exc:
+            logging.debug("ES conid lookup failed: %s", exc)
+        return None
+
+    def get_es_price_from_ibkr(self, es_conid: int | None = None) -> float | None:
+        """Fetch the front-month ES futures price via the market-data snapshot.
+
+        Fast-path: if ``get_positions`` was already called this session the
+        mktPrice from that response is returned immediately without an extra
+        HTTP round-trip.  Falls back to a snapshot API call if no cached price
+        is available.
+        """
+        # Fast path: use the price already seen in the last positions fetch
+        hint = getattr(self, "_last_es_price_hint", None)
+        if hint and 5000 < hint < 9000:
+            return hint
+
+        conid = es_conid or getattr(self, "_last_es_conid", None)
+        if not conid:
+            # Last resort: ask IBKR for the front-month ES contract
+            conid = self._lookup_es_conid()
+        if not conid:
+            return None
+        try:
+            snapshot = self.get_market_snapshot(
+                [conid], fields=self._SNAPSHOT_PRICE_FIELDS, subscribe_sleep=1.5
+            )
+            if conid in snapshot:
+                raw = snapshot[conid].get("31")
+                if raw is not None:
+                    price = float(str(raw).replace(",", "").strip())
+                    if 5000 < price < 9000:  # Sanity check for ES range
+                        return price
+        except Exception as exc:
+            logging.debug("IBKR ES price fetch failed: %s", exc)
+        return None
+
+    def get_option_greeks(self, conid: str) -> Dict:
+        """Fetch Greeks for a single option contract via the IBKR market-data snapshot.
+
+        Falls back to N/A placeholders on any error so callers are not disrupted.
+        """
+        try:
+            batch = self.get_market_greeks_batch([int(conid)])
+            if int(conid) in batch:
+                g = batch[int(conid)]
+                return {
+                    "delta":      g.get("delta", "N/A"),
+                    "gamma":      g.get("gamma", "N/A"),
+                    "theta":      g.get("theta", "N/A"),
+                    "vega":       g.get("vega",  "N/A"),
+                    "impliedVol": g.get("iv",    "N/A"),
+                }
         except Exception:
-            # Shouldn't happen, but return placeholders on any unexpected error
-            return {'delta': 'N/A', 'gamma': 'N/A', 'theta': 'N/A', 'vega': 'N/A', 'impliedVol': 'N/A'}
+            pass
+        return {"delta": "N/A", "gamma": "N/A", "theta": "N/A", "vega": "N/A", "impliedVol": "N/A"}
     
     async def get_tastytrade_option_greeks(
         self,
@@ -1218,125 +1546,84 @@ class IBKRClient:
             }
     
     def get_spx_price(self) -> float:
-        """Get current SPX price, trying multiple sources: Tastytrade SPY, Yahoo Finance ES, then fallback."""
+        """Get current SPX price.
+
+        Source priority (IBKR-first):
+          0. IBKR market-data snapshot for the ES front-month future.
+          1. Yahoo Finance ES=F continuous contract.
+          2. Yahoo Finance SPY × 10.
+          3. Hardcoded market-calibrated estimate (last resort).
+
+        Tastytrade SPY is intentionally skipped — it returns 404 unreliably.
+        """
         from datetime import datetime, timedelta
         now = datetime.now()
-        
-        # Check if cached price is still valid
-        if (self.spx_price is not None and 
-            self.spx_price_timestamp is not None and
-            now < self.spx_price_timestamp + timedelta(minutes=self.spx_price_cache_minutes)):
+
+        # Return cached value if still fresh
+        if (self.spx_price is not None and
+                self.spx_price_timestamp is not None and
+                now < self.spx_price_timestamp + timedelta(minutes=self.spx_price_cache_minutes)):
             return self.spx_price
-        
+
+        def _cache_and_return(price: float, label: str) -> float:
+            self.spx_price = price
+            self.spx_price_timestamp = now
+            print(f"Fetched SPX price from {label}: {price:.2f}")
+            return price
+
         try:
-            # Method 1: Try Tastytrade SPY (SPY ≈ SPX/10)
+            # ------------------------------------------------------------------
+            # Method 0: IBKR market-data snapshot (ES front-month future)
+            # ------------------------------------------------------------------
             try:
-                tw_session = self.options_cache._get_session() if hasattr(self.options_cache, '_get_session') else None
-                
-                if tw_session and hasattr(tw_session, 'session_token'):
-                    import requests
-                    # Get SPY quote via REST API
-                    headers = {"Authorization": f"Bearer {tw_session.session_token}"}
-                    response = requests.get("https://api.tastyworks.com/quote/equity", 
-                                          params={"symbols": "SPY"}, 
-                                          headers=headers, 
-                                          timeout=10)
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        if 'data' in data and 'items' in data['data'] and len(data['data']['items']) > 0:
-                            spy_data = data['data']['items'][0]
-                            spy_price = None
-                            
-                            # Try different price fields
-                            if 'last' in spy_data and spy_data['last']:
-                                spy_price = float(spy_data['last'])
-                            elif 'mark' in spy_data and spy_data['mark']:
-                                spy_price = float(spy_data['mark'])
-                            elif 'mid' in spy_data and spy_data['mid']:
-                                spy_price = float(spy_data['mid'])
-                            elif 'bid' in spy_data and spy_data['bid'] and 'ask' in spy_data and spy_data['ask']:
-                                spy_price = (float(spy_data['bid']) + float(spy_data['ask'])) / 2
-                            
-                            if spy_price and spy_price > 400:  # Sanity check for SPY range
-                                # Convert SPY to SPX: SPY * 10 is approximately SPX
-                                self.spx_price = spy_price * 10
-                                print(f"Fetched SPX price from Tastytrade SPY ({spy_price:.2f} * 10): {self.spx_price:.2f}")
-                                self.spx_price_timestamp = now
-                                return self.spx_price
-                            else:
-                                raise Exception(f"Invalid SPY price: {spy_price}")
-                        else:
-                            raise Exception("No SPY data in response")
-                    else:
-                        raise Exception(f"SPY API returned {response.status_code}: {response.text}")
-                        
-            except Exception as spy_error:
-                print(f"Tastytrade SPY method failed ({spy_error})")
-            
-            # Method 2: Try Yahoo Finance ES futures (ES=F is continuous contract)
+                price = self.get_es_price_from_ibkr()
+                if price and 5000 < price < 9000:
+                    return _cache_and_return(price, "IBKR ES snapshot")
+            except Exception as e0:
+                print(f"IBKR ES snapshot failed ({e0})")
+
+            # ------------------------------------------------------------------
+            # Method 1: Yahoo Finance ES=F continuous contract
+            # ------------------------------------------------------------------
             try:
-                print("Trying Yahoo Finance ES futures...")
-                es_future = yf.Ticker("ES=F")
-                
-                # Get the most recent price data
-                hist = es_future.history(period="1d", interval="1m")
+                print("Trying Yahoo Finance ES=F ...")
+                hist = yf.Ticker("ES=F").history(period="1d", interval="1m")
                 if not hist.empty:
-                    # Get the last available close price
-                    es_price = float(hist['Close'].iloc[-1])
-                    
-                    if es_price > 5000 and es_price < 8000:  # Sanity check for ES range
-                        self.spx_price = es_price
-                        print(f"Fetched SPX price from Yahoo Finance ES futures: {self.spx_price:.2f}")
-                        self.spx_price_timestamp = now
-                        return self.spx_price
-                    else:
-                        raise Exception(f"ES price out of expected range: {es_price}")
-                else:
-                    raise Exception("No ES futures data available")
-                    
-            except Exception as es_error:
-                print(f"Yahoo Finance ES method failed ({es_error})")
-            
-            # Method 3: Try Yahoo Finance SPY as backup
+                    es_price = float(hist["Close"].iloc[-1])
+                    if 5000 < es_price < 9000:
+                        return _cache_and_return(es_price, "Yahoo Finance ES=F")
+                    raise ValueError(f"ES price out of range: {es_price}")
+                raise ValueError("No ES=F data available")
+            except Exception as e1:
+                print(f"Yahoo Finance ES=F failed ({e1})")
+
+            # ------------------------------------------------------------------
+            # Method 2: Yahoo Finance SPY × 10
+            # ------------------------------------------------------------------
             try:
-                print("Trying Yahoo Finance SPY as backup...")
-                spy_ticker = yf.Ticker("SPY")
-                
-                # Get the most recent price data
-                hist = spy_ticker.history(period="1d", interval="1m")
+                print("Trying Yahoo Finance SPY ×10 ...")
+                hist = yf.Ticker("SPY").history(period="1d", interval="1m")
                 if not hist.empty:
-                    spy_price = float(hist['Close'].iloc[-1])
-                    
-                    if spy_price > 400 and spy_price < 800:  # Sanity check for SPY range
-                        # Convert SPY to SPX
-                        self.spx_price = spy_price * 10
-                        print(f"Fetched SPX price from Yahoo Finance SPY ({spy_price:.2f} * 10): {self.spx_price:.2f}")
-                        self.spx_price_timestamp = now
-                        return self.spx_price
-                    else:
-                        raise Exception(f"SPY price out of expected range: {spy_price}")
-                else:
-                    raise Exception("No SPY data available")
-                    
-            except Exception as spy_yf_error:
-                print(f"Yahoo Finance SPY method failed ({spy_yf_error})")
-            
-            # Fallback to market-calibrated estimate
-            print("All real-time sources failed, using market-calibrated estimate")
-            # Calibrated to match IB calculations (VOO should be ~0.551)
-            current_market_estimate = 6475.0
-            print(f"Using market-calibrated estimate: {current_market_estimate:.2f}")
-            self.spx_price = current_market_estimate
-            
-            self.spx_price_timestamp = now
-            return self.spx_price if self.spx_price is not None else 6475.0
-            
-        except Exception as e:
-            print(f"Warning: Could not fetch SPX price, using default: {e}")
-            self.spx_price = 6475.0  # Fallback value
+                    spy_price = float(hist["Close"].iloc[-1])
+                    if 400 < spy_price < 900:
+                        return _cache_and_return(spy_price * 10, "Yahoo Finance SPY×10")
+                    raise ValueError(f"SPY price out of range: {spy_price}")
+                raise ValueError("No SPY data available")
+            except Exception as e2:
+                print(f"Yahoo Finance SPY failed ({e2})")
+
+            # ------------------------------------------------------------------
+            # Method 3: Hardcoded estimate (last resort)
+            # ------------------------------------------------------------------
+            print("All real-time sources failed — using hardcoded estimate 6475.0")
+            return _cache_and_return(6475.0, "hardcoded estimate")
+
+        except Exception as exc:
+            print(f"Warning: Could not fetch SPX price, using default: {exc}")
+            self.spx_price = 6475.0
             self.spx_price_timestamp = now
             return self.spx_price
+
     
     def calculate_spx_weighted_delta(self, symbol: str, position_qty: float, price: float, 
                                    underlying_delta: float = 1.0, multiplier: float = 1.0) -> float:
@@ -1633,7 +1920,23 @@ class IBKRClient:
             except Exception:
                 expiry = str(expiry)
         expiry_str = str(expiry)
-        
+
+        # FOP contracts: IBKR Client Portal API always returns expiry=None for
+        # futures options.  All contract info lives in contractDesc, e.g.
+        # "ES     FEB2026 6615 P (EW3)".  Extract YYYYMM when expiry is empty.
+        if not expiry_str.strip():
+            _fop_desc = str(position.get('contractDesc') or '').upper()
+            _m = re.search(r'\b([A-Z]{3})(\d{4})\b', _fop_desc)
+            if _m:
+                _month_map = {
+                    'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04',
+                    'MAY': '05', 'JUN': '06', 'JUL': '07', 'AUG': '08',
+                    'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12',
+                }
+                _mn = _month_map.get(_m.group(1), '')
+                if _mn:
+                    expiry_str = f"{_m.group(2)}{_mn}"  # YYYYMM
+
         # Extract strike
         contract_desc = str(position.get('contractDesc') or '').strip()
         strike = position.get('strike') or position.get('strikePrice') or position.get('strikePx') or 0
@@ -1753,7 +2056,7 @@ class IBKRClient:
 
         # Fetch Tastytrade Greeks for all option positions concurrently
         option_greeks_data = {}
-        if option_positions and TASTYTRADE_AVAILABLE:
+        if option_positions and TASTYTRADE_SDK_AVAILABLE:
             # Apply skip rules: expired options or zero market value to reduce noise
             filtered_positions = []
             skipped_count = 0
@@ -2138,7 +2441,7 @@ async def main_async():
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--skip-greeks', action='store_true', help='Skip Greeks lookup to speed up output')
-    parser.add_argument('--cache-minutes', type=int, default=1, help='Cache expiry time in minutes (default: 1)')
+    parser.add_argument('--cache-minutes', type=int, default=5, help='Cache expiry time in minutes (default: 5)')
     parser.add_argument('--enable-external', action='store_true', help='Enable external data sources (tastyworks / Yahoo). Disabled by default for IBKR-only operation')
     parser.add_argument('--force-refresh', action='store_true', help='Force refresh of options cache for symbols in this run')
     parser.add_argument('--dry-run', action='store_true', help='Dry-run: simulate prefetch and use cached values without external API calls')

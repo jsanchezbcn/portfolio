@@ -1,0 +1,13 @@
+[server]
+# Disable file watcher — prevents rapid hot-reload OOM (Killed: 9) on macOS.
+# Restart the dashboard manually after code changes.
+fileWatcherType = "none"
+headless = true
+port = 8506
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+# Reduces memory pressure during reruns
+fastReruns = true

@@ -26,11 +26,18 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from agents.llm_client import async_llm_chat
+from models.order import (
+    AITradeSuggestion,
+    OrderAction,
+    OrderLeg,
+    PortfolioGreeks,
+    RiskBreach,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +59,27 @@ Rules:
 """
 
 
+_SUGGEST_SYSTEM_PROMPT = """\
+You are a quantitative options risk analyst specializing in income strategies \
+(SPX/ES iron condors, strangles, and spreads).
+
+A portfolio risk breach has been detected. Your job is to suggest exactly 3 \
+concrete remediation trades that would reduce the breach while preserving \
+theta income within the given budget.
+
+Rules:
+- Respond ONLY with a valid JSON array of exactly 3 objects. No markdown fences, \
+no extra text.
+- Each object must have these fields:
+    "legs": array of {symbol, action ("BUY"|"SELL"), quantity (positive int)}
+    "projected_delta_change": float (negative = delta reduced)
+    "projected_theta_cost": float (negative = theta earned; positive = theta spent)
+    "rationale": string (1-2 sentences, cite specific Greek values)
+- If action cannot be determined, omit the suggestion (return fewer objects).
+- Never raise exceptions — always return valid JSON.
+"""
+
+
 class LLMRiskAuditor:
     """Periodically audits portfolio risk using an LLM.
 
@@ -69,7 +97,7 @@ class LLMRiskAuditor:
         self.db = db
         self.interval_seconds = interval_seconds
         self._scheduler: AsyncIOScheduler | None = None
-        self._model = os.getenv("LLM_MODEL", "gpt-4.1")
+        self._model = os.getenv("LLM_MODEL", "gpt-4o-mini")
         # Latest snapshot pushed externally by the dashboard/streaming pipeline
         self._latest_context: dict[str, Any] | None = None
 
@@ -291,10 +319,134 @@ with the keys described in the system prompt.
         await self._persist(ctx, result)
         return result
 
+    # ------------------------------------------------------------------
+    # T048-T050: Trade suggestion (AI remediation recommendations)
+    # ------------------------------------------------------------------
 
-# ------------------------------------------------------------------ #
-# Entry point: python -m agents.llm_risk_auditor                     #
-# ------------------------------------------------------------------ #
+    async def suggest_trades(
+        self,
+        *,
+        portfolio_greeks: PortfolioGreeks,
+        vix: float,
+        regime: str,
+        breach: Optional[RiskBreach],
+        theta_budget: float,
+    ) -> list[AITradeSuggestion]:
+        """Return up to 3 AI-generated trades to remediate a risk breach.
+
+        Args:
+            portfolio_greeks: Current aggregate portfolio Greeks.
+            vix:              Current VIX value.
+            regime:           Active market regime name.
+            breach:           The detected breach (or None for general audit).
+            theta_budget:     Maximum theta that can be spent/risked.
+
+        Returns:
+            List of ``AITradeSuggestion`` (0–3 elements).  Never raises.
+        """
+        try:
+            prompt = self._build_suggest_prompt(
+                portfolio_greeks=portfolio_greeks,
+                vix=vix,
+                regime=regime,
+                breach=breach,
+                theta_budget=theta_budget,
+            )
+            raw = await async_llm_chat(
+                prompt,
+                model=self._model,
+                system=_SUGGEST_SYSTEM_PROMPT,
+                timeout=45.0,
+            )
+            return self._parse_suggestions(raw)
+        except Exception as exc:
+            logger.warning("suggest_trades() error: %s", exc, exc_info=True)
+            return []
+
+    # --- private helpers for suggest_trades ---
+
+    @staticmethod
+    def _build_suggest_prompt(
+        *,
+        portfolio_greeks: PortfolioGreeks,
+        vix: float,
+        regime: str,
+        breach: Optional[RiskBreach],
+        theta_budget: float,
+    ) -> str:
+        g = portfolio_greeks
+        breach_section = (
+            f"Breach Type:    {breach.breach_type}\n"
+            f"Threshold:      {breach.threshold_value}\n"
+            f"Actual Value:   {breach.actual_value}\n"
+            f"Breach Regime:  {breach.regime}\n"
+            f"Breach VIX:     {breach.vix}\n"
+        ) if breach else "No specific breach — general portfolio optimisation requested.\n"
+
+        return (
+            f"## Portfolio Greeks\n"
+            f"SPX Beta-Delta:   {g.spx_delta:.2f}\n"
+            f"Gamma:            {g.gamma:.4f}\n"
+            f"Daily Theta ($/d):{g.theta:.2f}\n"
+            f"Vega ($):         {g.vega:.2f}\n\n"
+            f"## Market Context\n"
+            f"VIX:              {vix:.2f}\n"
+            f"Regime:           {regime}\n\n"
+            f"## Risk Breach\n"
+            f"{breach_section}\n"
+            f"## Constraints\n"
+            f"Theta Budget (max to spend): {theta_budget:.2f}\n\n"
+            f"Respond ONLY with a JSON array of exactly 3 suggestion objects "
+            f"as described in the system prompt."
+        )
+
+    @staticmethod
+    def _parse_suggestions(raw: str) -> list[AITradeSuggestion]:
+        """Parse LLM JSON → list[AITradeSuggestion].  Returns [] on any error."""
+        text = raw.strip()
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            lines = text.splitlines()
+            text = "\n".join(l for l in lines if not l.startswith("```")).strip()
+        try:
+            parsed = json.loads(text)
+            if not isinstance(parsed, list):
+                logger.warning("suggest_trades: LLM returned non-list JSON")
+                return []
+            results: list[AITradeSuggestion] = []
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                legs_raw = item.get("legs", [])
+                legs: list[OrderLeg] = []
+                for lr in legs_raw:
+                    if not isinstance(lr, dict):
+                        continue
+                    try:
+                        action = OrderAction(lr.get("action", "BUY").upper())
+                    except ValueError:
+                        action = OrderAction.BUY
+                    legs.append(
+                        OrderLeg(
+                            symbol=str(lr.get("symbol", "UNKNOWN")),
+                            action=action,
+                            quantity=int(lr.get("quantity", 1)),
+                        )
+                    )
+                results.append(
+                    AITradeSuggestion(
+                        legs=legs,
+                        projected_delta_change=float(item.get("projected_delta_change", 0.0)),
+                        projected_theta_cost=float(item.get("projected_theta_cost", 0.0)),
+                        rationale=str(item.get("rationale", "")),
+                    )
+                )
+            return results
+        except Exception as exc:
+            logger.warning("suggest_trades: parse error — %s", exc)
+            return []
+
+
 
 if __name__ == "__main__":
     import asyncio

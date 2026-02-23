@@ -8,10 +8,6 @@ regimes:
       min_daily_theta: 100
       max_gamma: 50
       recession_probability_threshold: 0.4
-      # Issue 5: vega concentration cap (single underlying fraction of total vega)
-      max_single_underlying_vega_pct: 0.70
-      # Issue 6: max contracts per individual position
-      max_position_contracts: 100
       allowed_strategies:
         - "Long Calendars"
         - "Debit Spreads"
@@ -26,8 +22,6 @@ regimes:
       min_daily_theta: 300
       max_gamma: 35
       recession_probability_threshold: 0.4
-      max_single_underlying_vega_pct: 0.60
-      max_position_contracts: 50
       allowed_strategies:
         - "Iron Condors"
         - "Strangles"
@@ -42,8 +36,6 @@ regimes:
       min_daily_theta: 600
       max_gamma: 20
       recession_probability_threshold: 0.4
-      max_single_underlying_vega_pct: 0.50
-      max_position_contracts: 20
       allowed_strategies:
         - "Ratio Backspreads"
         - "Short Strangles (Managed)"
@@ -58,12 +50,7 @@ regimes:
       min_daily_theta: 0
       max_gamma: 10
       recession_probability_threshold: 0.4
-      max_single_underlying_vega_pct: 0.40
-      max_position_contracts: 10
       allowed_strategies:
         - "Long Puts"
         - "Cash"
         - "Long Volatility"
-
-# Arbitrage fee estimate per leg (USD). Used by ArbHunter for EV calculations.
-arb_fee_per_leg: 0.65

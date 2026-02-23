@@ -199,3 +199,44 @@ The three most impactful missing pieces for "guardrails" are:
 1. **`simulate_trade_impact`** — block trades that would breach limits
 2. **`AlertDispatcher`** — notify humans when limits are already breached
 3. **Margin cushion check** — prevent margin calls entirely
+
+
+
+---
+
+## US3/US4/US5/US6/US7 -- Algo Execution Platform (Feb 2026)
+
+### Architecture Decisions
+
+**Multi-leg BAG combo routing (T032)**
+- IBKR requires all legs of a spread/strangle submitted as a single BAG order with secType BAG, conidex, and comboLegs
+- Single-leg or no-conid orders use the per-leg orders list
+- Partial fills (PartiallyFilled) are a terminal state; order gets PARTIAL status and is journaled
+
+**Trade Journal (T036-T046)**
+- SQLite via aiosqlite in database/local_store.py
+- record_fill() is fire-and-forget via ThreadPoolExecutor(max_workers=1) + asyncio.run() -- never blocks submit() return path
+- VIX and SPX price fetched at fill time via MarketDataTools() with safe fallback (never raises)
+- Pre-Greeks captured from PortfolioGreeks passed to submit() from the order builder
+
+**AI Trade Suggestions (T048-T056)**
+- LLMRiskAuditor.suggest_trades() -- structured prompt with portfolio Greeks, VIX, regime, breach details; requires 3 JSON suggestions
+- All LLM failures return [] -- never raise
+- AITradeSuggestion.suggestion_id links to TradeJournalEntry.ai_suggestion_id for full audit trail
+- Background daemon thread runs AI analysis without blocking Streamlit
+
+**Historical Charts (T060-T065b)**
+- Background snapshot thread (threading, not asyncio -- survives Streamlit reruns) captures state every 15 min
+- Sebastian |theta|/|vega| ratio is mandatory: green 0.25-0.40; red <0.20 or >0.50
+
+**Flatten Risk (T067-T073)**
+- ExecutionEngine.flatten_risk(positions) -- pure function, no broker calls; returns pre-approved MARKET orders
+- Mandatory confirmation dialog before any orders submitted
+- All fills journaled with strategy_tag = FLATTEN and standard rationale string
+
+### Known Limitations
+
+1. Post-Greeks: post_greeks_json = "{}" at fill time; background polling after fill is a future enhancement
+2. Flatten margin estimate: Uses 5000 x n_orders heuristic; true value requires WhatIf per order
+3. Historical data accumulation: Charts only show data captured while the dashboard is running (no backfill)
+4. LLM suggestion quality: First-pass prompt; production hardening needs few-shot examples and Pydantic schema validation

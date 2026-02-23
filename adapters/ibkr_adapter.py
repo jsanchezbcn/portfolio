@@ -1,39 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import logging
 import os
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from typing import Any
 
 from adapters.base_adapter import BrokerAdapter
 from ibkr_portfolio_client import IBKRClient
+from models.order import PortfolioGreeks
 from models.unified_position import InstrumentType, UnifiedPosition
+from risk_engine.beta_weighter import BetaWeighter
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-# Issue 9: Complete futures multiplier table (CME/CBOT standard contracts)
-_FUTURES_MULTIPLIERS: dict[str, float] = {
-    "ES": 50.0,
-    "MES": 5.0,
-    "NQ": 20.0,
-    "MNQ": 2.0,
-    "YM": 5.0,
-    "MYM": 0.5,
-    "RTY": 50.0,
-    "M2K": 5.0,
-    "CL": 1_000.0,
-    "NG": 10_000.0,
-    "GC": 100.0,
-    "SI": 5_000.0,
-    "ZB": 1_000.0,
-    "ZN": 1_000.0,
-    "ZF": 1_000.0,
-    "ZT": 2_000.0,
-}
 
 
 class IBKRAdapter(BrokerAdapter):
@@ -44,18 +26,13 @@ class IBKRAdapter(BrokerAdapter):
 
         self.client = client or IBKRClient()
         self.last_greeks_status: dict[str, Any] = {}
-        # Issue 10: cache raw IBKR positions so the benchmark avoids a second REST call
-        self._last_raw_positions: list[dict[str, Any]] = []
         disable_cache_raw = str(os.getenv("GREEKS_DISABLE_CACHE", "")).strip().lower()
         self.disable_tasty_cache = disable_cache_raw in {"1", "true", "yes", "on"}
-        force_refresh_raw = str(os.getenv("GREEKS_FORCE_REFRESH_ON_MISS", "0")).strip().lower()
+        force_refresh_raw = str(os.getenv("GREEKS_FORCE_REFRESH_ON_MISS", "1")).strip().lower()
         self.force_refresh_on_miss = force_refresh_raw in {"1", "true", "yes", "on"}
-        # Issue 11 (partial): enable prefetch by default so all options for the same
-        # underlying are batched into a single DXLink websocket session rather than
-        # reconnecting once per option.  Full persistent session pooling is tracked
-        # separately in docs/IMPROVEMENTS.md #11.
-        prefetch_raw = str(os.getenv("GREEKS_PREFETCH", "1")).strip().lower()
-        self.enable_prefetch = prefetch_raw in {"1", "true", "yes", "on"}
+        # BetaWeighter provides the SPX beta waterfall used by compute_portfolio_greeks().
+        # Session is injected later if a Tastytrade session is available.
+        self._beta_weighter = BetaWeighter(tastytrade_session=None, ibkr_client=self.client)
 
     async def fetch_positions(self, account_id: str) -> list[UnifiedPosition]:
         """Fetch IBKR positions and convert to unified schema."""
@@ -65,19 +42,13 @@ class IBKRAdapter(BrokerAdapter):
         except Exception as exc:
             raise ConnectionError(f"Unable to fetch IBKR positions for account {account_id}.") from exc
 
-        # Issue 10: cache so callers can reuse without a second HTTP round-trip
-        self._last_raw_positions = raw_positions
         transformed: list[UnifiedPosition] = []
 
         for position in raw_positions:
             try:
                 transformed.append(self._to_unified_position(position))
             except Exception as exc:
-                message = str(exc)
-                if "Option positions require fields: expiration" in message:
-                    LOGGER.debug("Skipping IBKR option with missing expiration: %s", position)
-                else:
-                    LOGGER.warning("Skipping unparseable IBKR position payload: %s", exc)
+                LOGGER.warning("Skipping unparseable IBKR position payload: %s", exc)
                 continue
 
         return transformed
@@ -90,53 +61,201 @@ class IBKRAdapter(BrokerAdapter):
         prefetch_results: dict[str, int] = {}
         missing_greeks_details: list[dict[str, Any]] = []
 
-        if self.enable_prefetch and not self.disable_tasty_cache:
-            # Run all prefetch tasks concurrently to reduce total wait time
-            # (each WebSocket fetch takes ~18s; serial would be N×18s)
-            async def _prefetch_one(und: str, reqs: set) -> tuple[str, int]:
+        if not self.disable_tasty_cache:
+            for underlying, request_set in prefetch_targets.items():
                 try:
                     fetched = await self.client.options_cache.fetch_and_cache_options_for_underlying(
-                        und,
-                        only_options=reqs,
-                        force_refresh=self.force_refresh_on_miss,
+                        underlying,
+                        only_options=request_set,
+                        force_refresh=True,
                     )
-                    return und, len(fetched)
+                    prefetch_results[underlying] = len(fetched)
                 except Exception as exc:
-                    LOGGER.warning("Prefetch failed for %s: %s", und, exc)
-                    return und, 0
-
-            tasks = [_prefetch_one(und, reqs) for und, reqs in prefetch_targets.items()]
-            results = await asyncio.gather(*tasks, return_exceptions=False)
-            for und, count in results:
-                prefetch_results[und] = count
+                    LOGGER.warning("Prefetch failed for %s: %s", underlying, exc)
+                    prefetch_results[underlying] = 0
 
         cache_miss_count = 0
 
+        def _normalize_greeks_source(value: Any) -> str:
+            if isinstance(value, str):
+                return value.strip().lower()
+            return "none"
+
+        def _coerce_broker_conid(value: Any) -> int | None:
+            if value in (None, "", "N/A"):
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        # ------------------------------------------------------------------
+        # IBKR-first: batch-fetch option Greeks from the market-data snapshot
+        # API for all positions that lack native greeks (typical for FOP/OPT
+        # positions where the /portfolio endpoint returns None for all greeks).
+        # Tastytrade is used ONLY as a secondary fallback for the remainder.
+        # ------------------------------------------------------------------
+        _options_needing_greeks: list[tuple[UnifiedPosition, int]] = []
+        for pos in positions:
+            if pos.instrument_type != InstrumentType.OPTION:
+                continue
+            if abs(float(pos.quantity or 0.0)) <= 1e-9:
+                continue
+            if _normalize_greeks_source(getattr(pos, "greeks_source", None)) != "none":
+                continue
+            conid = _coerce_broker_conid(getattr(pos, "broker_id", None))
+            if conid is None:
+                continue
+            _options_needing_greeks.append((pos, conid))
+        ibkr_snapshot_hits = 0
+        ibkr_snapshot_errors: list[str] = []
+        if _options_needing_greeks:
+            _conids = [conid for _, conid in _options_needing_greeks]
+            try:
+                _ibkr_greeks = await asyncio.to_thread(
+                    self.client.get_market_greeks_batch, _conids
+                )
+            except Exception as _exc:
+                LOGGER.warning("IBKR snapshot greeks batch failed: %s", _exc)
+                _ibkr_greeks = {}
+            for pos, cid in _options_needing_greeks:
+                g = _ibkr_greeks.get(cid)
+                if not g:
+                    continue
+                # Per-contract greeks from snapshot; scale by qty × multiplier
+                mult = pos.contract_multiplier if pos.contract_multiplier > 0 else 1.0
+                dg_mult = mult  # delta & gamma
+                tv_mult = mult  # theta & vega
+                delta = self._safe_optional_float(g.get("delta"))
+                gamma = self._safe_optional_float(g.get("gamma"))
+                theta = self._safe_optional_float(g.get("theta"))
+                vega  = self._safe_optional_float(g.get("vega"))
+                if delta is None and theta is None and vega is None:
+                    ibkr_snapshot_errors.append(pos.symbol)
+                    continue
+                pos.delta = (delta or 0.0) * pos.quantity * dg_mult
+                pos.gamma = (gamma or 0.0) * pos.quantity * dg_mult
+                pos.theta = (theta or 0.0) * pos.quantity * tv_mult
+                pos.vega  = (vega  or 0.0) * pos.quantity * tv_mult
+                pos.iv    = self._safe_optional_float(g.get("iv"))
+                pos.greeks_source = "ibkr_snapshot"
+                ibkr_snapshot_hits += 1
+
+        LOGGER.debug(
+            "IBKR snapshot greeks: %d/%d enriched, %d failed",
+            ibkr_snapshot_hits,
+            len(_options_needing_greeks),
+            len(ibkr_snapshot_errors),
+        )
+
+        # Fetch SPX price once for the entire batch (used by BetaWeighter, T016)
+        try:
+            _spx_price_for_batch = await asyncio.to_thread(self.client.get_spx_price)
+        except Exception as _exc:
+            LOGGER.debug("Could not fetch SPX price for BetaWeighter batch: %s", _exc)
+            _spx_price_for_batch = 0.0
+        _spx_price_candidate = self._safe_optional_float(_spx_price_for_batch)
+        _spx_price_for_batch_num = (
+            float(_spx_price_candidate)
+            if isinstance(_spx_price_candidate, (int, float))
+            else 0.0
+        )
+
         for position in positions:
+            if position.instrument_type == InstrumentType.FUTURE:
+                # Recompute SPX delta with the current batch SPX price so that a
+                # failed get_spx_price() during fetch_positions() doesn't freeze
+                # spx_delta at 0.0 for the life of the session.
+                if _spx_price_for_batch_num > 0 and abs(float(position.quantity or 0.0)) > 1e-9:
+                    mult = position.contract_multiplier if (position.contract_multiplier or 0) > 0 else 1.0
+                    qty = float(position.quantity)
+                    # Derive the futures market price from market_value:
+                    # market_value = qty * mult * price  →  price = mv / (qty * mult)
+                    if qty and mult:
+                        _fut_px = abs(float(position.market_value) / (qty * mult))
+                    else:
+                        _fut_px = 0.0
+                    position.underlying_price = _fut_px if _fut_px > 0 else _spx_price_for_batch_num
+                    bw_result = await self._beta_weighter.compute_spx_equivalent_delta(
+                        position, _spx_price_for_batch_num
+                    )
+                    position.spx_delta = bw_result.spx_equivalent_delta
+                    position.beta_unavailable = bw_result.beta_unavailable
+                updated_positions.append(position)
+                continue
+
             if position.instrument_type != InstrumentType.OPTION:
+                # EQUITY / other: refresh with current SPX price and current stock price.
+                if _spx_price_for_batch_num > 0 and abs(float(position.quantity or 0.0)) > 1e-9:
+                    qty = float(position.quantity)
+                    _eq_px = abs(float(position.market_value) / qty) if qty else 0.0
+                    if _eq_px > 0:
+                        position.underlying_price = _eq_px
+                    bw_result = await self._beta_weighter.compute_spx_equivalent_delta(
+                        position, _spx_price_for_batch_num
+                    )
+                    position.spx_delta = bw_result.spx_equivalent_delta
+                    position.beta_unavailable = bw_result.beta_unavailable
                 updated_positions.append(position)
                 continue
 
-            # IBKR-first strategy:
-            # If IBKR provided ALL greeks (delta + theta + vega all non-zero), use them directly.
-            # If IBKR only has delta (typical for most options), still run Tastytrade to get
-            # theta/vega — we preserve the IBKR delta/gamma in that case (more accurate).
-            ibkr_has_full_greeks = (
-                position.greeks_source == "ibkr_native"
-                and abs(position.theta) > 1e-9
-                and abs(position.vega) > 1e-9
-            )
-            if ibkr_has_full_greeks:
+            # Ignore stale option rows with zero quantity to avoid false
+            # "missing greeks" noise and unnecessary retry/fallback work.
+            if abs(float(position.quantity or 0.0)) <= 1e-9:
                 updated_positions.append(position)
                 continue
 
-            # Track whether we have a valid IBKR delta to preserve
-            ibkr_has_delta = (
-                position.greeks_source == "ibkr_native"
-                and abs(position.delta) > 1e-9
+            # Ensure underlying_price is populated for SPX beta-weighting.
+            # IBKR /portfolio often omits underlier price for options.
+            _under_px_candidate = self._safe_optional_float(getattr(position, "underlying_price", None))
+            _under_px = (
+                float(_under_px_candidate)
+                if isinstance(_under_px_candidate, (int, float))
+                else None
             )
+            if (_under_px is None or _under_px <= 0) and _spx_price_for_batch_num > 0:
+                under = str(position.underlying or "").upper().lstrip("/")
+                if under in {"SPX", "SPXW", "XSP", "ES", "MES"}:
+                    position.underlying_price = float(_spx_price_for_batch_num)
+                elif position.strike is not None and position.strike > 0:
+                    # Last-resort fallback when underlier quote is not available.
+                    position.underlying_price = float(position.strike)
+
+            if position.greeks_source in {"ibkr_native", "ibkr_snapshot"}:
+                # Already have IBKR-sourced greeks — still need SPX delta via BetaWeighter
+                if _spx_price_for_batch_num > 0:
+                    bw_result = await self._beta_weighter.compute_spx_equivalent_delta(
+                        position, _spx_price_for_batch_num
+                    )
+                    position.spx_delta = bw_result.spx_equivalent_delta
+                    position.beta_unavailable = bw_result.beta_unavailable
+                updated_positions.append(position)
+                continue
 
             if not position.underlying or not position.expiration or not position.strike or not position.option_type:
+                updated_positions.append(position)
+                continue
+
+            # IBKR-only debug mode: never hit Tastytrade fallback.
+            if self.disable_tasty_cache:
+                cache_miss_count += 1
+                raw_contract_multiplier = self._safe_optional_float(getattr(position, "contract_multiplier", None))
+                contract_multiplier = raw_contract_multiplier if raw_contract_multiplier and raw_contract_multiplier > 0 else 1.0
+                missing_greeks_details.append(
+                    {
+                        "symbol": position.symbol,
+                        "underlying": position.underlying or "",
+                        "expiry": position.expiration.isoformat() if position.expiration else "",
+                        "strike": float(position.strike) if position.strike is not None else None,
+                        "option_type": position.option_type or "",
+                        "quantity": float(position.quantity),
+                        "contract_multiplier": contract_multiplier,
+                        "lookup_candidates": "",
+                        "lookup_used": "",
+                        "reason": "ibkr_no_data_no_fallback",
+                    }
+                )
+                position.greeks_source = "none"
                 updated_positions.append(position)
                 continue
 
@@ -183,19 +302,9 @@ class IBKRAdapter(BrokerAdapter):
                         "lookup_candidates": ", ".join(candidates),
                         "lookup_used": selected_underlying,
                         "reason": source,
-                        "ibkr_had_delta": ibkr_has_delta,
                     }
                 )
-                # IBKR-first: if we had IBKR native delta, keep it rather than marking as "none".
-                # This preserves delta accuracy even when Tastytrade cannot supply theta/vega.
-                if ibkr_has_delta:
-                    LOGGER.debug(
-                        "Tastytrade miss (%s) for %s — keeping IBKR native delta=%.4f",
-                        source, position.symbol, position.delta,
-                    )
-                    # Leave position.greeks_source as "ibkr_native" to indicate partial data
-                else:
-                    position.greeks_source = "none"
+                position.greeks_source = "none"
                 updated_positions.append(position)
                 continue
 
@@ -209,46 +318,74 @@ class IBKRAdapter(BrokerAdapter):
             delta_gamma_multiplier = self._option_delta_gamma_multiplier(position, contract_multiplier)
             theta_vega_multiplier = self._option_theta_vega_multiplier(position, contract_multiplier)
 
-            if ibkr_has_delta:
-                # IBKR-first: preserve IBKR delta/gamma (broker model, already position-adjusted),
-                # and fill in theta/vega/iv from Tastytrade (IBKR often lacks these).
-                position.theta = per_contract_theta * position.quantity * theta_vega_multiplier
-                position.vega = per_contract_vega * position.quantity * theta_vega_multiplier
-                position.iv = self._safe_optional_float(greeks.get("impliedVol"))
-                position.greeks_source = "ibkr_native+tastytrade"
-            else:
-                # No IBKR native greeks — use Tastytrade for everything.
-                position.delta = per_contract_delta * position.quantity * delta_gamma_multiplier
-                position.gamma = per_contract_gamma * position.quantity * delta_gamma_multiplier
-                position.theta = per_contract_theta * position.quantity * theta_vega_multiplier
-                position.vega = per_contract_vega * position.quantity * theta_vega_multiplier
-                position.iv = self._safe_optional_float(greeks.get("impliedVol"))
-                position.greeks_source = "tastytrade"
+            position.delta = per_contract_delta * position.quantity * delta_gamma_multiplier
+            position.gamma = per_contract_gamma * position.quantity * delta_gamma_multiplier
+            position.theta = per_contract_theta * position.quantity * theta_vega_multiplier
+            position.vega = per_contract_vega * position.quantity * theta_vega_multiplier
+            position.iv = self._safe_optional_float(greeks.get("impliedVol"))
+            position.greeks_source = "tastytrade"
 
-            price = position.market_value / position.quantity if position.quantity else 0.0
-            if position.strike is not None and position.strike > 0:
-                price = float(position.strike)
-            position.spx_delta = self.client.calculate_spx_weighted_delta(
-                symbol=position.underlying,
-                position_qty=position.quantity,
-                price=price,
-                underlying_delta=per_contract_delta,
-                multiplier=contract_multiplier,
-            )
+            # Use BetaWeighter for accurate SPX-equivalent delta (T016).
+            # underlying_price is already populated on the position (T005 fix).
+            if _spx_price_for_batch_num > 0:
+                bw_result = await self._beta_weighter.compute_spx_equivalent_delta(
+                    position, _spx_price_for_batch_num
+                )
+                position.spx_delta = bw_result.spx_equivalent_delta
+                position.beta_unavailable = bw_result.beta_unavailable  # T019 flag
+            else:
+                # Fallback to legacy internal formula when SPX price is unavailable
+                price = position.market_value / position.quantity if position.quantity else 0.0
+                _fallback_under_px = self._safe_optional_float(getattr(position, "underlying_price", None))
+                if _fallback_under_px is not None and _fallback_under_px > 0:
+                    price = float(_fallback_under_px)
+                elif position.strike is not None and position.strike > 0:
+                    price = float(position.strike)
+                position.spx_delta = self.client.calculate_spx_weighted_delta(
+                    symbol=position.underlying,
+                    position_qty=position.quantity,
+                    price=price,
+                    underlying_delta=per_contract_delta,
+                    multiplier=contract_multiplier,
+                )
             updated_positions.append(position)
 
         self.last_greeks_status = {
             "prefetch_targets": {key: len(value) for key, value in prefetch_targets.items()},
             "prefetch_results": prefetch_results,
+            "ibkr_snapshot_total": len(_options_needing_greeks),
+            "ibkr_snapshot_hits": ibkr_snapshot_hits,
+            "ibkr_snapshot_errors": ibkr_snapshot_errors,
             "cache_miss_count": cache_miss_count,
             "missing_greeks_details": missing_greeks_details,
             "last_session_error": getattr(self.client.options_cache, "last_session_error", None),
             "disable_tasty_cache": self.disable_tasty_cache,
             "force_refresh_on_miss": self.force_refresh_on_miss,
-            "enable_prefetch": self.enable_prefetch,
+            "tasty_fallback_enabled": not self.disable_tasty_cache,
+            "spx_price": _spx_price_for_batch_num,  # T020: exposed for dashboard SPX price check
+            "spx_price_source": getattr(self.client, "_last_spx_source", "unknown"),
         }
 
         return updated_positions
+
+    async def compute_portfolio_greeks(
+        self,
+        positions: list[UnifiedPosition],
+        spx_price: float | None = None,
+    ) -> PortfolioGreeks:
+        """Aggregate all positions into a PortfolioGreeks snapshot using BetaWeighter.
+
+        If *spx_price* is not supplied it is fetched from the IBKR client.  When
+        the price cannot be determined all deltas are 0 and a CRITICAL log is emitted
+        so the dashboard can show an error state (T020).
+        """
+        if spx_price is None or spx_price <= 0:
+            try:
+                spx_price = await asyncio.to_thread(self.client.get_spx_price)
+            except Exception as exc:
+                LOGGER.error("SPX price unavailable — portfolio delta cannot be computed: %s", exc)
+                spx_price = 0.0
+        return await self._beta_weighter.compute_portfolio_spx_delta(positions, spx_price)
 
     def _build_prefetch_targets(self, positions: list[UnifiedPosition]) -> dict[str, set[tuple[str, float, str]]]:
         """Build per-underlying option requests used for cache prewarming."""
@@ -290,7 +427,7 @@ class IBKRAdapter(BrokerAdapter):
             "theta": position.theta,
             "vega": position.vega,
             "iv": position.iv,
-            "event_time": datetime.now(timezone.utc).isoformat(),
+            "event_time": datetime.utcnow().isoformat(),
         }
 
     def _candidate_tasty_underlyings(self, position: UnifiedPosition) -> list[str]:
@@ -366,39 +503,44 @@ class IBKRAdapter(BrokerAdapter):
                 theta=(native_theta or 0.0) * quantity * theta_vega_multiplier,
                 vega=(native_vega or 0.0) * quantity * theta_vega_multiplier,
                 greeks_source="ibkr_native" if has_native else "none",
+                broker_id=str(position.get("conid", "") or ""),
             )
 
         ticker = str(position.get("ticker") or position.get("contractDesc") or "UNKNOWN")
+        asset_class = str(position.get("assetClass") or "").upper()
+        conid_raw = position.get("conid", "")
+        multiplier = contract_multiplier if contract_multiplier > 0 else 1.0
+        is_futures = asset_class == "FUT"
+        base_delta = quantity * multiplier if is_futures else quantity
         spx_delta = self.client.calculate_spx_weighted_delta(
             symbol=ticker,
             position_qty=quantity,
             price=float(position.get("mktPrice", 0.0)),
             underlying_delta=1.0,
-            multiplier=1.0,
+            multiplier=multiplier if is_futures else 1.0,
         )
 
         return UnifiedPosition(
             symbol=ticker,
-            instrument_type=InstrumentType.EQUITY,
+            instrument_type=InstrumentType.FUTURE if is_futures else InstrumentType.EQUITY,
             broker="ibkr",
             quantity=quantity,
             contract_multiplier=contract_multiplier,
             avg_price=avg_price,
             market_value=market_value,
             unrealized_pnl=unrealized_pnl,
-            delta=quantity,
+            delta=base_delta,
             spx_delta=spx_delta,
             greeks_source="ibkr_native",
+            broker_id=str(conid_raw or ""),
         )
 
     def _extract_native_greeks(self, position: dict[str, Any]) -> dict[str, float | None]:
-        # Use PER-CONTRACT fields only (positionDelta/positionGamma/etc. are quantity-adjusted
-        # and would double-count when multiplied by quantity in _to_unified_position).
         candidates = {
-            "delta": ["delta", "optDelta", "modelDelta"],
-            "gamma": ["gamma", "optGamma", "modelGamma"],
-            "theta": ["theta", "optTheta", "modelTheta"],
-            "vega": ["vega", "optVega", "modelVega"],
+            "delta": ["delta", "positionDelta", "netDelta", "optDelta", "modelDelta"],
+            "gamma": ["gamma", "positionGamma", "optGamma", "modelGamma"],
+            "theta": ["theta", "positionTheta", "optTheta", "modelTheta"],
+            "vega": ["vega", "positionVega", "optVega", "modelVega"],
         }
 
         extracted: dict[str, float | None] = {"delta": None, "gamma": None, "theta": None, "vega": None}
@@ -413,7 +555,6 @@ class IBKRAdapter(BrokerAdapter):
         return extracted
 
     def _extract_contract_multiplier(self, position: dict[str, Any]) -> float:
-        # Use IBKR's own multiplier field when present and valid
         raw_multiplier = position.get("multiplier")
         try:
             if raw_multiplier not in (None, ""):
@@ -426,39 +567,30 @@ class IBKRAdapter(BrokerAdapter):
         asset_class = str(position.get("assetClass") or "").upper()
         ticker = str(position.get("ticker") or position.get("undSym") or "").upper().lstrip("/")
 
-        # Issue 9: look up from the comprehensive futures multiplier table
-        if asset_class in {"OPT", "FOP", "FUT"} and ticker in _FUTURES_MULTIPLIERS:
-            return _FUTURES_MULTIPLIERS[ticker]
-
-        # Equity options default
         if asset_class in {"OPT", "FOP"}:
+            if not ticker:
+                # FOP positions from IBKR API lack ticker/undSym; parse from contractDesc.
+                _desc = str(position.get("contractDesc") or "").upper().strip()
+                _tm = re.match(r'^/?([A-Z]{1,6})\b', _desc)
+                if _tm:
+                    ticker = _tm.group(1).lstrip("/")
+            if ticker in {"ES", "SPX", "SPXW"}:
+                return 50.0
+            if ticker in {"MES"}:
+                return 5.0
+            if ticker in {"NQ", "NQ100"}:
+                return 20.0
+            if ticker in {"MNQ"}:
+                return 2.0
             return 100.0
 
+        if asset_class == "FUT":
+            if ticker == "ES":
+                return 50.0
+            if ticker == "MES":
+                return 5.0
+
         return 1.0
-
-    async def fetch_account_margin(self, account_id: str) -> dict[str, Any]:
-        """Issue 2: Fetch IBKR account margin / liquidity summary via REST.
-
-        Returns a dict with keys like ``netliquidation``, ``excessliquidity``, and
-        ``cushion`` (ratio of excess liquidity to net liquidation value).  Returns an
-        empty dict if the request fails so callers can degrade gracefully.
-        """
-        try:
-            response = await asyncio.to_thread(
-                self.client.session.get,
-                f"{self.client.base_url}/v1/api/portfolio/{account_id}/summary",
-                timeout=5,
-            )
-            if response.status_code == 200:
-                return dict(response.json())
-            LOGGER.warning(
-                "fetch_account_margin: status %s for account %s",
-                response.status_code,
-                account_id,
-            )
-        except Exception as exc:
-            LOGGER.warning("fetch_account_margin failed for %s: %s", account_id, exc)
-        return {}
 
     @staticmethod
     def _is_futures_option(position: UnifiedPosition) -> bool:
@@ -495,25 +627,19 @@ class IBKRAdapter(BrokerAdapter):
         return 100.0
 
     @staticmethod
-    def _parse_expiration(expiry: str) -> date | None:
-        raw = str(expiry or "").strip()
-        if not raw:
-            return None
-
-        if raw.isdigit() and len(raw) > 8:
-            try:
-                return datetime.fromtimestamp(int(raw) / 1000).date()
-            except (ValueError, OSError):
-                return None
-
-        normalized = raw.replace("-", "")
-        if len(normalized) == 8 and normalized.isdigit():
-            try:
-                return datetime.strptime(normalized, "%Y%m%d").date()
-            except ValueError:
-                return None
-
-        return None
+    def _parse_expiration(expiry: str) -> date:
+        normalized = expiry.replace("-", "").strip()
+        if len(normalized) == 8:
+            return datetime.strptime(normalized, "%Y%m%d").date()
+        if len(normalized) == 6 and normalized.isdigit():
+            # YYYYMM – produced for FOP contracts whose contractDesc encodes the
+            # expiry as e.g. "FEB2026".  Use the last calendar day of that month
+            # as the expiration date (exact weekly date is not critical for beta
+            # weighting calculations).
+            year, month = int(normalized[:4]), int(normalized[4:6])
+            last_day = calendar.monthrange(year, month)[1]
+            return date(year, month, last_day)
+        raise ValueError(f"Unsupported expiration format: {expiry!r}")
 
     @staticmethod
     def _safe_float(value: Any) -> float:

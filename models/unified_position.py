@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -35,12 +36,18 @@ class UnifiedPosition(BaseModel):
     spx_delta: float = 0.0
 
     underlying: str | None = None
+    underlying_price: float | None = None  # Live price of the underlying (for options/futures: the index/stock price, NOT the option price)
     strike: float | None = None
     expiration: date | None = None
     option_type: Literal["call", "put"] | None = None
     iv: float | None = None
     days_to_expiration: int | None = None
     greeks_source: str = "none"
+    beta_unavailable: bool = False  # True when no beta source found; SPX delta defaulted to assume beta=1.0
+
+    # Broker-native identifier (conid for IBKR, OCC symbol for Tastytrade).
+    # Used to look up live greeks via marketdata/snapshot without re-fetching positions.
+    broker_id: str | None = None
 
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
@@ -79,3 +86,17 @@ class UnifiedPosition(BaseModel):
         if dte <= 60:
             return "31-60"
         return "60+"
+
+
+@dataclass
+class BetaWeightedPosition:
+    """A UnifiedPosition enriched with its SPX beta and computed SPX-equivalent delta.
+
+    Produced by BetaWeighter.compute_spx_equivalent_delta(position).
+    """
+
+    position: UnifiedPosition
+    beta: float                         # Beta value used for this position
+    beta_source: str                    # "tastytrade" | "yfinance" | "beta_config" | "default"
+    beta_unavailable: bool              # True → no source returned a beta; defaulted to 1.0
+    spx_equivalent_delta: float        # (delta × qty × multiplier × beta × underlying_price) / spx_price

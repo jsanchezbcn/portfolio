@@ -62,7 +62,7 @@ class NewsSentry:
         self.db = db
         self.interval_seconds = interval_seconds
         self._scheduler: AsyncIOScheduler | None = None
-        self._model = os.getenv("LLM_MODEL", "gpt-4.1")
+        self._model = os.getenv("LLM_MODEL", "gpt-4o-mini")
         self._news_provider = os.getenv("NEWS_PROVIDER", "alpaca").lower()
         self._news_api_key = os.getenv("NEWS_API_KEY", "")
         # Provider-specific keys (can supplement NEWS_API_KEY)

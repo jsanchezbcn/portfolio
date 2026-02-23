@@ -1,22 +1,12 @@
 from __future__ import annotations
 
-import logging
 import math
-import os
 from datetime import datetime
 from typing import Iterable
 
-import httpx
 import yfinance as yf
 
 from adapters.polymarket_adapter import PolymarketAdapter
-
-logger = logging.getLogger(__name__)
-
-# FRED series for the risk-free rate (3-month T-bill yield)
-_FRED_SERIES = "DGS3MO"
-_FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
-_FRED_FALLBACK_RATE = 0.05  # 5% default if FRED unreachable
 
 
 _POLYMARKET_ADAPTER = PolymarketAdapter()
@@ -95,43 +85,3 @@ class MarketDataTools:
         """Fetch macro indicators used by regime detection."""
 
         return await _POLYMARKET_ADAPTER.get_recession_probability()
-
-    async def get_risk_free_rate(self) -> float:
-        """Return the current annualised risk-free rate from FRED (DGS3MO).
-
-        Falls back to ``_FRED_FALLBACK_RATE`` (5%) if the API key is missing
-        or the request fails so that callers always receive a usable float.
-
-        Set ``FRED_API_KEY`` in ``.env`` to enable live data:
-          https://fred.stlouisfed.org/docs/api/api_key.html  (free)
-        """
-        api_key = os.getenv("FRED_API_KEY", "")
-        if not api_key:
-            logger.debug("FRED_API_KEY not set — using fallback rate %.0f%%", _FRED_FALLBACK_RATE * 100)
-            return _FRED_FALLBACK_RATE
-
-        try:
-            params = {
-                "series_id": _FRED_SERIES,
-                "api_key": api_key,
-                "file_type": "json",
-                "limit": 1,
-                "sort_order": "desc",
-                "observation_start": "2020-01-01",
-            }
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(_FRED_BASE_URL, params=params)
-                resp.raise_for_status()
-                data = resp.json()
-            observations: list[dict] = data.get("observations", [])
-            if not observations:
-                return _FRED_FALLBACK_RATE
-            raw_value = observations[0].get("value", ".")
-            if raw_value in (".", "", None):
-                # FRED uses "." for missing observations on weekends/holidays
-                return _FRED_FALLBACK_RATE
-            # FRED returns the yield in percentage points (e.g. 5.25 = 5.25%)
-            return float(raw_value) / 100.0
-        except Exception as exc:
-            logger.warning("FRED request failed (%s) — using fallback %.0f%%", exc, _FRED_FALLBACK_RATE * 100)
-            return _FRED_FALLBACK_RATE
