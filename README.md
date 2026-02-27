@@ -79,8 +79,27 @@ Integration tests (require credentials/network):
 - `adapters/`: broker and data-source adapters (`IBKRAdapter`, `TastytradeAdapter`, `PolymarketAdapter`)
 - `agent_tools/`: portfolio and market analytics logic
 - `risk_engine/`: regime model and threshold detection
-- `dashboard/`: Streamlit UI
+- `dashboard/`: Streamlit UI including **Trade Proposer Queue** panel
+- `agents/trade_proposer.py`: async 300s monitoring loop — detects Greek breaches and generates top-3 hedge proposals
+- `agents/proposer_engine.py`: `RiskRegimeLoader`, `BreachDetector`, `CandidateGenerator`, `ProposerEngine`
+- `models/proposed_trade.py`: SQLModel ORM for `proposed_trades` table
 - `specs/001-portfolio-risk-manager/`: feature specs and implementation tasks
+- `specs/006-trade-proposer/`: Feature 006 Trade Proposer specs, plan, tasks
+
+### Feature 006: Trade Proposer
+
+Every 300 s the agent:
+1. Fetches live Greeks from IBKR (or uses `MOCK_BREACH=TRUE` synthetic breach for CI)
+2. Detects regime-adjusted limit breaches via `BreachDetector` → `config/risk_matrix.yaml`
+3. Generates SPX/SPY/ES option candidates (bear put spreads, calendar spreads)
+4. Scores by capital efficiency: `risk_reduction / (max(margin, 1) + n_legs × 0.65)`
+5. Persists top-3 to `proposed_trades` table (prior Pending rows → Superseded)
+6. Fires Telegram alert when `efficiency_score > PROPOSER_NOTIFY_THRESHOLD` or `regime == crisis_mode`
+
+```bash
+# CI smoke test (no gateway needed)
+MOCK_BREACH=TRUE python -m agents.trade_proposer --run-once
+```
 
 ## Security Notes
 

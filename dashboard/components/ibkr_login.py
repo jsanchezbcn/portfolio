@@ -68,7 +68,13 @@ def render_ibkr_login_button(adapter=None) -> None:
     """
     Render the 'Sign in to IBKR' button in the Streamlit sidebar.
     Handles the full auto-login lifecycle.
+    Not applicable in SOCKET (TWS) mode — returns immediately.
     """
+    import os as _os
+    _mode = _os.getenv("IB_API_MODE", "PORTAL").split("#")[0].strip().upper()
+    if _mode == "SOCKET":
+        return  # TWS socket mode — portal login not applicable; hide all portal UI
+
     # ── Poll status file → session_state ──────────────────────────────────────
     file_status, file_message = _poll_status_file()
     if file_status:

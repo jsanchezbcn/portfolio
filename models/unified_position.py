@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Literal, Optional
 
@@ -49,7 +49,7 @@ class UnifiedPosition(BaseModel):
     # Used to look up live greeks via marketdata/snapshot without re-fetching positions.
     broker_id: str | None = None
 
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @model_validator(mode="after")
     def validate_option_fields(self) -> "UnifiedPosition":

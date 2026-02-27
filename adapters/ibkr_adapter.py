@@ -14,54 +14,10 @@ from ibkr_portfolio_client import IBKRClient
 from models.order import PortfolioGreeks
 from models.unified_position import InstrumentType, UnifiedPosition
 from risk_engine.beta_weighter import BetaWeighter
-from core.event_bus import get_event_bus
 import json
 import ssl
 
 LOGGER = logging.getLogger(__name__)
-
-class IBKRWebSocketClient:
-    """
-    Basic WebSocket client for IBKR CPAPI.
-    Connects to wss://localhost:5001/v1/api/ws and publishes updates to EventBus.
-    """
-    def __init__(self, base_url: str = "wss://localhost:5001/v1/api/ws"):
-        self.base_url = base_url
-        self._running = False
-        self._ws = None
-
-    async def start(self):
-        import websockets
-        self._running = True
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        
-        try:
-            async with websockets.connect(self.base_url, ssl=ssl_context) as ws:
-                self._ws = ws
-                LOGGER.info("Connected to IBKR WebSocket")
-                
-                # Send initial session message
-                await ws.send(json.dumps({"session": "portfolio_ws"}))
-                
-                while self._running:
-                    msg = await ws.recv()
-                    data = json.loads(msg)
-                    
-                    # Publish to event bus
-                    event_bus = get_event_bus()
-                    if event_bus._running:
-                        await event_bus.publish("market_data", data)
-                        
-        except Exception as e:
-            LOGGER.error(f"IBKR WebSocket error: {e}")
-            self._running = False
-
-    async def stop(self):
-        self._running = False
-        if self._ws:
-            await self._ws.close()
 
 class IBKRAdapter(BrokerAdapter):
     """IBKR-backed adapter that normalizes positions and enriches Greeks."""
@@ -106,7 +62,32 @@ class IBKRAdapter(BrokerAdapter):
         try:
             raw_positions = await asyncio.to_thread(self.client.get_positions, account_id)
         except Exception as exc:
+            if _api_mode != "SOCKET":
+                LOGGER.warning(
+                    "Client Portal positions failed for %s (%s); attempting TWS socket fallback",
+                    account_id,
+                    exc,
+                )
+                try:
+                    socket_positions = await self._fetch_positions_via_tws_socket(account_id)
+                    if socket_positions:
+                        return socket_positions
+                except Exception as socket_exc:
+                    LOGGER.warning("TWS socket fallback positions failed: %s", socket_exc)
             raise ConnectionError(f"Unable to fetch IBKR positions for account {account_id}.") from exc
+
+        if _api_mode != "SOCKET" and not raw_positions:
+            try:
+                socket_positions = await self._fetch_positions_via_tws_socket(account_id)
+                if socket_positions:
+                    LOGGER.info(
+                        "Client Portal returned 0 positions for %s; using %d TWS socket positions",
+                        account_id,
+                        len(socket_positions),
+                    )
+                    return socket_positions
+            except Exception as socket_exc:
+                LOGGER.debug("TWS socket fallback after empty portal positions failed: %s", socket_exc)
 
         transformed: list[UnifiedPosition] = []
 
@@ -181,31 +162,23 @@ class IBKRAdapter(BrokerAdapter):
             _api_mode = os.getenv("IB_API_MODE", "PORTAL").split("#")[0].strip().upper()
             if _api_mode == "SOCKET":
                 # TWS socket mode: use ib_async modelGreeks instead of Client Portal
-                # snapshot REST API (which returns 401/400 when portal is not authenticated).
+                # snapshot REST API (which returns 401/400 or 429 when portal is not authenticated).
                 # Pass full position objects so contracts can be built from metadata.
                 try:
                     _ibkr_greeks = await self._fetch_greeks_via_tws_socket(_options_needing_greeks)
                 except Exception as _exc:
                     LOGGER.warning("TWS socket greeks batch failed: %s", _exc)
                     _ibkr_greeks = {}
-                # Fallback for contracts still missing modelGreeks (common on some equity options).
-                # If Client Portal is authenticated, snapshot greeks can fill the remainder.
-                _remaining_conids = [
-                    conid for _, conid in _options_needing_greeks if conid not in _ibkr_greeks
-                ]
-                if _remaining_conids:
-                    try:
-                        _snapshot_greeks = await asyncio.to_thread(
-                            self.client.get_market_greeks_batch, _remaining_conids
-                        )
-                        if _snapshot_greeks:
-                            _ibkr_greeks.update(_snapshot_greeks)
-                    except Exception as _exc:
-                        LOGGER.debug(
-                            "IBKR snapshot fallback unavailable for %d contracts: %s",
-                            len(_remaining_conids),
-                            _exc,
-                        )
+                # NOTE: Client Portal snapshot fallback intentionally disabled in SOCKET mode.
+                # Hitting localhost:5001 in socket mode causes 429 rate-limit errors that
+                # blow the 35s timeout before SPX price can be fetched.
+                # Positions missing modelGreeks from TWS will fall through to the
+                # Tastytrade path below (or remain without Greeks in IBKR-only mode).
+                _remaining_conids: list[int] = []
+                LOGGER.debug(
+                    "SOCKET mode: TWS modelGreeks enriched %d/%d options (no Portal fallback)",
+                    len(_ibkr_greeks), len(_options_needing_greeks),
+                )
             else:
                 try:
                     _ibkr_greeks = await asyncio.to_thread(
@@ -214,6 +187,21 @@ class IBKRAdapter(BrokerAdapter):
                 except Exception as _exc:
                     LOGGER.warning("IBKR snapshot greeks batch failed: %s", _exc)
                     _ibkr_greeks = {}
+                _remaining_pairs = [
+                    (pos, conid) for pos, conid in _options_needing_greeks if conid not in _ibkr_greeks
+                ]
+                if _remaining_pairs:
+                    try:
+                        _socket_greeks = await self._fetch_greeks_via_tws_socket(_remaining_pairs)
+                        if _socket_greeks:
+                            _ibkr_greeks.update(_socket_greeks)
+                            LOGGER.info(
+                                "TWS socket fallback enriched %d/%d remaining options after Client Portal snapshot",
+                                len(_socket_greeks),
+                                len(_remaining_pairs),
+                            )
+                    except Exception as _exc:
+                        LOGGER.debug("TWS socket fallback for portal greeks failed: %s", _exc)
             for pos, cid in _options_needing_greeks:
                 g = _ibkr_greeks.get(cid)
                 if not g:
@@ -246,18 +234,70 @@ class IBKRAdapter(BrokerAdapter):
             "tws_socket" if os.getenv("IB_API_MODE", "PORTAL").split("#")[0].strip().upper() == "SOCKET" else "ibkr_snapshot",
         )
 
+        def _derive_spx_proxy_from_positions(_positions: list[UnifiedPosition]) -> float:
+            """Best-effort SPX proxy using live ES/MES marks from current positions.
+
+            SPX and ES/MES are tightly coupled for portfolio beta-weighted delta.
+            When index market data is unavailable (common IBKR permission edge),
+            use futures marks so risk computation remains actionable.
+            """
+            for _p in _positions:
+                if _p.instrument_type != InstrumentType.FUTURE:
+                    continue
+                _sym = str(_p.symbol or "").upper()
+                if not (_sym.startswith("ES") or _sym.startswith("MES")):
+                    continue
+                _qty = float(_p.quantity or 0.0)
+                _mult = float(_p.contract_multiplier or 0.0)
+                _mv = float(_p.market_value or 0.0)
+                if abs(_qty) > 1e-9 and _mult > 0:
+                    _px = abs(_mv / (_qty * _mult))
+                    if 4000 < _px < 9000:
+                        return float(_px)
+            return 0.0
+
         # Fetch SPX price once for the entire batch (used by BetaWeighter, T016)
+        # In SOCKET mode: request SPX Index via ib_async TWS socket first;
+        # the Client Portal REST path is only tried as a fallback.
+        _api_mode_for_spx = os.getenv("IB_API_MODE", "PORTAL").split("#")[0].strip().upper()
         try:
-            _spx_price_for_batch = await asyncio.to_thread(self.client.get_spx_price)
+            if _api_mode_for_spx == "SOCKET":
+                _spx_price_for_batch = await self._fetch_spx_price_via_tws_socket()
+                if not _spx_price_for_batch or _spx_price_for_batch <= 0:
+                    LOGGER.debug("TWS SPX price=0, falling back to client.get_spx_price()")
+                    _spx_price_for_batch = await asyncio.to_thread(self.client.get_spx_price)
+            else:
+                _spx_price_for_batch = await asyncio.to_thread(self.client.get_spx_price)
         except Exception as _exc:
             LOGGER.debug("Could not fetch SPX price for BetaWeighter batch: %s", _exc)
             _spx_price_for_batch = 0.0
+
+        # Final fallback: derive SPX proxy from ES/MES futures marks in current positions.
+        if not _spx_price_for_batch or float(_spx_price_for_batch) <= 0:
+            _proxy_spx = _derive_spx_proxy_from_positions(positions)
+            if _proxy_spx > 0:
+                _spx_price_for_batch = _proxy_spx
+                LOGGER.info("Using ES/MES-derived SPX proxy price: %.2f", _proxy_spx)
+
         _spx_price_candidate = self._safe_optional_float(_spx_price_for_batch)
         _spx_price_for_batch_num = (
             float(_spx_price_candidate)
             if isinstance(_spx_price_candidate, (int, float))
             else 0.0
         )
+        if _spx_price_for_batch_num <= 0:
+            # Keep SPX beta-weighted delta actionable even when live SPX quote fails.
+            _spx_price_for_batch_num = float(getattr(self.client, "spx_price", 0.0) or 0.0)
+        if _spx_price_for_batch_num <= 0:
+            _spx_price_for_batch_num = 6475.0
+
+        # If Tastytrade session is available, let BetaWeighter source live stock betas.
+        try:
+            _tt_session = getattr(getattr(self.client, "options_cache", None), "session", None)
+            if _tt_session is not None and getattr(self._beta_weighter, "_session", None) is None:
+                self._beta_weighter._session = _tt_session
+        except Exception:
+            pass
 
         for position in positions:
             if position.instrument_type == InstrumentType.FUTURE:
@@ -287,6 +327,11 @@ class IBKRAdapter(BrokerAdapter):
                 if _spx_price_for_batch_num > 0 and abs(float(position.quantity or 0.0)) > 1e-9:
                     qty = float(position.quantity)
                     _eq_px = abs(float(position.market_value) / qty) if qty else 0.0
+                    if _eq_px <= 0:
+                        try:
+                            _eq_px = abs(float(getattr(position, "avg_price", 0.0) or 0.0))
+                        except Exception:
+                            _eq_px = 0.0
                     if _eq_px > 0:
                         position.underlying_price = _eq_px
                     bw_result = await self._beta_weighter.compute_spx_equivalent_delta(
@@ -330,34 +375,17 @@ class IBKRAdapter(BrokerAdapter):
                 updated_positions.append(position)
                 continue
 
-            if not position.underlying or not position.expiration or not position.strike or not position.option_type:
+            if not position.expiration or not position.strike or not position.option_type:
                 updated_positions.append(position)
                 continue
 
-            # IBKR-only debug mode: never hit Tastytrade fallback.
-            if self.disable_tasty_cache:
-                cache_miss_count += 1
-                raw_contract_multiplier = self._safe_optional_float(getattr(position, "contract_multiplier", None))
-                contract_multiplier = raw_contract_multiplier if raw_contract_multiplier and raw_contract_multiplier > 0 else 1.0
-                missing_greeks_details.append(
-                    {
-                        "symbol": position.symbol,
-                        "underlying": position.underlying or "",
-                        "expiry": position.expiration.isoformat() if position.expiration else "",
-                        "strike": float(position.strike) if position.strike is not None else None,
-                        "option_type": position.option_type or "",
-                        "quantity": float(position.quantity),
-                        "contract_multiplier": contract_multiplier,
-                        "lookup_candidates": "",
-                        "lookup_used": "",
-                        "reason": "ibkr_no_data_no_fallback",
-                    }
-                )
-                position.greeks_source = "none"
-                updated_positions.append(position)
-                continue
-
+            # When disable_tasty_cache=True (IBKR-only mode), skip the prefetch
+            # cache but still attempt a live Tastytrade fetch as last resort for
+            # positions where IBKR returned no greeks data.
             candidates = self._candidate_tasty_underlyings(position)
+            if not candidates:
+                updated_positions.append(position)
+                continue
             greeks: dict[str, Any] = {"source": "cache_miss"}
             selected_underlying = candidates[0] if candidates else ""
             for tasty_underlying in candidates:
@@ -368,7 +396,7 @@ class IBKRAdapter(BrokerAdapter):
                         position.strike,
                         position.option_type,
                         use_cache=not self.disable_tasty_cache,
-                        force_refresh_on_miss=self.force_refresh_on_miss,
+                        force_refresh_on_miss=self.force_refresh_on_miss or self.disable_tasty_cache,
                     )
                 except Exception as exc:
                     LOGGER.warning("Greeks lookup failed for %s (%s): %s", position.symbol, tasty_underlying, exc)
@@ -720,6 +748,141 @@ class IBKRAdapter(BrokerAdapter):
             )
             return None
 
+    async def _fetch_spx_price_via_tws_socket(self) -> float:
+        """Fetch current SPX index price via ib_async TWS socket.
+
+        Used in SOCKET mode so BetaWeighter delta computation does not rely on
+        Client Portal REST API (which requires portal auth not needed by TWS).
+        Returns 0.0 on any failure; caller should fall back to client.get_spx_price().
+        """
+        try:
+            from ib_async import IB, Contract
+        except ImportError:
+            return 0.0
+
+        host            = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
+        port            = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        client_id       = int(os.getenv("IB_SPX_PRICE_CLIENT_ID", "14"))
+        market_data_type = int(os.getenv("IB_GREEKS_MARKET_DATA_TYPE", "3"))
+
+        ib = IB()
+        try:
+            await ib.connectAsync(host=host, port=port, clientId=client_id)
+            try:
+                ib.reqMarketDataType(market_data_type)
+            except Exception:
+                pass
+
+            spx_contract = Contract(secType="IND", symbol="SPX", exchange="CBOE", currency="USD")
+            ticker = ib.reqMktData(spx_contract, "", False, False)
+
+            # Poll up to 5 s for a valid SPX price
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.3)
+                _last  = getattr(ticker, "last",  None)
+                _close = getattr(ticker, "close", None)
+                _price = _last if (_last and _last > 0) else _close
+                if _price and 4000 < _price < 9_000:
+                    break
+
+            try:
+                ib.cancelMktData(spx_contract)
+            except Exception:
+                pass
+
+            raw_last  = float(getattr(ticker, "last",  0.0) or 0.0)
+            raw_close = float(getattr(ticker, "close", 0.0) or 0.0)
+            price = raw_last if (raw_last > 0) else raw_close
+            if 4000 < price < 9_000:
+                LOGGER.info("SPX price from TWS socket: %.2f", price)
+                # Cache on client so client.get_spx_price() reuses it immediately
+                try:
+                    from datetime import datetime as _dt
+                    self.client.spx_price = price
+                    self.client.spx_price_timestamp = _dt.now()
+                except Exception:
+                    pass
+                return float(price)
+
+        except Exception as exc:
+            LOGGER.debug("TWS socket SPX price fetch failed: %s", exc)
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+        return 0.0
+
+    async def _fetch_account_summary_via_tws_socket(self, account_id: str) -> dict:
+        """Fetch account summary (NLV, margin, buying power) from TWS via ib_async.
+
+        Returns a dict in the same format as IBKRClient.get_account_summary():
+          {tag_lower: {"amount": value_str, "currency": ccy}}
+        so the dashboard _to_float() helper can parse it unchanged.
+        """
+        try:
+            from ib_async import IB
+        except ImportError:
+            LOGGER.warning("ib_async not installed – cannot fetch account summary via TWS socket")
+            return {}
+
+        host = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
+        port = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        client_id = int(os.getenv("IB_ACCT_SUMMARY_CLIENT_ID", "13"))
+
+        ib = IB()
+        result: dict = {}
+        try:
+            await ib.connectAsync(host=host, port=port, clientId=client_id)
+            # Subscribe to account updates and wait for values to arrive
+            await ib.reqAccountUpdatesAsync(account=account_id)
+            await asyncio.sleep(1.5)  # let AccountValue events arrive
+            values = ib.accountValues(account=account_id)
+            for av in values:
+                key = av.tag.lower() if av.tag else ""
+                if key:
+                    result[key] = {"amount": av.value, "currency": av.currency}
+            LOGGER.info(
+                "TWS account summary: fetched %d tags for account %s",
+                len(result), account_id,
+            )
+        except Exception as exc:
+            LOGGER.warning("TWS account summary fetch failed: %s", exc)
+            return {}
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+        return result
+
+    def get_account_summary(self, account_id: str) -> dict:
+        """Sync wrapper: fetch account summary from TWS socket (SOCKET mode) or
+        Client Portal REST (PORTAL mode), with automatic fallback."""
+        _api_mode = os.getenv("IB_API_MODE", "PORTAL").split("#")[0].strip().upper()
+        if _api_mode == "SOCKET":
+            try:
+                summary = asyncio.run(self._fetch_account_summary_via_tws_socket(account_id))
+                if summary:
+                    return summary
+                LOGGER.warning("TWS socket account summary empty; falling back to Client Portal")
+            except RuntimeError:
+                # Already inside a running event loop – use asyncio.to_thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    fut = ex.submit(asyncio.run, self._fetch_account_summary_via_tws_socket(account_id))
+                    try:
+                        summary = fut.result(timeout=20)
+                        if summary:
+                            return summary
+                    except Exception as exc:
+                        LOGGER.warning("TWS socket account summary (thread) failed: %s", exc)
+            except Exception as exc:
+                LOGGER.warning("TWS socket account summary sync failed: %s", exc)
+        # Fall back to Client Portal REST API
+        return self.client.get_account_summary(account_id)
+
     async def _fetch_greeks_via_tws_socket(
         self,
         options: list[tuple["UnifiedPosition", int]],
@@ -802,7 +965,7 @@ class IBKRAdapter(BrokerAdapter):
         host      = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
         port      = int(os.getenv("IB_SOCKET_PORT", "7496"))
         client_id = int(os.getenv("IB_GREEKS_CLIENT_ID", "12"))
-        poll_secs = float(os.getenv("IB_GREEKS_POLL_SECS", "12"))
+        poll_secs = float(os.getenv("IB_GREEKS_POLL_SECS", "45"))
         market_data_type = int(os.getenv("IB_GREEKS_MARKET_DATA_TYPE", "3"))
 
         ib = IB()
@@ -824,6 +987,18 @@ class IBKRAdapter(BrokerAdapter):
                 c = _build_contract(pos, cid)
                 built_contracts.append(c)
                 contract_by_cid[cid] = c
+
+            # Track conids that fired Error 10091 (subscription required) — remove
+            # them from pending immediately so the 45s poll window is not wasted.
+            no_subscription_conids: set[int] = set()
+
+            def _on_error(reqId: int, errorCode: int, errorString: str, contract: Any, *args: Any) -> None:  # noqa: ANN401
+                if errorCode == 10091 and contract is not None:
+                    cid = getattr(contract, "conId", None)
+                    if cid:
+                        no_subscription_conids.add(int(cid))
+
+            ib.errorEvent += _on_error
 
             base_types = [market_data_type, 1, 2, 3, 4]
             requested_types: list[int] = []
@@ -854,8 +1029,11 @@ class IBKRAdapter(BrokerAdapter):
                 pending_idx = set(range(len(tickers)))
                 while pending_idx and loop.time() < deadline:
                     await asyncio.sleep(0.2)
+                    # Remove contracts that got 10091 — no subscription, won't deliver
                     pending_idx = {
-                        i for i in pending_idx if getattr(tickers[i][1], "modelGreeks", None) is None
+                        i for i in pending_idx
+                        if getattr(tickers[i][1], "modelGreeks", None) is None
+                        and tickers[i][0] not in no_subscription_conids
                     }
 
                 resolved: set[int] = set()
@@ -877,6 +1055,16 @@ class IBKRAdapter(BrokerAdapter):
                     enriched += len(resolved)
                     pending_conids -= resolved
 
+                # Drop 10091 contracts from future MDT passes — won't get data without subscription
+                if no_subscription_conids:
+                    dropped = pending_conids & no_subscription_conids
+                    if dropped:
+                        LOGGER.debug(
+                            "Dropping %d conids with Error 10091 (no subscription): will fall through to Tastytrade",
+                            len(dropped),
+                        )
+                        pending_conids -= dropped
+
                 for cid, ticker in tickers:
                     if cid in resolved:
                         try:
@@ -897,8 +1085,9 @@ class IBKRAdapter(BrokerAdapter):
                 )
 
             LOGGER.info(
-                "TWS socket Greeks: %d/%d enriched via modelGreeks",
+                "TWS socket Greeks: %d/%d enriched via modelGreeks%s",
                 enriched, len(active),
+                f", {len(no_subscription_conids)} skipped (Error 10091 – no subscription)" if no_subscription_conids else "",
             )
         except Exception as exc:
             LOGGER.warning("TWS socket Greek fetch failed: %s", exc)
@@ -962,20 +1151,50 @@ class IBKRAdapter(BrokerAdapter):
         """Return candidate underlyings used for Tastytrade Greeks lookup."""
 
         primary = self._resolve_tasty_underlying(position)
-        candidates = [primary]
+        candidates = [primary] if primary else []
 
         base_underlying = str(position.underlying or "").upper().lstrip("/")
+        if base_underlying and base_underlying not in candidates:
+            candidates.append(base_underlying)
         if self._is_futures_option(position) and base_underlying:
             base_candidate = f"/{base_underlying}"
             if base_candidate not in candidates:
                 candidates.append(base_candidate)
 
-        return candidates
+        symbol_text = str(position.symbol or "").upper().strip()
+        if symbol_text:
+            parts = symbol_text.replace("(", " ").replace(")", " ").replace("-", " ").split()
+            if parts:
+                root = parts[0].lstrip("/")
+                if root and root not in candidates:
+                    candidates.append(root)
+                if self._is_futures_option(position):
+                    fut_root = f"/{root}"
+                    if fut_root not in candidates:
+                        candidates.append(fut_root)
+
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for candidate in candidates:
+            normalized = str(candidate or "").strip().upper()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+
+        return deduped
 
     def _resolve_tasty_underlying(self, position: UnifiedPosition) -> str:
         """Map a normalized option position into a Tastytrade underlying symbol."""
 
         underlying = str(position.underlying or "").upper().lstrip("/")
+        if not underlying:
+            symbol_text = str(position.symbol or "").upper().strip()
+            if symbol_text:
+                parts = symbol_text.replace("(", " ").replace(")", " ").replace("-", " ").split()
+                if parts:
+                    underlying = parts[0].lstrip("/")
+
         if not self._is_futures_option(position):
             return underlying
 
@@ -1257,6 +1476,544 @@ class IBKRAdapter(BrokerAdapter):
         position.iv = self._safe_optional_float(payload.get("iv"))
         position.greeks_source = "stock_option_cache"
         return True
+
+    # ─── What-If margin simulation (FR-005 / T005-T006) ─────────────────────
+
+    async def simulate_margin_impact(
+        self,
+        account_id: str,
+        legs: list[dict],
+    ) -> dict[str, float]:
+        """Simulate the margin impact of a multi-leg option combo via What-If.
+
+        Returns a dict with keys:
+            init_margin_change   – Initial Margin delta (positive = increases margin)
+            maint_margin_change  – Maintenance Margin delta
+
+        Dispatches to SOCKET or PORTAL mode based on IB_API_MODE env var.
+
+        Args:
+            account_id: IBKR account ID (e.g. "U1234567").
+            legs: list of leg dicts, each with:
+                  {conId: int, action: "BUY"|"SELL", quantity: int,
+                   exchange: str (optional, default "SMART")}
+
+        Raises:
+            ValueError: if legs is empty.
+            RuntimeError: if the What-If call fails after retries.
+        """
+        if not legs:
+            raise ValueError("simulate_margin_impact requires at least one leg")
+
+        _api_mode = os.getenv("IB_API_MODE", "PORTAL").split("#")[0].strip().upper()
+
+        if _api_mode == "SOCKET":
+            return await self._simulate_margin_impact_socket(account_id, legs)
+        return await self._simulate_margin_impact_portal(account_id, legs)
+
+    async def _simulate_margin_impact_socket(
+        self,
+        account_id: str,
+        legs: list[dict],
+    ) -> dict[str, float]:
+        """SOCKET implementation: uses ib_async whatIfOrder with a Bag contract."""
+        try:
+            from ib_async import IB, Contract, ComboLeg, MarketOrder, Order
+        except ImportError:
+            LOGGER.warning("ib_async not installed – simulate_margin_impact unavailable")
+            return {"init_margin_change": 0.0, "maint_margin_change": 0.0}
+
+        host      = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
+        port      = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        client_id = int(os.getenv("IB_WHATIF_CLIENT_ID", "15"))  # distinct from acct-summary (13)
+
+        ib = IB()
+        try:
+            await ib.connectAsync(host=host, port=port, clientId=client_id, timeout=10.0)
+
+            import asyncio as _asyncio
+
+            if len(legs) == 1:
+                # Single-leg: submit the FOP/OPT contract directly — BAG hangs on WhatIf
+                leg = legs[0]
+                contract = Contract(conId=int(leg["conId"]))
+                contract.exchange = leg.get("exchange", "SMART")
+                _action   = leg["action"].upper()
+                _quantity = int(leg.get("quantity", 1))
+                _limit_price = legs[0].get("limit_price") if legs else None
+                if _limit_price is not None:
+                    from ib_async import LimitOrder as _LimitOrder
+                    order = _LimitOrder(_action, _quantity, lmtPrice=float(_limit_price))
+                else:
+                    order = MarketOrder(_action, _quantity)
+                order.whatIf = True
+            else:
+                # Multi-leg: build a BAG combo contract
+                contract = Contract()
+                contract.symbol   = legs[0].get("symbol", "ES")
+                contract.secType  = "BAG"
+                contract.currency = "USD"
+                _first_sym = str(legs[0].get("symbol", "")).upper()
+                contract.exchange = "CME" if _first_sym in {"ES", "MES"} else "SMART"
+
+                combo_legs: list[ComboLeg] = []
+                for leg in legs:
+                    cl          = ComboLeg()
+                    cl.conId    = int(leg["conId"])
+                    cl.ratio    = int(leg.get("quantity", 1))
+                    cl.action   = leg["action"].upper()
+                    cl.exchange = leg.get("exchange", "SMART")
+                    combo_legs.append(cl)
+
+                contract.comboLegs = combo_legs
+                # Overall order action: SELL if all legs SELL, else BUY
+                _actions = [l["action"].upper() for l in legs]
+                _bag_action = "SELL" if all(a == "SELL" for a in _actions) else "BUY"
+                _bag_price = legs[0].get("limit_price") if legs else None
+                if _bag_price is not None:
+                    from ib_async import LimitOrder as _LimitOrder
+                    order = _LimitOrder(_bag_action, 1, lmtPrice=float(_bag_price))
+                else:
+                    order = MarketOrder(_bag_action, 1)
+                order.whatIf = True
+
+            # Wrap in asyncio timeout so we never hang indefinitely
+            order_state = await _asyncio.wait_for(
+                ib.whatIfOrderAsync(contract, order),
+                timeout=30.0,
+            )
+
+            init_change  = self._safe_float(getattr(order_state, "initMarginChange",  None))
+            maint_change = self._safe_float(getattr(order_state, "maintMarginChange", None))
+            LOGGER.info(
+                "simulate_margin_impact SOCKET: init=%s maint=%s",
+                init_change, maint_change,
+            )
+            return {
+                "init_margin_change":  init_change,
+                "maint_margin_change": maint_change,
+            }
+
+        except Exception as exc:
+            LOGGER.warning(
+                "simulate_margin_impact SOCKET failed: %s: %s",
+                type(exc).__name__, exc,
+            )
+            return {"init_margin_change": 0.0, "maint_margin_change": 0.0}
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+    async def _simulate_margin_impact_portal(
+        self,
+        account_id: str,
+        legs: list[dict],
+    ) -> dict[str, float]:
+        """PORTAL implementation: POST to /v1/api/iserver/account/{acctId}/orders/whatif."""
+        import aiohttp
+        import ssl
+
+        base_url = os.getenv("IBKR_PORTAL_BASE_URL", "https://localhost:5001")
+        url      = f"{base_url}/v1/api/iserver/account/{account_id}/orders/whatif"
+
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode    = ssl.CERT_NONE
+
+        combo_legs_payload = [
+            {
+                "conid":    int(leg["conId"]),
+                "side":     leg["action"].upper(),
+                "quantity": int(leg.get("quantity", 1)),
+            }
+            for leg in legs
+        ]
+
+        payload = {
+            "orders": [
+                {
+                    "conid":        0,
+                    "secType":      "BAG",
+                    "orderType":    "MKT",
+                    "side":         "BUY",
+                    "quantity":     1,
+                    "comboLegs":    combo_legs_payload,
+                    "tif":          "DAY",
+                }
+            ]
+        }
+
+        for attempt in range(3):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url,
+                        json=payload,
+                        ssl=ssl_ctx,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            LOGGER.warning(
+                                "simulate_margin_impact PORTAL HTTP %d (attempt %d): %s",
+                                resp.status, attempt + 1, body[:200],
+                            )
+                            if attempt < 2:
+                                await asyncio.sleep(2 ** attempt)
+                                continue
+                            return {"init_margin_change": 0.0, "maint_margin_change": 0.0}
+                        data = await resp.json(content_type=None)
+                        orders = data if isinstance(data, list) else data.get("orders", [data])
+                        first = orders[0] if orders else {}
+                        init_change  = self._safe_float(first.get("initMarginChange"))
+                        maint_change = self._safe_float(first.get("maintMarginChange"))
+                        LOGGER.info(
+                            "simulate_margin_impact PORTAL: init=%s maint=%s",
+                            init_change, maint_change,
+                        )
+                        return {
+                            "init_margin_change":  init_change,
+                            "maint_margin_change": maint_change,
+                        }
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning(
+                    "simulate_margin_impact PORTAL attempt %d failed: %s",
+                    attempt + 1, exc,
+                )
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+
+        return {"init_margin_change": 0.0, "maint_margin_change": 0.0}
+
+    # ─── Options chain (bid/ask) via TWS ────────────────────────────────────
+
+    async def fetch_option_expirations_tws(
+        self,
+        underlying: str,
+        dte_min: int = 0,
+        dte_max: int = 180,
+    ) -> list[dict[str, Any]]:
+        import math
+
+        _allowlist = {"SPX", "SPY", "ES", "MES", "QQQ", "NDX", "RUT"}
+        if underlying not in _allowlist:
+            return []
+
+        try:
+            from ib_async import IB, Contract
+        except ImportError:
+            LOGGER.warning("ib_async not installed – option chain unavailable")
+            return []
+
+        host = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
+        port = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        client_id = int(os.getenv("IB_CHAIN_CLIENT_ID", "19"))
+        connect_timeout = float(os.getenv("IB_CHAIN_CONNECT_TIMEOUT", "10.0"))
+
+        _spec: dict[str, dict[str, Any]] = {
+            "SPX": {"secType": "IND", "symbol": "SPX", "exchange": "CBOE", "currency": "USD", "undSecType": "IND", "futFopExchange": "", "multiplier": 100},
+            "SPY": {"secType": "STK", "symbol": "SPY", "exchange": "SMART", "currency": "USD", "primaryExch": "ARCA", "undSecType": "STK", "futFopExchange": "", "multiplier": 100},
+            "QQQ": {"secType": "STK", "symbol": "QQQ", "exchange": "SMART", "currency": "USD", "primaryExch": "NASDAQ", "undSecType": "STK", "futFopExchange": "", "multiplier": 100},
+            "NDX": {"secType": "IND", "symbol": "NDX", "exchange": "NASDAQ", "currency": "USD", "undSecType": "IND", "futFopExchange": "", "multiplier": 100},
+            "RUT": {"secType": "IND", "symbol": "RUT", "exchange": "RUSSELL", "currency": "USD", "undSecType": "IND", "futFopExchange": "", "multiplier": 100},
+            "ES": {"secType": "FUT", "symbol": "ES", "exchange": "CME", "currency": "USD", "undSecType": "FUT", "futFopExchange": "CME", "multiplier": 50},
+            "MES": {"secType": "FUT", "symbol": "MES", "exchange": "CME", "currency": "USD", "undSecType": "FUT", "futFopExchange": "CME", "multiplier": 5},
+        }
+
+        spec = dict(_spec[underlying])
+        if underlying in {"ES", "MES"}:
+            today = datetime.utcnow().date()
+            q_months = [3, 6, 9, 12]
+            next_q = next((m for m in q_months if (today.year, m) >= (today.year, today.month)), None)
+            year = today.year if next_q is not None else today.year + 1
+            month = next_q if next_q is not None else 3
+            spec["lastTradeDateOrContractMonth"] = f"{year}{month:02d}"
+
+        ib = IB()
+        try:
+            await ib.connectAsync(host=host, port=port, clientId=client_id, timeout=connect_timeout)
+            base_fields = {
+                k: v for k, v in spec.items()
+                if k in {"secType", "symbol", "exchange", "currency", "lastTradeDateOrContractMonth", "primaryExch"} and v
+            }
+            und_contract = Contract(**base_fields)
+            qualified = await ib.qualifyContractsAsync(und_contract)
+            if not qualified:
+                return []
+            und_conid = qualified[0].conId
+
+            chains = await ib.reqSecDefOptParamsAsync(
+                underlyingSymbol=underlying,
+                futFopExchange=spec.get("futFopExchange", ""),
+                underlyingSecType=spec["undSecType"],
+                underlyingConId=und_conid,
+            )
+            if not chains:
+                return []
+
+            _preferred_exch_map = {
+                "ES": "CME", "MES": "CME",
+                "SPX": "CBOE", "NDX": "CBOE", "RUT": "CBOE",
+            }
+            preferred_exchange = _preferred_exch_map.get(underlying, "SMART")
+            chain = next((c for c in chains if c.exchange == preferred_exchange), chains[0])
+
+            today = datetime.utcnow().date()
+            expiries: list[dict[str, Any]] = []
+            for exp in sorted(chain.expirations):
+                try:
+                    exp_date = datetime.strptime(exp, "%Y%m%d").date()
+                except ValueError:
+                    continue
+                dte = (exp_date - today).days
+                if dte_min <= dte <= dte_max:
+                    expiries.append({
+                        "expiry": exp,
+                        "dte": dte,
+                        "exchange": chain.exchange,
+                        "tradingClass": getattr(chain, "tradingClass", underlying),
+                        "multiplier": int(spec["multiplier"]),
+                    })
+            return expiries
+        except Exception as exc:
+            LOGGER.warning("fetch_option_expirations_tws failed for %s: %s", underlying, exc)
+            return []
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+    async def fetch_option_chain_matrix_tws(
+        self,
+        underlying: str,
+        expiry: str,
+        atm_price: float = 0.0,
+        strikes_each_side: int = 6,
+    ) -> list[dict[str, Any]]:
+        import math
+
+        _allowlist = {"SPX", "SPY", "ES", "MES", "QQQ", "NDX", "RUT"}
+        if underlying not in _allowlist:
+            return []
+
+        try:
+            from ib_async import IB, Contract
+        except ImportError:
+            LOGGER.warning("ib_async not installed – option chain unavailable")
+            return []
+
+        host = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
+        port = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        # Use a distinct client ID for chain-matrix fetches (separate from expiration lookup)
+        client_id = int(os.getenv("IB_CHAIN_MATRIX_CLIENT_ID", os.getenv("IB_CHAIN_CLIENT_ID", "20")))
+        poll_secs = float(os.getenv("IB_CHAIN_POLL_SECS", "4.0"))
+        connect_timeout = float(os.getenv("IB_CHAIN_CONNECT_TIMEOUT", "10.0"))
+
+        _spec: dict[str, dict[str, Any]] = {
+            "SPX": {"secType": "IND", "symbol": "SPX", "exchange": "CBOE", "currency": "USD", "undSecType": "IND", "futFopExchange": "", "multiplier": 100},
+            "SPY": {"secType": "STK", "symbol": "SPY", "exchange": "SMART", "currency": "USD", "primaryExch": "ARCA", "undSecType": "STK", "futFopExchange": "", "multiplier": 100},
+            "QQQ": {"secType": "STK", "symbol": "QQQ", "exchange": "SMART", "currency": "USD", "primaryExch": "NASDAQ", "undSecType": "STK", "futFopExchange": "", "multiplier": 100},
+            "NDX": {"secType": "IND", "symbol": "NDX", "exchange": "NASDAQ", "currency": "USD", "undSecType": "IND", "futFopExchange": "", "multiplier": 100},
+            "RUT": {"secType": "IND", "symbol": "RUT", "exchange": "RUSSELL", "currency": "USD", "undSecType": "IND", "futFopExchange": "", "multiplier": 100},
+            "ES": {"secType": "FUT", "symbol": "ES", "exchange": "CME", "currency": "USD", "undSecType": "FUT", "futFopExchange": "CME", "multiplier": 50},
+            "MES": {"secType": "FUT", "symbol": "MES", "exchange": "CME", "currency": "USD", "undSecType": "FUT", "futFopExchange": "CME", "multiplier": 5},
+        }
+
+        spec = dict(_spec[underlying])
+        if underlying in {"ES", "MES"}:
+            today = datetime.utcnow().date()
+            q_months = [3, 6, 9, 12]
+            next_q = next((m for m in q_months if (today.year, m) >= (today.year, today.month)), None)
+            year = today.year if next_q is not None else today.year + 1
+            month = next_q if next_q is not None else 3
+            spec["lastTradeDateOrContractMonth"] = f"{year}{month:02d}"
+
+        ib = IB()
+        rows: list[dict[str, Any]] = []
+        try:
+            await ib.connectAsync(host=host, port=port, clientId=client_id, timeout=connect_timeout)
+            try:
+                ib.reqMarketDataType(3)
+            except Exception:
+                pass
+
+            base_fields = {
+                k: v for k, v in spec.items()
+                if k in {"secType", "symbol", "exchange", "currency", "lastTradeDateOrContractMonth", "primaryExch"} and v
+            }
+            und_contract = Contract(**base_fields)
+            qualified = await ib.qualifyContractsAsync(und_contract)
+            if not qualified:
+                return []
+            und_conid = qualified[0].conId
+
+            chains = await ib.reqSecDefOptParamsAsync(
+                underlyingSymbol=underlying,
+                futFopExchange=spec.get("futFopExchange", ""),
+                underlyingSecType=spec["undSecType"],
+                underlyingConId=und_conid,
+            )
+            if not chains:
+                return []
+
+            # Pick the most appropriate exchange for each underlying
+            _preferred_exch_map = {
+                "ES": "CME", "MES": "CME",
+                "SPX": "CBOE", "NDX": "CBOE", "RUT": "CBOE",
+            }
+            preferred_exchange = _preferred_exch_map.get(underlying, "SMART")
+            eligible = [c for c in chains if expiry in set(c.expirations)]
+            if not eligible:
+                return []
+            chain = next((c for c in eligible if c.exchange == preferred_exchange), eligible[0])
+
+            strikes_all = sorted(float(s) for s in chain.strikes)
+            if not strikes_all:
+                return []
+            if atm_price <= 0:
+                atm_price = strikes_all[len(strikes_all) // 2]
+
+            atm_idx = min(range(len(strikes_all)), key=lambda i: abs(strikes_all[i] - atm_price))
+            start = max(0, atm_idx - strikes_each_side)
+            end = min(len(strikes_all), atm_idx + strikes_each_side + 1)
+            strikes = strikes_all[start:end]
+            if not strikes:
+                return []
+
+            sec_type_opt = "FOP" if underlying in {"ES", "MES"} else "OPT"
+            opt_exchange = "CME" if underlying in {"ES", "MES"} else "SMART"
+            trading_class = getattr(chain, "tradingClass", None) or underlying
+            multiplier = int(spec["multiplier"])
+
+            contracts = []
+            for strike in strikes:
+                for right in ("P", "C"):
+                    contracts.append(
+                        Contract(
+                            secType=sec_type_opt,
+                            symbol=underlying,
+                            lastTradeDateOrContractMonth=expiry,
+                            strike=float(strike),
+                            right=right,
+                            exchange=opt_exchange,
+                            currency="USD",
+                            multiplier=str(multiplier),
+                            tradingClass=trading_class,
+                        )
+                    )
+
+            qualified_opts = await ib.qualifyContractsAsync(*contracts)
+            if not qualified_opts:
+                return []
+
+            ticker_map: list[tuple[Any, Any]] = []
+            for contract in qualified_opts:
+                ticker = ib.reqMktData(contract, "", snapshot=True)
+                ticker_map.append((contract, ticker))
+
+            await asyncio.sleep(poll_secs)
+            exp_date = datetime.strptime(expiry, "%Y%m%d").date()
+            today = datetime.utcnow().date()
+            dte = (exp_date - today).days
+
+            for contract, ticker in ticker_map:
+                raw_bid = getattr(ticker, "bid", None)
+                raw_ask = getattr(ticker, "ask", None)
+                raw_last = getattr(ticker, "last", None)
+                bid = float(raw_bid) if raw_bid is not None and not math.isnan(float(raw_bid)) and float(raw_bid) > 0 else 0.0
+                ask = float(raw_ask) if raw_ask is not None and not math.isnan(float(raw_ask)) and float(raw_ask) > 0 else 0.0
+                last = float(raw_last) if raw_last is not None and not math.isnan(float(raw_last)) and float(raw_last) > 0 else 0.0
+                mid = round((bid + ask) / 2, 4) if bid > 0 and ask > 0 else (ask or bid or last)
+
+                greeks = (
+                    getattr(ticker, "modelGreeks", None)
+                    or getattr(ticker, "bidGreeks", None)
+                    or getattr(ticker, "askGreeks", None)
+                    or getattr(ticker, "lastGreeks", None)
+                )
+
+                rows.append({
+                    "conId": int(getattr(contract, "conId", 0) or 0),
+                    "symbol": underlying,
+                    "strike": float(contract.strike),
+                    "right": str(contract.right),
+                    "expiry": expiry,
+                    "dte": int(dte),
+                    "bid": float(bid),
+                    "ask": float(ask),
+                    "last": float(last),
+                    "mid": float(mid),
+                    "delta": float(getattr(greeks, "delta", 0.0) or 0.0),
+                    "gamma": float(getattr(greeks, "gamma", 0.0) or 0.0),
+                    "theta": float(getattr(greeks, "theta", 0.0) or 0.0),
+                    "vega": float(getattr(greeks, "vega", 0.0) or 0.0),
+                    "iv": float(getattr(greeks, "impliedVol", 0.0) or 0.0),
+                    "multiplier": multiplier,
+                    "tradingClass": trading_class,
+                })
+
+            rows.sort(key=lambda r: (r["strike"], r["right"]))
+            return rows
+        except Exception as exc:
+            LOGGER.warning("fetch_option_chain_matrix_tws failed for %s %s: %s", underlying, expiry, exc)
+            return []
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+    async def fetch_options_chain_tws(
+        self,
+        underlying: str,
+        dte_min: int = 30,
+        dte_max: int = 60,
+        atm_price: float = 0.0,
+        right: str = "P",
+        n_strikes: int = 4,
+    ) -> list[dict]:
+        expirations = await self.fetch_option_expirations_tws(
+            underlying=underlying,
+            dte_min=dte_min,
+            dte_max=dte_max,
+        )
+        if not expirations:
+            return []
+
+        target_dte = (dte_min + dte_max) // 2
+        chosen = min(expirations, key=lambda x: abs(int(x.get("dte", 0)) - target_dte))
+        expiry = str(chosen["expiry"])
+
+        matrix = await self.fetch_option_chain_matrix_tws(
+            underlying=underlying,
+            expiry=expiry,
+            atm_price=atm_price,
+            strikes_each_side=n_strikes,
+        )
+        if not matrix:
+            return []
+
+        out = []
+        for row in matrix:
+            if str(row.get("right", "")).upper() != str(right).upper():
+                continue
+            out.append({
+                "conId": row.get("conId", 0),
+                "symbol": row.get("symbol", underlying),
+                "strike": float(row.get("strike", 0.0)),
+                "right": row.get("right", right),
+                "dte": int(row.get("dte", 0)),
+                "expiry": row.get("expiry", expiry),
+                "bid": float(row.get("bid", 0.0)),
+                "ask": float(row.get("ask", 0.0)),
+                "mid": float(row.get("mid", 0.0)),
+                "multiplier": int(row.get("multiplier", 100)),
+                "tradingClass": row.get("tradingClass", underlying),
+            })
+        return out
 
     @staticmethod
     def _parse_expiration(expiry: str) -> date:

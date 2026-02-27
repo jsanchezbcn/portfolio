@@ -21,14 +21,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _run_async(coro):
-    """Run an async coroutine from a synchronous Streamlit context."""
+    """Run an async coroutine safely from any thread (Streamlit-safe).
+
+    Always delegates to a fresh thread so ``asyncio.run()`` never hits an
+    already-running loop (Tornado/Streamlit keep a loop in the main thread).
+    """
+    import concurrent.futures
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                return pool.submit(asyncio.run, coro).result(timeout=10)
-        return loop.run_until_complete(coro)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result(timeout=10)
     except Exception as exc:
         logger.warning("Async operation failed in trade_journal_view: %s", exc)
         return None

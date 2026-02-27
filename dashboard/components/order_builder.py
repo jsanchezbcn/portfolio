@@ -82,7 +82,11 @@ def render_order_builder(
         Optional ``MarketDataService`` for real-time prices and options chain.
         When ``None``, price-fetch buttons are disabled.
     """
-    with st.expander("📋 Order Builder — Pre-Trade Simulation", expanded=False):
+    _ob_auto_expand = (
+        bool(st.session_state.get("order_prefill_notice"))
+        or bool(st.session_state.pop("ob_force_expand", False))
+    )
+    with st.expander("📋 Order Builder — Pre-Trade Simulation", expanded=_ob_auto_expand):
         if market_data_service is not None:
             st.caption("📡 Market data connected — use 💲 per-leg to fetch live bid/ask/last")
         else:
@@ -118,16 +122,63 @@ def _render_inner(
         )
         st.stop()
 
+    # ── Widget version key (prevents browser-state override on prefill) ──────
+    # Each time a prefill occurs, ob_kver increments. All input widget keys
+    # include this suffix (e.g. "ob_n_legs_3"), so Streamlit treats them as
+    # brand-new widgets — their value= / session_state seed takes effect
+    # instead of the browser's stale widget state.
+    _kver: int = st.session_state.get("ob_kver", 0)
+
     # ── T054: AI suggestion pre-fill ───────────────────────────────────────
     ai_prefill_legs = st.session_state.pop("ai_prefill_legs", None)
     if ai_prefill_legs:
+        _kver += 1
+        st.session_state["ob_kver"] = _kver
         st.session_state[_SS_LEG_COUNT] = len(ai_prefill_legs)
         for i, leg in enumerate(ai_prefill_legs):
             action_val = getattr(getattr(leg, "action", None), "value", "SELL")
-            st.session_state[f"ob_action_{i}"] = action_val
-            st.session_state[f"ob_symbol_{i}"] = getattr(leg, "symbol", "SPX")
-            st.session_state[f"ob_qty_{i}"] = max(1, int(getattr(leg, "quantity", 1)))
+            st.session_state[f"ob_action_{i}_{_kver}"] = action_val
+            st.session_state[f"ob_symbol_{i}_{_kver}"] = getattr(leg, "symbol", "SPX")
+            st.session_state[f"ob_qty_{i}_{_kver}"] = max(1, int(getattr(leg, "quantity", 1)))
         st.info("ℹ️ Order builder pre-filled from AI suggestion. Review legs before simulating.")
+
+    # ── External prefill staging (proposals / arb signals) ────────────────
+    # ob_prefill_data is set by _prefill_order_builder_from_legs in app.py.
+    # We increment _kver so all widget keys change → Streamlit creates fresh
+    # widgets that read from session_state / value= instead of browser state.
+    _prefill_data = st.session_state.pop("ob_prefill_data", None)
+    if _prefill_data:
+        _kver += 1
+        st.session_state["ob_kver"] = _kver
+        n = _prefill_data.get("leg_count", 1)
+        st.session_state[_SS_LEG_COUNT] = n
+        for i, leg in enumerate(_prefill_data.get("legs", [])):
+            st.session_state[f"ob_action_{i}_{_kver}"] = leg.get("action", "BUY")
+            st.session_state[f"ob_symbol_{i}_{_kver}"] = leg.get("symbol", "SPX")
+            st.session_state[f"ob_qty_{i}_{_kver}"] = leg.get("qty", 1)
+            st.session_state[f"ob_conid_{i}_{_kver}"] = leg.get("conid") or leg.get("conId")
+            _itype = leg.get("instrument_type", "Option")
+            st.session_state[f"ob_itype_{i}_{_kver}"] = _itype
+            if _itype == "Option":
+                if leg.get("strike") is not None:
+                    st.session_state[f"ob_strike_{i}_{_kver}"] = float(leg["strike"])
+                if leg.get("right"):
+                    st.session_state[f"ob_right_{i}_{_kver}"] = str(leg["right"]).upper()
+                if leg.get("expiry") is not None:
+                    from datetime import date as _date
+                    raw_exp = leg["expiry"]
+                    if isinstance(raw_exp, str):
+                        try:
+                            st.session_state[f"ob_expiry_{i}_{_kver}"] = _date.fromisoformat(raw_exp[:10])
+                        except ValueError:
+                            pass
+                    elif isinstance(raw_exp, _date):
+                        st.session_state[f"ob_expiry_{i}_{_kver}"] = raw_exp
+        if _prefill_data.get("rationale"):
+            st.session_state[f"ob_rationale_{_kver}"] = _prefill_data["rationale"]
+        if _prefill_data.get("reset_approved"):
+            st.session_state[_SS_APPROVED] = False
+        st.info("📋 Order pre-filled from proposal/signal — review legs, simulate, then approve.")
 
     # ── Leg count + order type ─────────────────────────────────────────────
     if _SS_LEG_COUNT not in st.session_state:
@@ -141,7 +192,7 @@ def _render_inner(
             max_value=_MAX_LEGS,
             value=st.session_state[_SS_LEG_COUNT],
             step=1,
-            key="ob_n_legs_input",
+            key=f"ob_n_legs_{_kver}",
         )
         st.session_state[_SS_LEG_COUNT] = n_legs
 
@@ -166,22 +217,22 @@ def _render_inner(
         with c1:
             action_str = st.selectbox(
                 "Action", ["SELL", "BUY"],
-                key=f"ob_action_{i}", label_visibility="collapsed",
+                key=f"ob_action_{i}_{_kver}", label_visibility="collapsed",
             )
         with c2:
             symbol = st.text_input(
                 "Symbol", value="SPX",
-                key=f"ob_symbol_{i}", label_visibility="collapsed",
+                key=f"ob_symbol_{i}_{_kver}", label_visibility="collapsed",
             )
         with c3:
             qty = st.number_input(
                 "Qty", min_value=1, value=1, step=1,
-                key=f"ob_qty_{i}", label_visibility="collapsed",
+                key=f"ob_qty_{i}_{_kver}", label_visibility="collapsed",
             )
         with c4:
             instrument_type = st.selectbox(
                 "Type", ["Option", "Stock/ETF", "Future"],
-                key=f"ob_itype_{i}", label_visibility="collapsed",
+                key=f"ob_itype_{i}_{_kver}", label_visibility="collapsed",
             )
 
         # Row 2: option-specific fields + real-time price (T-RT4)
@@ -194,7 +245,7 @@ def _render_inner(
             if instrument_type == "Option":
                 strike = st.number_input(
                     "Strike", value=5000.0, step=50.0,
-                    key=f"ob_strike_{i}", label_visibility="collapsed",
+                    key=f"ob_strike_{i}_{_kver}", label_visibility="collapsed",
                 )
                 has_option_legs = True
             else:
@@ -204,7 +255,7 @@ def _render_inner(
             if instrument_type == "Option":
                 right_val = st.selectbox(
                     "Call/Put", ["CALL", "PUT"],
-                    key=f"ob_right_{i}", label_visibility="collapsed",
+                    key=f"ob_right_{i}_{_kver}", label_visibility="collapsed",
                 )
             else:
                 st.empty()
@@ -213,7 +264,7 @@ def _render_inner(
             if instrument_type in ("Option", "Future"):
                 expiry = st.date_input(
                     "Expiry", value=date.today(),
-                    key=f"ob_expiry_{i}", label_visibility="collapsed",
+                    key=f"ob_expiry_{i}_{_kver}", label_visibility="collapsed",
                 )
             else:
                 st.empty()
@@ -230,6 +281,7 @@ def _render_inner(
             "action": action_str,
             "symbol": symbol,
             "qty": int(qty),
+            "conid": st.session_state.get(f"ob_conid_{i}_{_kver}"),
             "instrument_type": instrument_type,
             "strike": strike,
             "right": right_val,
@@ -246,7 +298,7 @@ def _render_inner(
     user_rationale = st.text_area(
         "Trade rationale (optional)",
         placeholder="e.g. Rolling short put up to collect more credit …",
-        key="ob_rationale",
+        key=f"ob_rationale_{_kver}",
         height=70,
     )
 
@@ -719,6 +771,7 @@ def _build_order(
                 option_right=right,
                 strike=cfg.get("strike"),
                 expiration=cfg.get("expiry"),
+                conid=str(cfg.get("conid")) if cfg.get("conid") not in (None, "") else None,
             )
         )
 

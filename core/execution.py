@@ -22,6 +22,7 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -146,6 +147,12 @@ class ExecutionEngine:
             Risk regime key from ``risk_matrix.yaml`` used for delta-breach check.
             Defaults to ``"neutral_volatility"``.
         """
+        _api_mode = os.getenv("IB_API_MODE", "PORTAL").split("#")[0].strip().upper()
+
+        # SOCKET mode: use ib_async WhatIf path through IBKRAdapter to avoid CP 401s.
+        if _api_mode == "SOCKET":
+            return self._simulate_via_socket(account_id, order, current_portfolio_greeks, regime)
+
         url = (
             f"{self._client.base_url}"
             f"/v1/api/iserver/account/{account_id}/orders/whatif"
@@ -168,6 +175,9 @@ class ExecutionEngine:
 
         # ── HTTP status check ────────────────────────────────────────────────
         if resp.status_code != 200:
+            if resp.status_code == 401:
+                logger.warning("WhatIf returned 401 in portal path; trying SOCKET fallback")
+                return self._simulate_via_socket(account_id, order, current_portfolio_greeks, regime)
             logger.warning(
                 "WhatIf HTTP %s (account=%s): %.200s",
                 resp.status_code,
@@ -231,6 +241,173 @@ class ExecutionEngine:
         order.simulation_result = result
 
         return result
+
+    def _simulate_via_socket(
+        self,
+        account_id: str,
+        order: Order,
+        current_portfolio_greeks: PortfolioGreeks,
+        regime: str,
+    ) -> SimulationResult:
+        """Simulate margin impact via ib_async socket path (WhatIf fallback)."""
+        try:
+            from adapters.ibkr_adapter import IBKRAdapter
+
+            socket_legs: list[dict] = []
+            unresolved_legs: list[dict] = []
+            for leg in order.legs:
+                _sym = str(leg.symbol).upper()
+                _is_fut_opt = _sym in {"ES", "MES"}  # futures options → FOP on CME
+                _leg_exchange = "CME" if _is_fut_opt else "SMART"
+                if leg.conid:
+                    socket_legs.append(
+                        {
+                            "conId": int(leg.conid),
+                            "action": leg.action.value,
+                            "quantity": int(leg.quantity),
+                            "exchange": _leg_exchange,
+                            "symbol": _sym,
+                        }
+                    )
+                else:
+                    # Resolve field names from OrderLeg dataclass correctly
+                    _option_right = getattr(leg, "option_right", None)  # OptionRight enum
+                    _right_str = ""
+                    if _option_right is not None:
+                        _rv = getattr(_option_right, "value", str(_option_right))
+                        _right_str = "P" if str(_rv).upper() in {"P", "PUT"} else "C" if str(_rv).upper() in {"C", "CALL"} else str(_rv).upper()
+                    _expiration = getattr(leg, "expiration", None)  # date object
+                    _expiry_str = _expiration.strftime("%Y%m%d") if _expiration else ""
+                    _sec_type = "FOP" if _is_fut_opt and leg.strike else ("OPT" if leg.strike else "STK")
+                    _multiplier = "50" if _sym == "ES" else "5" if _sym == "MES" else "100"
+                    # Build a descriptor suitable for auto-qualification
+                    unresolved_legs.append(
+                        {
+                            "action": leg.action.value,
+                            "quantity": int(leg.quantity),
+                            "symbol": _sym,
+                            "secType": _sec_type,
+                            "strike": float(leg.strike or 0),
+                            "right": _right_str,
+                            "expiry": _expiry_str,
+                            "multiplier": _multiplier,
+                            "exchange": _leg_exchange,
+                        }
+                    )
+
+            # Auto-qualify unresolved legs via ib_async to obtain conIds
+            if unresolved_legs:
+                logger.info(
+                    "WhatIf: auto-qualifying %d leg(s) with missing conids via TWS",
+                    len(unresolved_legs),
+                )
+
+                async def _qualify_legs(legs_to_qualify):
+                    """Connect to TWS, qualify contracts, return conId list."""
+                    import os
+                    from datetime import datetime as _dt
+                    from ib_async import IB, Contract
+
+                    host = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
+                    port = int(os.getenv("IB_SOCKET_PORT", "7496"))
+                    client_id = int(os.getenv("IB_WHATIF_CLIENT_ID", "15"))  # distinct from acct-summary (13)
+                    ib = IB()
+                    try:
+                        await ib.connectAsync(host=host, port=port, clientId=client_id, timeout=10.0)
+                        contracts = []
+                        for linfo in legs_to_qualify:
+                            sym = linfo["symbol"].upper()
+                            sec_type = linfo.get("secType", "OPT")
+                            right = linfo.get("right", "")
+                            expiry = linfo.get("expiry", "")
+                            strike = linfo.get("strike", 0)
+                            exc = linfo.get("exchange", "SMART")
+                            multiplier = linfo.get("multiplier", "100")
+                            if sec_type in {"OPT", "FOP"} and strike and right and expiry:
+                                contract_kwargs = dict(
+                                    secType=sec_type,
+                                    symbol=sym,
+                                    lastTradeDateOrContractMonth=expiry,
+                                    strike=float(strike),
+                                    right=right,
+                                    exchange=exc,
+                                    currency="USD",
+                                    multiplier=str(multiplier),
+                                )
+                                # For FOP (ES/MES), set tradingClass to match symbol
+                                if sec_type == "FOP":
+                                    contract_kwargs["tradingClass"] = sym
+                                contracts.append(Contract(**contract_kwargs))
+                            else:
+                                contracts.append(
+                                    Contract(secType="STK", symbol=sym, exchange="SMART", currency="USD")
+                                )
+                        qualified = await ib.qualifyContractsAsync(*contracts) if contracts else []
+                        return [c.conId for c in qualified if c is not None]
+                    finally:
+                        try:
+                            ib.disconnect()
+                        except Exception:
+                            pass
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _qual_pool:
+                    try:
+                        conids = _qual_pool.submit(asyncio.run, _qualify_legs(unresolved_legs)).result(timeout=30)
+                        if len(conids) == len(unresolved_legs):
+                            for linfo, conid in zip(unresolved_legs, conids):
+                                if conid:
+                                    socket_legs.append(
+                                        {
+                                            "conId": int(conid),
+                                            "action": linfo["action"],
+                                            "quantity": linfo["quantity"],
+                                            "exchange": linfo.get("exchange", "SMART"),
+                                            "symbol": linfo["symbol"],
+                                        }
+                                    )
+                                else:
+                                    return SimulationResult(error=f"Could not qualify contract for {linfo['symbol']} {linfo.get('right','')} {linfo.get('strike','')} {linfo.get('expiry','')}")
+                        else:
+                            return SimulationResult(
+                                error=f"Contract qualification failed: expected {len(unresolved_legs)} results, got {len(conids)}."
+                            )
+                    except Exception as qual_exc:
+                        return SimulationResult(error=f"Contract qualification error: {qual_exc}")
+
+            if not socket_legs:
+                return SimulationResult(error="Simulation requires at least one leg.")
+
+            # Wire limit price into every socket leg so adapter can build LimitOrder
+            if order.limit_price is not None:
+                for _sl in socket_legs:
+                    _sl["limit_price"] = order.limit_price
+
+            adapter = IBKRAdapter(client=self._client)
+            # Use a dedicated thread so asyncio.run() never hits an "already running" loop
+            # (Streamlit / Tornado keep a loop in the main thread).
+            _socket_coro = adapter._simulate_margin_impact_socket(
+                account_id=account_id, legs=socket_legs
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _sim_pool:
+                impact = _sim_pool.submit(asyncio.run, _socket_coro).result(timeout=60)
+            post_trade_greeks = self._compute_post_trade_greeks(order, current_portfolio_greeks)
+            delta_limit = _load_delta_limit(regime)
+            delta_breach = abs(post_trade_greeks.spx_delta) > delta_limit
+
+            result = SimulationResult(
+                margin_requirement=float(impact.get("init_margin_change") or 0.0),
+                equity_before=None,
+                equity_after=None,
+                post_trade_greeks=post_trade_greeks,
+                delta_breach=delta_breach,
+                error=None,
+            )
+            order.transition_to(OrderStatus.SIMULATED)
+            order.simulation_result = result
+            return result
+        except Exception as exc:
+            logger.warning("SOCKET WhatIf simulation failed: %s", exc)
+            return SimulationResult(error=f"SOCKET simulation failed: {exc}")
 
     # ------------------------------------------------------------------
     # submit() — LIVE ORDER (T030) — REQUIRES HUMAN APPROVAL
@@ -669,6 +846,9 @@ class ExecutionEngine:
                 entry["strike"] = str(leg.strike)
             if leg.option_right is not None:
                 entry["right"] = leg.option_right.value  # "C" or "P"
+            # Include limit price for LIMIT orders
+            if order.order_type.value == "LIMIT" and order.limit_price is not None:
+                entry["price"] = str(round(order.limit_price, 4))
 
             orders_list.append(entry)
 
@@ -707,6 +887,8 @@ class ExecutionEngine:
                 "listingExchange": "SMART",
                 "comboLegs": combo_legs,
             }
+            if order.order_type.value == "LIMIT" and order.limit_price is not None:
+                bag_entry["price"] = str(round(order.limit_price, 4))
             return {"orders": [bag_entry]}
 
         # ── Fallback: individual order per leg (single-leg or no conids) ───────
@@ -724,6 +906,8 @@ class ExecutionEngine:
                 entry["strike"] = str(leg.strike)
             if leg.option_right is not None:
                 entry["right"] = leg.option_right.value
+            if order.order_type.value == "LIMIT" and order.limit_price is not None:
+                entry["price"] = str(round(order.limit_price, 4))
             orders_list.append(entry)
 
         return {"orders": orders_list}

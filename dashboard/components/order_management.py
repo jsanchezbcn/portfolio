@@ -13,6 +13,7 @@ SAFETY CONTRACT
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 import streamlit as st
@@ -81,6 +82,8 @@ def _fetch_open_orders(client: Any, account_id: str) -> list[dict]:
             verify=False,
             timeout=15,
         )
+        if resp.status_code == 401:
+            return _fetch_open_orders_socket(account_id)
         if resp.status_code == 200:
             body = resp.json()
             orders = body.get("orders", []) if isinstance(body, dict) else body
@@ -92,6 +95,8 @@ def _fetch_open_orders(client: Any, account_id: str) -> list[dict]:
                     if str(o.get("account") or o.get("acctId") or "").upper()
                     == account_id.upper()
                 ]
+            if not all_orders:
+                return _fetch_open_orders_socket(account_id)
             return all_orders
         logger.warning(
             "fetch_open_orders HTTP %d: %s", resp.status_code, resp.text[:200]
@@ -100,6 +105,58 @@ def _fetch_open_orders(client: Any, account_id: str) -> list[dict]:
     except Exception as exc:
         logger.warning("fetch_open_orders failed: %s", exc)
         return []
+
+
+def _fetch_open_orders_socket(account_id: str) -> list[dict]:
+    """Fallback open-order fetch using ib_async in SOCKET mode."""
+    try:
+        from ib_async import IB
+    except Exception:
+        return []
+
+    host = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
+    port = int(os.getenv("IB_SOCKET_PORT", "7496"))
+    client_id = int(os.getenv("IB_ORDERS_CLIENT_ID", "18"))
+
+    ib = IB()
+    rows: list[dict] = []
+    try:
+        ib.connect(host=host, port=port, clientId=client_id)
+        trades = ib.openTrades() or []
+        for t in trades:
+            contract = getattr(t, "contract", None)
+            order = getattr(t, "order", None)
+            status_obj = getattr(t, "orderStatus", None)
+            oid = str(getattr(order, "orderId", "") or "")
+            symbol = str(getattr(contract, "symbol", "") or "")
+            side = str(getattr(order, "action", "") or "")
+            qty = float(getattr(order, "totalQuantity", 0) or 0)
+            status = str(getattr(status_obj, "status", "") or "")
+            acct = str(getattr(order, "account", "") or "")
+            if account_id and account_id.lower() != "all" and acct and acct.upper() != account_id.upper():
+                continue
+            rows.append(
+                {
+                    "orderId": oid,
+                    "ticker": symbol,
+                    "side": side,
+                    "quantity": qty,
+                    "status": status,
+                    "account": acct,
+                    "orderType": str(getattr(order, "orderType", "") or ""),
+                    "price": getattr(order, "lmtPrice", None),
+                    "timeInForce": str(getattr(order, "tif", "") or ""),
+                }
+            )
+        return rows
+    except Exception as exc:
+        logger.warning("socket open-orders fallback failed: %s", exc)
+        return []
+    finally:
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
 
 
 def _prime_account_context(client: Any, account_id: str) -> None:

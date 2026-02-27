@@ -132,11 +132,12 @@ def require_auth(handler: Callable) -> Callable:
 # 2.  HELPER — fetch Greeks from IBKR (or last cache) + account net-liq
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _resolve_account_id() -> str:
-    """Return account ID from env, or auto-detect the first IBKR account."""
+async def _resolve_account_ids() -> list[str]:
+    """Return a list of account IDs from env, or all detected IBKR accounts."""
     account_id = os.getenv("IBKR_ACCOUNT_ID", "").strip()
     if account_id:
-        return account_id
+        return [acc.strip() for acc in account_id.split(",") if acc.strip()]
+
     # Auto-detect from IBKR
     try:
         adapter, _, _, _ = _services()
@@ -144,10 +145,10 @@ async def _resolve_account_id() -> str:
             None, adapter.client.get_accounts
         )
         if accounts:
-            return accounts[0] if isinstance(accounts[0], str) else accounts[0].get("id", "")
+            return [(acc if isinstance(acc, str) else acc.get("id", "")) for acc in accounts if acc]
     except Exception:
         pass
-    return ""
+    return []
 
 
 async def _fetch_greeks_summary(account_id: str) -> dict[str, Any]:
@@ -194,7 +195,7 @@ async def _fetch_greeks_summary(account_id: str) -> dict[str, Any]:
     }
 
 
-async def _fetch_regime():
+async def _fetch_regime(account_id: str | None = None):
     """Return (vix_data, regime, violations) tuple."""
     _, portfolio, market_tools, regime_det = _services()
     vix_data = await asyncio.get_event_loop().run_in_executor(
@@ -208,7 +209,10 @@ async def _fetch_regime():
     violations: list[dict] = []
     try:
         # We fetch actual greeks for the primary account if available
-        account_id = await _resolve_account_id()
+        if not account_id:
+            account_ids = await _resolve_account_ids()
+            account_id = account_ids[0] if account_ids else None
+        
         if account_id:
             g = await _fetch_greeks_summary(account_id)
             violations = portfolio.check_risk_limits(g["raw_summary"], regime)
@@ -234,6 +238,7 @@ async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "📊 *Portfolio Risk Bot*\n\n"
+        "/portfolio — Net Liq, Margin, PNL\n"
         "/greeks — Greek totals + net-liq\n"
         "/regime — VIX, active regime, limit check\n"
         "/analyze — AI risk assessment (LLM)\n"
@@ -248,31 +253,80 @@ async def cmd_greeks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Return current Greek totals and account net liquidation."""
     await update.message.reply_text("⏳ Fetching Greeks…")
 
-    account_id = await _resolve_account_id()
-    if not account_id:
+    account_ids = await _resolve_account_ids()
+    if not account_ids:
         await update.message.reply_text(
             "⚠️ Cannot resolve IBKR account. Set IBKR_ACCOUNT_ID in .env or ensure the gateway is running."
         )
         return
 
-    try:
-        g = await _fetch_greeks_summary(account_id)
-    except Exception as exc:
-        await update.message.reply_text(f"❌ Error fetching Greeks: {exc}")
+    for account_id in account_ids:
+        try:
+            g = await _fetch_greeks_summary(account_id)
+        except Exception as exc:
+            await update.message.reply_text(f"❌ Error fetching Greeks for {account_id}: {exc}")
+            continue
+
+        net_liq_str = f"${g['net_liq']:,.2f}" if g["net_liq"] else "_unavailable_"
+        msg = (
+            f"📐 *Greeks — {account_id}*\n\n"
+            f"SPX δ-equiv  `{g['spx_delta']:+.2f}`\n"
+            f"Delta        `{g['delta']:+.2f}`\n"
+            f"Gamma        `{g['gamma']:+.4f}`\n"
+            f"Theta        `{g['theta']:+.2f}` /day\n"
+            f"Vega         `{g['vega']:+.2f}`\n"
+            f"Net Liq      `{net_liq_str}`\n"
+            f"\n_Updated {datetime.now(timezone.utc).strftime('%H:%M UTC')}_"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+@require_auth
+async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Return net liquidity, maintenance margin, and daily PNL."""
+    await update.message.reply_text("⏳ Fetching Portfolio metrics…")
+
+    account_ids = await _resolve_account_ids()
+    if not account_ids:
+        await update.message.reply_text(
+            "⚠️ Cannot resolve IBKR account. Set IBKR_ACCOUNT_ID in .env or ensure the gateway is running."
+        )
         return
 
-    net_liq_str = f"${g['net_liq']:,.2f}" if g["net_liq"] else "_unavailable_"
-    msg = (
-        f"📐 *Greeks — {account_id}*\n\n"
-        f"SPX δ-equiv  `{g['spx_delta']:+.2f}`\n"
-        f"Delta        `{g['delta']:+.2f}`\n"
-        f"Gamma        `{g['gamma']:+.4f}`\n"
-        f"Theta        `{g['theta']:+.2f}` /day\n"
-        f"Vega         `{g['vega']:+.2f}`\n"
-        f"Net Liq      `{net_liq_str}`\n"
-        f"\n_Updated {datetime.now(timezone.utc).strftime('%H:%M UTC')}_"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    for account_id in account_ids:
+        try:
+            adapter, _, _, _ = _services()
+            summary = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: adapter.client.get_account_summary(account_id)
+            )
+            
+            def _fmt(key: str, alternatives: list[str] = None) -> str:
+                keys = [key] + (alternatives or [])
+                val = None
+                for k in keys:
+                    raw = summary.get(k)
+                    if raw is not None:
+                        val = raw.get("amount") if isinstance(raw, dict) else raw
+                        break
+                
+                if val is None: return "N/A"
+                try:
+                    return f"${float(val):,.2f}"
+                except (ValueError, TypeError):
+                    return str(val)
+
+            msg = (
+                f"💼 *Portfolio — {account_id}*\n\n"
+                f"Net Liq      `{_fmt('netliquidation')}`\n"
+                f"Maint Margin `{_fmt('maintmarginreq', ['maintenance'])}`\n"
+                f"Day PNL      `{_fmt('daypnl', ['daily_pnl', 'pnl'])}`\n"
+                f"Unrealized   `{_fmt('unrealizedpnl')}`\n"
+                f"Realized     `{_fmt('realizedpnl')}`\n"
+                f"\n_Updated {datetime.now(timezone.utc).strftime('%H:%M UTC')}_"
+            )
+            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        except Exception as exc:
+            await update.message.reply_text(f"❌ Error fetching Portfolio for {account_id}: {exc}")
 
 
 @require_auth
@@ -314,9 +368,10 @@ async def cmd_analyze(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Trigger LLM risk assessment via Copilot SDK and return result."""
     await update.message.reply_text("🤖 Asking the AI (gpt-4o-mini)…")
 
-    account_id = await _resolve_account_id()
+    account_ids = await _resolve_account_ids()
+    account_id = account_ids[0] if account_ids else None
     try:
-        vix_data, regime, violations = await _fetch_regime()
+        vix_data, regime, violations = await _fetch_regime(account_id)
         greeks_ctx = ""
         if account_id:
             g = await _fetch_greeks_summary(account_id)
@@ -437,36 +492,40 @@ async def _alert_loop(app: Application) -> None:
         if not _is_market_hours():
             continue
 
-        # Only alert if a real account is resolvable
-        account_id = await _resolve_account_id()
-        if not account_id:
+        # Only alert if real accounts are resolvable
+        account_ids = await _resolve_account_ids()
+        if not account_ids:
             continue
 
-        try:
-            vix_data, regime, violations = await _fetch_regime()
-            if not violations:
-                continue
+        for account_id in account_ids:
+            try:
+                # We fetch regime and greeks for this specific account
+                # NOTE: _fetch_regime currently uses account_ids[0] inside its try-block. 
+                # Let's refactor _fetch_regime to optionally take an account_id.
+                vix_data, regime, violations = await _fetch_regime(account_id)
+                if not violations:
+                    continue
 
-            lines = "\n".join(
-                f"  • {v.get('metric','?')}: `{v.get('current',0):+.1f}` (limit `{v.get('limit','?')}`)"
-                for v in violations
-            )
-            msg = (
-                f"🚨 *RISK ALERT — {account_id}*\n\n"
-                f"Regime: `{regime.name}` | VIX: `{vix_data.get('vix', 0):.2f}`\n\n"
-                f"*Limit Breaches:*\n{lines}\n\n"
-                f"_{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
-            )
-            for uid in ALLOWED_TELEGRAM_USERS:
-                await app.bot.send_message(
-                    chat_id=uid,
-                    text=msg,
-                    parse_mode=ParseMode.MARKDOWN,
+                lines = "\n".join(
+                    f"  • {v.get('metric','?')}: `{v.get('current',0):+.1f}` (limit `{v.get('limit','?')}`)"
+                    for v in violations
                 )
-            logger.warning("Alert sent: %d breach(es)", len(violations))
+                msg = (
+                    f"🚨 *RISK ALERT — {account_id}*\n\n"
+                    f"Regime: `{regime.name}` | VIX: `{vix_data.get('vix', 0):.2f}`\n\n"
+                    f"*Limit Breaches:*\n{lines}\n\n"
+                    f"_{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
+                )
+                for uid in ALLOWED_TELEGRAM_USERS:
+                    await app.bot.send_message(
+                        chat_id=uid,
+                        text=msg,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                logger.warning("Alert sent for %s: %d breach(es)", account_id, len(violations))
 
-        except Exception as exc:
-            logger.warning("Alert loop error (non-fatal): %s", exc)
+            except Exception as exc:
+                logger.warning("Alert loop error for %s (non-fatal): %s", account_id, exc)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -480,12 +539,13 @@ def _build_app() -> Application:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",   cmd_help))
-    app.add_handler(CommandHandler("help",    cmd_help))
-    app.add_handler(CommandHandler("greeks",  cmd_greeks))
-    app.add_handler(CommandHandler("regime",  cmd_regime))
-    app.add_handler(CommandHandler("analyze", cmd_analyze))
-    app.add_handler(CommandHandler("journal", cmd_journal))
+    app.add_handler(CommandHandler("start",     cmd_help))
+    app.add_handler(CommandHandler("help",      cmd_help))
+    app.add_handler(CommandHandler("portfolio", cmd_portfolio))
+    app.add_handler(CommandHandler("greeks",    cmd_greeks))
+    app.add_handler(CommandHandler("regime",    cmd_regime))
+    app.add_handler(CommandHandler("analyze",   cmd_analyze))
+    app.add_handler(CommandHandler("journal",   cmd_journal))
     # Catch-all for plain text messages (no command prefix)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_unknown))
 
@@ -501,14 +561,15 @@ async def _run(app: Application) -> None:
     # Register command menu shown in the Telegram UI (the / picker)
     from telegram import BotCommand
     await app.bot.set_my_commands([
-        BotCommand("greeks",  "📐 Greek totals + account net-liq"),
-        BotCommand("regime",  "🌡️ VIX, active regime, limit check"),
-        BotCommand("analyze", "🤖 AI risk assessment (LLM)"),
-        BotCommand("journal", "📓 Append note to trade journal"),
-        BotCommand("help",    "📋 Show all commands"),
+        BotCommand("portfolio", "💼 Net Liq, Margin, PNL"),
+        BotCommand("greeks",    "📐 Greek totals + account net-liq"),
+        BotCommand("regime",    "🌡️ VIX, active regime, limit check"),
+        BotCommand("analyze",   "🤖 AI risk assessment (LLM)"),
+        BotCommand("journal",   "📓 Append note to trade journal"),
+        BotCommand("help",      "📋 Show all commands"),
     ])
     logger.info(
-        "Bot running. Allowed users: %s. Commands: /greeks /regime /analyze /journal /help",
+        "Bot running. Allowed users: %s. Commands: /portfolio /greeks /regime /analyze /journal /help",
         ALLOWED_TELEGRAM_USERS,
     )
 

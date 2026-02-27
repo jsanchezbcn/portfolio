@@ -33,6 +33,22 @@ logger = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
 
+API_MODE_SOCKET = "SOCKET"
+API_MODE_PORTAL = "PORTAL"
+VALID_API_MODES = frozenset({API_MODE_SOCKET, API_MODE_PORTAL})
+
+
+def normalize_api_mode(value: str | None) -> str:
+    """Normalize and validate IB bridge API mode.
+
+    Accepts values with optional inline comments (e.g. "SOCKET # note").
+    Raises ValueError for unsupported modes.
+    """
+    raw_mode = (value or API_MODE_SOCKET).split("#", 1)[0].strip().upper()
+    if raw_mode not in VALID_API_MODES:
+        raise ValueError(f"IB_API_MODE must be 'SOCKET' or 'PORTAL', got {raw_mode!r}")
+    return raw_mode
+
 # ── Watchdog tuning constants ─────────────────────────────────────────────────
 _WATCHDOG_INTERVAL   = 30        # seconds between health checks
 _BACKOFF_SCHEDULE    = (5, 10, 20)   # seconds between reconnect retries
@@ -97,6 +113,10 @@ class IBridgeBase(ABC):
     def is_connected(self) -> bool:
         """Return True if a live session exists."""
 
+    @abstractmethod
+    async def get_recent_executions(self, since: datetime | None = None) -> list[dict]:
+        """Return recent execution rows normalized for persistence."""
+
 
 # ── SOCKET implementation ─────────────────────────────────────────────────────
 
@@ -133,6 +153,38 @@ class SocketBridge(IBridgeBase):
 
     def is_connected(self) -> bool:
         return self._ib.isConnected()
+
+    async def get_recent_executions(self, since: datetime | None = None) -> list[dict]:
+        """Return recent executions from TWS/IB Gateway via ib_async."""
+        try:
+            fills = self._ib.executions()
+        except Exception as exc:
+            logger.warning("Could not read socket executions: %s", exc)
+            return []
+
+        rows: list[dict] = []
+        for fill in fills or []:
+            execution = getattr(fill, "execution", fill)
+            exec_time = getattr(execution, "time", None)
+            if isinstance(exec_time, datetime) and exec_time.tzinfo is None:
+                exec_time = exec_time.replace(tzinfo=timezone.utc)
+            if since is not None and isinstance(exec_time, datetime) and exec_time < since:
+                continue
+            rows.append(
+                {
+                    "broker": "IBKR",
+                    "account_id": getattr(execution, "acctNumber", None),
+                    "broker_execution_id": getattr(execution, "execId", None),
+                    "symbol": getattr(getattr(fill, "contract", None), "localSymbol", None)
+                    or getattr(getattr(fill, "contract", None), "symbol", None),
+                    "side": getattr(execution, "side", None),
+                    "quantity": getattr(execution, "shares", None),
+                    "price": getattr(execution, "price", None),
+                    "commission": getattr(getattr(fill, "commissionReport", None), "commission", None),
+                    "execution_time": exec_time,
+                }
+            )
+        return rows
 
     # ── Greeks ─────────────────────────────────────────────────────────────
 
@@ -242,6 +294,49 @@ class PortalBridge(IBridgeBase):
 
     def is_connected(self) -> bool:
         return self._connected and self._session is not None and not self._session.closed
+
+    async def get_recent_executions(self, since: datetime | None = None) -> list[dict]:
+        """Best-effort: Client Portal execution endpoint varies by gateway build.
+
+        Returns an empty list when unsupported to keep polling resilient.
+        """
+        if not self._session:
+            return []
+
+        url = f"{self._base_url}/v1/api/iserver/account/trades"
+        try:
+            async with self._session.get(url) as resp:
+                if resp.status >= 400:
+                    return []
+                data = await resp.json()
+        except Exception:
+            return []
+
+        rows: list[dict] = []
+        for item in data if isinstance(data, list) else []:
+            trade_time = item.get("tradeTime") or item.get("trade_time")
+            parsed_time: datetime | None = None
+            if isinstance(trade_time, str):
+                try:
+                    parsed_time = datetime.fromisoformat(trade_time.replace("Z", "+00:00"))
+                except ValueError:
+                    parsed_time = None
+            if since is not None and parsed_time is not None and parsed_time < since:
+                continue
+            rows.append(
+                {
+                    "broker": "IBKR",
+                    "account_id": item.get("acctId") or item.get("account"),
+                    "broker_execution_id": item.get("execution_id") or item.get("executionID") or item.get("execId"),
+                    "symbol": item.get("symbol"),
+                    "side": item.get("side"),
+                    "quantity": item.get("size") or item.get("quantity"),
+                    "price": item.get("price"),
+                    "commission": item.get("commission"),
+                    "execution_time": parsed_time,
+                }
+            )
+        return rows
 
     # ── Greeks ─────────────────────────────────────────────────────────────
 
@@ -410,3 +505,9 @@ class Watchdog:
                     "All reconnect attempts exhausted — watchdog will retry next cycle",
                     "error",
                 )
+
+
+def build_bridge_from_env() -> IBridgeBase:
+    """Construct the concrete bridge implementation from `IB_API_MODE`."""
+    mode = normalize_api_mode(os.getenv("IB_API_MODE", API_MODE_SOCKET))
+    return SocketBridge() if mode == API_MODE_SOCKET else PortalBridge()

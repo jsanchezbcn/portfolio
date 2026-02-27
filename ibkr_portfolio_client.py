@@ -1261,6 +1261,29 @@ class IBKRClient:
                         result[int(cid)] = item
             except Exception as exc:
                 logging.warning("IBKR snapshot batch %d failed: %s", i, exc)
+                # A single invalid conid can cause a 400 for the whole batch.
+                # Retry each conid individually so valid symbols still return data.
+                if len(chunk) > 1:
+                    for cid in chunk:
+                        try:
+                            single_resp = self.session.get(
+                                url,
+                                params={"conids": cid, "fields": fields_str},
+                                verify=False,
+                                timeout=10,
+                            )
+                            single_resp.raise_for_status()
+                            single_items = single_resp.json()
+                            for item in single_items:
+                                one_cid = item.get("conid")
+                                if one_cid is not None:
+                                    result[int(one_cid)] = item
+                        except Exception as single_exc:
+                            logging.debug(
+                                "IBKR snapshot single-conid retry failed for %s: %s",
+                                cid,
+                                single_exc,
+                            )
         return result
 
     def get_market_greeks_batch(self, conids: list) -> dict:

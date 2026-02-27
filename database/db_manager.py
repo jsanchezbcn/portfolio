@@ -66,13 +66,18 @@ class DBManager:
                 cls._instance = DBManager()
             return cls._instance
 
+    @staticmethod
+    def _env(key: str, default: str = "") -> str:
+        """Read an env var, stripping inline # comments (e.g. DB_HOST=localhost # note)."""
+        return os.getenv(key, default).split("#")[0].strip()
+
     @property
     def dsn(self) -> str:
-        host = os.getenv("DB_HOST", "localhost")
-        port = os.getenv("DB_PORT", "5432")
-        name = os.getenv("DB_NAME", "portfolio_engine")
-        user = os.getenv("DB_USER", "portfolio")
-        password = os.getenv("DB_PASS", "")
+        host = self._env("DB_HOST", "localhost")
+        port = self._env("DB_PORT", "5432")
+        name = self._env("DB_NAME", "portfolio_engine")
+        user = self._env("DB_USER", "portfolio")
+        password = self._env("DB_PASS", "")
         return f"postgresql://{user}:{password}@{host}:{port}/{name}"
 
     @property
