@@ -55,7 +55,7 @@ class ChainTab(QWidget):
         self._connect_signals()
         # ── Live price refresh timer (visible strikes only) ──
         self._stream_timer = QTimer(self)
-        self._stream_timer.setInterval(15_000)  # 15s refresh
+        self._stream_timer.setInterval(60_000)  # 60s streaming refresh
         self._stream_timer.timeout.connect(self._on_stream_tick)
 
     def _setup_ui(self) -> None:
@@ -91,6 +91,11 @@ class ChainTab(QWidget):
         self._btn_fetch = QPushButton("🔄 Fetch Chain")
         self._btn_fetch.setFixedHeight(30)
         toolbar.addWidget(self._btn_fetch)
+
+        self._btn_clear_reload = QPushButton("⟳ Clear & Reload")
+        self._btn_clear_reload.setFixedHeight(30)
+        self._btn_clear_reload.setToolTip("Cancel streaming, clear cached data, and re-fetch fresh chain data including Greeks")
+        toolbar.addWidget(self._btn_clear_reload)
 
         toolbar.addStretch()
         self._lbl_status = QLabel("Ready")
@@ -171,9 +176,11 @@ class ChainTab(QWidget):
 
         # Start with action buttons disabled until connected
         self._btn_fetch.setEnabled(False)
+        self._btn_clear_reload.setEnabled(False)
 
     def _connect_signals(self) -> None:
         self._btn_fetch.clicked.connect(self._on_fetch)
+        self._btn_clear_reload.clicked.connect(self._on_clear_reload)
         self._table.doubleClicked.connect(self._on_double_click)
         self._table.clicked.connect(self._on_click)  # single-click for leg cart
         self._engine.chain_ready.connect(self._on_chain_ready)
@@ -214,14 +221,28 @@ class ChainTab(QWidget):
     @Slot()
     def _on_connected(self) -> None:
         self._btn_fetch.setEnabled(True)
+        self._btn_clear_reload.setEnabled(True)
         # Auto-load expiries for current underlying
         self._load_expiries()
 
     @Slot()
     def _on_disconnected(self) -> None:
         self._btn_fetch.setEnabled(False)
+        self._btn_clear_reload.setEnabled(False)
         self._cmb_expiry.clear()
         self._stream_timer.stop()
+
+    @Slot()
+    def _on_clear_reload(self) -> None:
+        """Cancel all streaming subscriptions, clear the model, and re-fetch."""
+        self._stream_timer.stop()
+        try:
+            self._engine.cancel_chain_streaming()
+        except Exception:
+            pass
+        self._model.set_data([])
+        self._lbl_status.setText("Reloading…")
+        self._on_fetch()
 
     def _load_expiries(self) -> None:
         """Fetch available expiries from IB and populate the dropdown."""

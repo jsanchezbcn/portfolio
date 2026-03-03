@@ -147,9 +147,9 @@ class MainWindow(QMainWindow):
         self._statusbar.showMessage("Ready — click Connect to start")
 
     def _setup_auto_refresh(self) -> None:
-        """Auto-refresh positions every 30 seconds while connected."""
+        """Auto-refresh positions every 5 minutes while connected."""
         self._refresh_timer = QTimer(self)
-        self._refresh_timer.setInterval(30_000)  # 30s
+        self._refresh_timer.setInterval(300_000)  # 5 min
         self._refresh_timer.timeout.connect(self._on_refresh_all)
 
     def _connect_signals(self) -> None:
