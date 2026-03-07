@@ -309,7 +309,7 @@ class ExecutionEngine:
                     from ib_async import IB, Contract
 
                     host = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
-                    port = int(os.getenv("IB_SOCKET_PORT", "7496"))
+                    port = int(os.getenv("IB_SOCKET_PORT", "4001"))
                     client_id = int(os.getenv("IB_WHATIF_CLIENT_ID", "15"))  # distinct from acct-summary (13)
                     ib = IB()
                     try:

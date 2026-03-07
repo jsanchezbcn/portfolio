@@ -138,7 +138,7 @@ def _render_inner(
         for i, leg in enumerate(ai_prefill_legs):
             action_val = getattr(getattr(leg, "action", None), "value", "SELL")
             st.session_state[f"ob_action_{i}_{_kver}"] = action_val
-            st.session_state[f"ob_symbol_{i}_{_kver}"] = getattr(leg, "symbol", "SPX")
+            st.session_state[f"ob_symbol_{i}_{_kver}"] = getattr(leg, "symbol", "ES")
             st.session_state[f"ob_qty_{i}_{_kver}"] = max(1, int(getattr(leg, "quantity", 1)))
         st.info("ℹ️ Order builder pre-filled from AI suggestion. Review legs before simulating.")
 
@@ -154,7 +154,7 @@ def _render_inner(
         st.session_state[_SS_LEG_COUNT] = n
         for i, leg in enumerate(_prefill_data.get("legs", [])):
             st.session_state[f"ob_action_{i}_{_kver}"] = leg.get("action", "BUY")
-            st.session_state[f"ob_symbol_{i}_{_kver}"] = leg.get("symbol", "SPX")
+            st.session_state[f"ob_symbol_{i}_{_kver}"] = leg.get("symbol", "ES")
             st.session_state[f"ob_qty_{i}_{_kver}"] = leg.get("qty", 1)
             st.session_state[f"ob_conid_{i}_{_kver}"] = leg.get("conid") or leg.get("conId")
             _itype = leg.get("instrument_type", "Option")
@@ -221,7 +221,7 @@ def _render_inner(
             )
         with c2:
             symbol = st.text_input(
-                "Symbol", value="SPX",
+                "Symbol", value="ES",
                 key=f"ob_symbol_{i}_{_kver}", label_visibility="collapsed",
             )
         with c3:

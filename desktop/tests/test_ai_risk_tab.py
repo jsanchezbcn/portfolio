@@ -1,15 +1,34 @@
 """desktop/tests/test_ai_risk_tab.py — Basic tests for AI Risk tab."""
 from __future__ import annotations
 
+from datetime import date
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
-from desktop.ui.ai_risk_tab import AIRiskTab, _get_copilot_account
+from models.order import AITradeSuggestion, OrderAction, OrderLeg
+
+from desktop.ui.ai_risk_tab import AIRiskTab, _default_trades_model, _get_copilot_account
 
 
 class TestAIRiskTab:
     def test_creates_without_crash(self, qtbot, mock_engine):
         tab = AIRiskTab(mock_engine)
         qtbot.addWidget(tab)
+
+    def test_default_model_is_gpt5_mini(self, qtbot, mock_engine, monkeypatch):
+        monkeypatch.delenv("LLM_FAST_MODEL", raising=False)
+        monkeypatch.delenv("LLM_MODEL", raising=False)
+
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        assert tab.current_model == "gpt-5-mini"
+
+    def test_default_model_prefers_fast_model_env(self, monkeypatch):
+        monkeypatch.setenv("LLM_FAST_MODEL", "gpt-4.1")
+        monkeypatch.setenv("LLM_MODEL", "gpt-5")
+
+        assert _default_trades_model() == "gpt-4.1"
 
     def test_default_model_picker_has_entries(self, qtbot, mock_engine):
         tab = AIRiskTab(mock_engine)
@@ -25,6 +44,75 @@ class TestAIRiskTab:
         tab = AIRiskTab(mock_engine)
         qtbot.addWidget(tab)
         assert "WhatIf" in tab._btn_whatif.text()
+
+    def test_build_tools_context_includes_structured_portfolio_state(self, qtbot, mock_engine, monkeypatch):
+        monkeypatch.setenv("GITHUB_COPILOT_ACTIVE_PROFILE", "work")
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+        tab._context = {
+            "summary": {
+                "total_spx_delta": 22.5,
+                "total_theta": 110.0,
+                "total_vega": -450.0,
+                "theta_vega_ratio": -0.24,
+            },
+            "regime_name": "neutral_volatility",
+            "vix": 18.2,
+            "nlv": 250000.0,
+            "violations": [{"metric": "delta", "current": 22.5, "limit": 15.0}],
+            "resolved_limits": {"max_spx_delta_pct_nlv": 0.01},
+            "positions": [
+                {"symbol": "ES", "sec_type": "FOP", "quantity": -1, "expiry": "20260320", "spx_delta": -30.0, "theta": 75.0, "vega": -220.0},
+                {"symbol": "MES", "sec_type": "FOP", "quantity": 2, "expiry": "20260320", "spx_delta": 8.0, "theta": 20.0, "vega": -80.0},
+            ],
+            "open_orders": [{"symbol": "ES"}],
+            "recent_fills": [{"symbol": "MES"}],
+            "order_log": [],
+            "last_prices": {"ES": 5750.25, "VIX": 18.2},
+            "prices": {"ES": {"last": 5750.25}},
+            "account": {"net_liquidation": 250000.0},
+        }
+        tab._suggestions = [
+            AITradeSuggestion(
+                suggestion_id="s1",
+                legs=[OrderLeg(symbol="MES", action=OrderAction.SELL, quantity=1, strike=5800.0, option_right=None, expiration=date(2026, 3, 20))],
+                projected_delta_change=-5.0,
+                projected_theta_cost=-30.0,
+                rationale="Trim delta with MES",
+            )
+        ]
+        mock_engine.chain_snapshot = MagicMock(return_value=[
+            SimpleNamespace(underlying="ES", expiry="20260320", strike=5800.0, right="C", bid=12.0, ask=12.5, delta=0.16)
+        ])
+
+        tools_context, tool_log_lines = tab._build_tools_context()
+
+        assert "tool:get_portfolio_state" in tools_context
+        assert tools_context["tool:get_trades_view_state"]["copilot_profile"] == "work"
+        assert tools_context["tool:get_portfolio_state"]["largest_spx_delta_positions"][0]["symbol"] == "ES"
+        assert tools_context["tool:get_portfolio_state"]["active_chain"]["underlying"] == "ES"
+        assert tools_context["tool:get_portfolio_state"]["current_ai_suggestions"][0]["rationale"] == "Trim delta with MES"
+        assert any("tool:get_portfolio_state" in line for line in tool_log_lines)
+
+    def test_build_chat_request_prioritizes_portfolio_state(self, qtbot, mock_engine):
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+        tab._context = {
+            "summary": {"total_spx_delta": 10.0},
+            "positions": [],
+            "open_orders": [],
+            "recent_fills": [],
+            "order_log": [],
+            "last_prices": {},
+            "prices": {},
+        }
+
+        system, prompt, tools_context, _tool_log_lines = tab._build_chat_request("What should I trade?")
+
+        assert "Prioritize the structured portfolio state summary" in system
+        assert "Portfolio state (prioritize this summary first)" in prompt
+        assert "What should I trade?" in prompt
+        assert "tool:get_portfolio_state" in tools_context
 
 
 class TestGetCopilotAccount:

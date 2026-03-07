@@ -22,26 +22,49 @@ The 193 passing unit tests, the circuit-breaker, the SOCKET/PORTAL toggle, and t
 
 ---
 
+## Runtime Contract Update (2026-03-02)
+
+This repository now runs against **IB Gateway (headless)** with **live streaming Level 1** data.
+
+- **Primary socket target**: `IB_SOCKET_HOST=127.0.0.1`, `IB_SOCKET_PORT=4001`.
+- **Subscription mode**: prefer `ib.reqMktData(..., snapshot=False)` for monitored symbols/options so agents can react on each `ib.waitOnUpdate()` cycle.
+- **Greeks/IV generic ticks**: request `100,101,104,106` for options/FOP subscriptions.
+- **Line-budget policy (100 market-data lines)**:
+  - Prioritize `/ES` and `/MES` plus their active FOP chains.
+  - Subscribe equities only for high-alpha names from sentiment filters.
+  - Unsubscribe stale contracts promptly to avoid line exhaustion.
+- **Regime filter source**: use live `VIX` spot (CBOE index feed) for volatility-gated strategies.
+- **Cost/efficiency guidance**: avoid unnecessary heavyweight polling loops (including broad PnL sweeps) when a streaming ticker path is sufficient.
+
+### Canonical Agent Rules
+
+1. Treat IB Gateway `4001` as the default in code and scripts.
+2. Use continuous ticker subscriptions for execution-sensitive flows.
+3. Persist streaming bid/ask/last + Greeks to PostgreSQL with timestamped ticks.
+4. Keep snapshot requests for one-off UI reads and diagnostics only.
+
+---
+
 ## 1. Critical Issues (Fix First)
 
 ### 1.1 Duplicate IBKRWebSocketClient
 
 Two classes named `IBKRWebSocketClient` exist in the codebase:
 
-| File | Status | Uses |
-|---|---|---|
-| `streaming/ibkr_ws.py` | Production implementation | `core/processor.py → DBManager` |
-| `adapters/ibkr_adapter.py` (lines 23-62) | Dead code / vestigial | Never instantiated anywhere |
+| File                                     | Status                    | Uses                            |
+| ---------------------------------------- | ------------------------- | ------------------------------- |
+| `streaming/ibkr_ws.py`                   | Production implementation | `core/processor.py → DBManager` |
+| `adapters/ibkr_adapter.py` (lines 23-62) | Dead code / vestigial     | Never instantiated anywhere     |
 
 **Action**: Delete the copy in `adapters/ibkr_adapter.py`. It publishes raw JSON to EventBus without normalization and causes import confusion.
 
 ### 1.2 Three Regime-Detection Implementations
 
-| Location | Mechanism | Consumers |
-|---|---|---|
-| `risk_engine/regime_detector.py` — `RegimeDetector` | YAML config, VIX + term_structure | `dashboard/app.py`, tests |
-| `agents/market_intelligence.py` — `MarketIntelligenceAgent._evaluate_regime()` | Hard-coded thresholds (>22 = high vol), publishes REGIME_CHANGED to EventBus | Nothing (no subscribers confirmed active) |
-| `agents/proposer_engine.py` — `RiskRegimeLoader` / `BreachDetector._detect_regime()` | YAML config, VIX + TS + recession_prob scalers | `trade_proposer.py` |
+| Location                                                                             | Mechanism                                                                    | Consumers                                 |
+| ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- | ----------------------------------------- |
+| `risk_engine/regime_detector.py` — `RegimeDetector`                                  | YAML config, VIX + term_structure                                            | `dashboard/app.py`, tests                 |
+| `agents/market_intelligence.py` — `MarketIntelligenceAgent._evaluate_regime()`       | Hard-coded thresholds (>22 = high vol), publishes REGIME_CHANGED to EventBus | Nothing (no subscribers confirmed active) |
+| `agents/proposer_engine.py` — `RiskRegimeLoader` / `BreachDetector._detect_regime()` | YAML config, VIX + TS + recession_prob scalers                               | `trade_proposer.py`                       |
 
 `MarketIntelligenceAgent` uses different thresholds than the YAML (e.g., `VIX > 22` hardcoded vs `VIX >= 25` in YAML `high_volatility`). The three implementations can disagree simultaneously.
 
@@ -56,6 +79,7 @@ This file predates the adapter pattern and contains: HTTP client, authentication
 - `scripts/verify_greeks_accuracy.py`
 
 **Actions**:
+
 1. Extract `IBKRClient` (the REST wrapper around Client Portal) into `adapters/ibkr_client.py`.
 2. Move anything related to Greek computation into `adapters/ibkr_adapter.py`.
 3. Keep `ibkr_portfolio_client.py` as a thin re-export shim until all imports are migrated, then delete.
@@ -63,6 +87,7 @@ This file predates the adapter pattern and contains: HTTP client, authentication
 ### 1.4 `dashboard/app.py` — 1,628-line Streamlit Monolith
 
 `app.py` currently handles:
+
 - Layout and rendering (correct place for Streamlit)
 - Background snapshot threading (`_snapshot_loop`)
 - Job dispatch to `worker_jobs` table
@@ -73,6 +98,7 @@ This file predates the adapter pattern and contains: HTTP client, authentication
 The `_snapshot_loop` thread and adapter setup belong in `workers/` or a dedicated `AppState` service class.
 
 **Actions**:
+
 1. Move `_snapshot_loop` to `workers/portfolio_worker.py` as a new job type (`snapshot`).
 2. Extract rendering sections into `dashboard/components/`: `regime_banner.py`, `greeks_panel.py`, `positions_table.py`.
 3. Introduce a `dashboard/state.py` that holds the `IBKRAdapter`, `MarketDataService`, and `LocalStore` singletons — initialized once in `app.py`, passed to components.
@@ -92,20 +118,22 @@ The `_snapshot_loop` thread and adapter setup belong in `workers/` or a dedicate
 Both patterns start from `start_dashboard.sh` simultaneously, meaning two workers are polling the same `worker_jobs` table while also two agents are trying to run LISTEN/NOTIFY. They don't coordinate. Pattern B agents are never confirmed as consumers of any live data path in the dashboard.
 
 **Action**: Decide on one pattern per concern:
+
 - **CPU-bound / long tasks**: Job queue (Pattern A). Already working well.
 - **Real-time streaming events**: EventBus ONLY when Postgres is confirmed available; add a guard that downgrades gracefully to a no-op log when the connection fails. Or replace the EventBus entirely with in-process `asyncio.Queue` — there is only one process (portfolio_worker) that needs it.
 
 ### 2.2 Dual Database Stack Without Ownership Boundaries
 
-| Store | Tables | Technology |
-|---|---|---|
-| `database/db_manager.py` | `greek_snapshots`, `worker_jobs`, `staged_orders` | asyncpg / PostgreSQL |
-| `database/local_store.py` | `market_intel`, `trade_journal`, `account_snapshots` | aiosqlite / SQLite |
-| `bridge/database_manager.py` | `portfolio_greeks`, `api_logs`, `proposed_trades` | asyncpg / PostgreSQL (via circuit breaker) |
+| Store                        | Tables                                               | Technology                                 |
+| ---------------------------- | ---------------------------------------------------- | ------------------------------------------ |
+| `database/db_manager.py`     | `greek_snapshots`, `worker_jobs`, `staged_orders`    | asyncpg / PostgreSQL                       |
+| `database/local_store.py`    | `market_intel`, `trade_journal`, `account_snapshots` | aiosqlite / SQLite                         |
+| `bridge/database_manager.py` | `portfolio_greeks`, `api_logs`, `proposed_trades`    | asyncpg / PostgreSQL (via circuit breaker) |
 
 The `proposed_trades` table schema lives in `bridge/database_manager.py` but `models/proposed_trade.py` defines it as a SQLModel entity. These can drift.
 
 **Actions**:
+
 1. Document the ownership boundary clearly: SQLite for journal/audit trail (no network dependency), PostgreSQL for real-time telemetry and job coordination.
 2. Consolidate all DDL into a single `database/schema.py` (or Alembic migrations).
 3. Have `bridge/database_manager.py` import the DDL string from `database/schema.py` rather than duplicating it.
@@ -113,6 +141,7 @@ The `proposed_trades` table schema lives in `bridge/database_manager.py` but `mo
 ### 2.3 `BrokerAdapter` ABC Is Underspecified
 
 `adapters/base_adapter.py` defines only two abstract methods: `fetch_positions()` and `fetch_greeks()`. But `IBKRAdapter` has grown to include:
+
 - `fetch_account_summary()`
 - `simulate_margin_impact()` — What-If API (added for Spec 006)
 - `compute_portfolio_greeks()` — delegates to `BetaWeighter`
@@ -125,6 +154,7 @@ None of these are on the `BrokerAdapter` ABC, so type-safe code and mocking are 
 ### 2.4 `IBKRAdapter` Is Doing Too Much (1,780 lines)
 
 The adapter has grown to handle:
+
 - Position fetching (SOCKET and PORTAL paths)
 - Greeks enrichment (TWS socket, Client Portal snapshot, Tastytrade fallback, stock option cache)
 - Beta weighting
@@ -133,6 +163,7 @@ The adapter has grown to handle:
 - Greeks cache persistence to `.stock_option_greeks_cache.json`
 
 **Suggested split**:
+
 ```
 adapters/
   ibkr_positions.py      — fetch_positions() SOCKET + PORTAL
@@ -140,25 +171,27 @@ adapters/
   ibkr_simulation.py     — simulate_margin_impact()
   ibkr_adapter.py        — thin IBKRAdapter that composes the three above
 ```
+
 Each sub-module can be tested in isolation.
 
 ### 2.5 Configuration Is Scattered and Not Type-Safe
 
-| Config source | What it controls |
-|---|---|
+| Config source             | What it controls                                   |
+| ------------------------- | -------------------------------------------------- |
 | `config/risk_matrix.yaml` | Regime limits, VIX scalers, term-structure scalers |
-| `beta_config.json` (root) | Static beta overrides |
-| `.env` | All credentials and feature flags |
-| `agent_config.py` (root) | LLM system prompt + tool schemas |
-| `pytest.ini` | Test configuration |
+| `beta_config.json` (root) | Static beta overrides                              |
+| `.env`                    | All credentials and feature flags                  |
+| `agent_config.py` (root)  | LLM system prompt + tool schemas                   |
+| `pytest.ini`              | Test configuration                                 |
 
 There is no central Pydantic `Settings` model. Each module reads env vars directly with `os.getenv()` scattered across 15+ files. A typo in a variable name silently falls through to a default.
 
 **Action**: Introduce `config/settings.py` using `pydantic-settings`:
+
 ```python
 class Settings(BaseSettings):
     ib_api_mode: Literal["SOCKET", "PORTAL"] = "PORTAL"
-    ib_socket_port: int = 7496
+  ib_socket_port: int = 4001
     db_host: str = "localhost"
     greeks_disable_cache: bool = False
     proposer_interval: int = 300
@@ -166,15 +199,17 @@ class Settings(BaseSettings):
     # ... all env vars in one place
     model_config = SettingsConfigDict(env_file=".env")
 ```
+
 Import `settings` throughout instead of `os.getenv()` with magic strings.
 
 ### 2.6 Inline Comment in `.env` Requires Code Workaround
 
 ```
-IB_API_MODE=SOCKET  # Use TWS/IB Gateway socket on 7496; set to PORTAL to use Client Portal REST
+IB_API_MODE=SOCKET  # Use IB Gateway socket on 4001; set to PORTAL to use Client Portal REST
 ```
 
 Multiple places in the code strip inline comments manually:
+
 ```python
 _api_mode = os.getenv("IB_API_MODE", "PORTAL").split("#")[0].strip().upper()
 ```
@@ -188,6 +223,7 @@ Pydantic `BaseSettings` validators would handle this correctly and eliminate the
 ### 3.1 Root-Level Test Files Outside pytest Discovery Path
 
 `pytest.ini` sets `testpaths = tests agents skills`. These test files are NOT discovered:
+
 - `test_dashboard_playwright.py`
 - `test_dashboard_playwright_2.py` through `_final.py` (6 files)
 - `test_all_news.py`, `test_alpaca_auth.py`, `test_finnhub_alpaca.py`, `test_news_api.py`
@@ -198,6 +234,7 @@ Some of these are exploratory scripts, some are duplicated by `tests/test_dashbo
 ### 3.2 Root-Level Utility Scripts With No Home
 
 The following files at the project root have no clear module home:
+
 - `debug_api.py`, `debug_greeks_cli.py`, `debug_greeks_live.py` → should be in `scripts/`
 - `demo_feature_readiness.py`, `demo_us7_deterministic.py` → one-off demos, should be in `scripts/demos/` or deleted
 - `diagnostic_summary.py` → `scripts/`
@@ -219,9 +256,11 @@ clientportal_latest.gw.zip ← archive
 ### 3.4 `datetime.utcnow()` Deprecation
 
 `models/unified_position.py` line 57 uses:
+
 ```python
 timestamp: datetime = Field(default_factory=datetime.utcnow)
 ```
+
 `datetime.utcnow()` is deprecated in Python 3.12+. Replace with `datetime.now(timezone.utc)`.
 
 ### 3.5 `get_event_bus()` Has a Hidden PostgreSQL Dependency
@@ -256,6 +295,7 @@ Most `__init__.py` files are empty. Packages like `adapters/`, `agents/`, `core/
 ### 4.2 Playwright Tests Have Strict-Mode Failures
 
 From the terminal output, 14 Playwright tests fail due to:
+
 - Multiple matching elements for `get_by_role("button", name="Refresh")` (3 elements)
 - `get_by_role("button", name="🚨 Flatten Risk")` resolves to 2 elements
 - `AttributeError: 'function' object has no attribute 'replace'` for lambda locators
@@ -273,9 +313,11 @@ These need scoped selectors (e.g., `page.locator('[data-testid="stSidebarUserCon
 ### 5.1 Telegram Bot Token Exposed in Terminal History
 
 The terminal context shows:
+
 ```
 bot8503210871:AAEaAn9AQu0yeXto3z10vE3Ag-qFDFC1Aec
 ```
+
 This token is live. **Revoke and rotate it immediately** via BotFather. Ensure `.env` is in `.gitignore` (it should be, but double-check `git log -- .env`).
 
 ### 5.2 SSL Verification Disabled Globally
@@ -284,11 +326,14 @@ This token is live. **Revoke and rotate it immediately** via BotFather. Ensure `
 # ibkr_portfolio_client.py
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 ```
+
 And in `bridge/ib_bridge.py`:
+
 ```python
 ssl_context.check_hostname = False
 ssl_context.verify_mode = ssl.CERT_NONE
 ```
+
 This is acceptable for the localhost Client Portal (uses a self-signed cert), but `disable_warnings` globally silences ALL SSL warnings in the process, including external API calls. Pin the IBKR self-signed cert instead and re-enable warnings for external calls.
 
 ### 5.3 No Input Validation on IBKR API Responses
@@ -308,11 +353,13 @@ The adapter parses raw API responses with `.get()` fallbacks but no schema valid
 ### 6.2 Beta Waterfall Makes Synchronous Outbound HTTP Calls
 
 `BetaWeighter._get_beta_from_ibkr()` makes a synchronous `requests.get()` call to the Client Portal inside an async context:
+
 ```python
 search_resp = session.get(
     f"{base_url}/v1/api/iserver/secdef/search", ...
 )
 ```
+
 This blocks the event loop. Replace with `aiohttp` or run in an executor (`loop.run_in_executor`).
 
 ### 6.3 Snapshot Loop Uses Thread Instead of Async Worker
@@ -389,18 +436,18 @@ The dashboard supports multiple accounts via a selector, but Greeks and risk met
 
 ## 9. Quick Wins (1–2 hours each)
 
-| # | Task | File(s) | Effort |
-|---|------|---------|--------|
-| Q1 | Delete vestigial `IBKRWebSocketClient` in `adapters/ibkr_adapter.py` (lines 23–62) | `adapters/ibkr_adapter.py` | 15 min |
-| Q2 | Replace `datetime.utcnow` → `datetime.now(timezone.utc)` | `models/unified_position.py` | 5 min |
-| Q3 | Move `debug_*.py`, `demo_*.py`, `diagnostic_summary.py` to `scripts/` | root | 15 min |
-| Q4 | Move 11 root-level `test_*.py` files to `tests/` or delete | root | 30 min |
-| Q5 | Delete `clientportal_backup_old/` and `clientportal_latest.gw.zip` from repo | root | 5 min |
-| Q6 | Add `__all__` to `adapters/__init__.py`, `agents/__init__.py`, `models/__init__.py` | `*/___init__.py` | 20 min |
-| Q7 | Add file lock (or use `LocalStore`) for `.stock_option_greeks_cache.json` writes | `adapters/ibkr_adapter.py` | 45 min |
-| Q8 | Pin IBKR cert; re-enable SSL warnings for external APIs | `ibkr_portfolio_client.py` | 30 min |
-| Q9 | Rotate Telegram bot token (security) | BotFather + `.env` | 5 min |
-| Q10 | Add `PROPOSER_DB_URL` to `configs/settings.py` to decouple proposer from `DATABASE_URL` | `agents/trade_proposer.py` | 20 min |
+| #   | Task                                                                                    | File(s)                      | Effort |
+| --- | --------------------------------------------------------------------------------------- | ---------------------------- | ------ |
+| Q1  | Delete vestigial `IBKRWebSocketClient` in `adapters/ibkr_adapter.py` (lines 23–62)      | `adapters/ibkr_adapter.py`   | 15 min |
+| Q2  | Replace `datetime.utcnow` → `datetime.now(timezone.utc)`                                | `models/unified_position.py` | 5 min  |
+| Q3  | Move `debug_*.py`, `demo_*.py`, `diagnostic_summary.py` to `scripts/`                   | root                         | 15 min |
+| Q4  | Move 11 root-level `test_*.py` files to `tests/` or delete                              | root                         | 30 min |
+| Q5  | Delete `clientportal_backup_old/` and `clientportal_latest.gw.zip` from repo            | root                         | 5 min  |
+| Q6  | Add `__all__` to `adapters/__init__.py`, `agents/__init__.py`, `models/__init__.py`     | `*/___init__.py`             | 20 min |
+| Q7  | Add file lock (or use `LocalStore`) for `.stock_option_greeks_cache.json` writes        | `adapters/ibkr_adapter.py`   | 45 min |
+| Q8  | Pin IBKR cert; re-enable SSL warnings for external APIs                                 | `ibkr_portfolio_client.py`   | 30 min |
+| Q9  | Rotate Telegram bot token (security)                                                    | BotFather + `.env`           | 5 min  |
+| Q10 | Add `PROPOSER_DB_URL` to `configs/settings.py` to decouple proposer from `DATABASE_URL` | `agents/trade_proposer.py`   | 20 min |
 
 ---
 
@@ -408,16 +455,17 @@ The dashboard supports multiple accounts via a selector, but Greeks and risk met
 
 ### Unused or Redundant Dependencies
 
-| Package | Status | Notes |
-|---------|--------|-------|
-| `psycopg2-binary` | **Redundant** | `asyncpg` is used exclusively for Postgres; `psycopg2-binary` is listed but never imported |
-| `tastytrade-sdk>=0.0.0` | **Duplicate** | `tastytrade>=7.0.0` already installed; `tastytrade-sdk` is an old name for the same package |
-| `sqlmodel` | **Underused** | Only `models/proposed_trade.py` uses it; everything else is raw asyncpg or aiosqlite |
-| `websockets` | **Direct dep** | Used by vestigial WebSocket in `ibkr_adapter.py`; after Q1, only `streaming/ibkr_ws.py` uses it (still needed) |
+| Package                 | Status         | Notes                                                                                                          |
+| ----------------------- | -------------- | -------------------------------------------------------------------------------------------------------------- |
+| `psycopg2-binary`       | **Redundant**  | `asyncpg` is used exclusively for Postgres; `psycopg2-binary` is listed but never imported                     |
+| `tastytrade-sdk>=0.0.0` | **Duplicate**  | `tastytrade>=7.0.0` already installed; `tastytrade-sdk` is an old name for the same package                    |
+| `sqlmodel`              | **Underused**  | Only `models/proposed_trade.py` uses it; everything else is raw asyncpg or aiosqlite                           |
+| `websockets`            | **Direct dep** | Used by vestigial WebSocket in `ibkr_adapter.py`; after Q1, only `streaming/ibkr_ws.py` uses it (still needed) |
 
 ### Version Pins Too Loose
 
 `requirements.txt` uses `>=` for everything. For a trading system, pin exact versions for:
+
 - `ib_async`, `asyncpg`, `aiohttp`, `tastytrade` — these have breaking API changes between minor versions
 - Use `pip-tools` or `uv` to generate `requirements.lock` with hash-pinned versions.
 
@@ -427,13 +475,13 @@ The dashboard supports multiple accounts via a selector, but Greeks and risk met
 
 Current status: Core engine built and tested (84 passing tests). Integration with live dashboard pending.
 
-| Item | Status | Priority |
-|------|--------|----------|
-| `simulate_margin_impact()` — SOCKET path with live TWS | Implemented, not verified with real What-If response | P1 |
-| Dashboard Trade Approval Queue tab | Not yet built | P2 |
-| `proposed_trades` table visible in dashboard | Not yet connected | P2 |
-| Regime mismatch between `proposer_engine.py` and `regime_detector.py` (§1.2) | Open — needs unification | P1 |
-| `trade_proposer.py` started from `start_dashboard.sh` but PostgreSQL is optional | If PG is down, proposer loop will crash on DB write | P1 |
+| Item                                                                             | Status                                               | Priority |
+| -------------------------------------------------------------------------------- | ---------------------------------------------------- | -------- |
+| `simulate_margin_impact()` — SOCKET path with live TWS                           | Implemented, not verified with real What-If response | P1       |
+| Dashboard Trade Approval Queue tab                                               | Not yet built                                        | P2       |
+| `proposed_trades` table visible in dashboard                                     | Not yet connected                                    | P2       |
+| Regime mismatch between `proposer_engine.py` and `regime_detector.py` (§1.2)     | Open — needs unification                             | P1       |
+| `trade_proposer.py` started from `start_dashboard.sh` but PostgreSQL is optional | If PG is down, proposer loop will crash on DB write  | P1       |
 
 ---
 
@@ -481,4 +529,4 @@ Background Processes (start_dashboard.sh):
 
 ---
 
-*This document reflects the architecture as of branch `006-trade-proposer`. Priority order: Critical (§1) → Architectural (§2) → Code Quality (§3) → Security (§5) → Quick Wins (§9).*
+_This document reflects the architecture as of branch `006-trade-proposer`. Priority order: Critical (§1) → Architectural (§2) → Code Quality (§3) → Security (§5) → Quick Wins (§9)._

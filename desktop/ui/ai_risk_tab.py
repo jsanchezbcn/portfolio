@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import subprocess
@@ -22,13 +23,53 @@ from dataclasses import asdict
 from datetime import date
 from typing import Any
 
+from pydantic import BaseModel, Field
+from copilot.tools import define_tool
+
+logger = logging.getLogger(__name__)
+
+
+class EmptyParams(BaseModel):
+    """Empty parameter model for tools that take no arguments."""
+
+
+class GetMarketSnapshotParams(BaseModel):
+    symbol: str = Field(description="Symbol (e.g. 'ES', 'AAPL')")
+    sec_type: str = Field(description="Security type (STK, FUT, OPT, FOP, IND)")
+    exchange: str = Field(description="Exchange (SMART, CME, CBOE)")
+
+
+class GetBidAskParams(BaseModel):
+    symbol: str = Field(description="Underlying symbol")
+    strike: float = Field(description="Strike price")
+    expiry: str = Field(description="Expiry date YYYYMMDD")
+    right: str = Field(description="Option right (C or P)")
+    sec_type: str = Field(description="OPT or FOP")
+    exchange: str = Field(description="Exchange (SMART or CME)")
+
+
+class GetChainParams(BaseModel):
+    underlying: str = Field(description="Underlying symbol")
+    expiry: str = Field(description="Expiry date YYYYMMDD")
+
+
+class WhatIfOrderParams(BaseModel):
+    legs: list[dict] = Field(description="List of order leg dicts with symbol, action, qty, sec_type, strike, right, expiry")
+
+
+class GetRecentFillsParams(BaseModel):
+    limit: int = Field(default=20, description="Max number of fills to return")
+
 
 def _get_copilot_account() -> str:
     """Detect which GitHub Copilot account is currently configured."""
     try:
         result = subprocess.run(
-            ["gh", "auth", "status"],
-            capture_output=True, text=True, timeout=5,
+            ["gh", "auth", "status", "--hostname", "github.com"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            env={**os.environ, "GH_PAGER": "cat", "NO_COLOR": "1"},
         )
         if result.returncode == 0:
             output = result.stdout
@@ -70,7 +111,12 @@ from agents.llm_client import async_list_models, async_llm_chat
 from agents.llm_risk_auditor import LLMRiskAuditor
 from agents.proposer_engine import BreachDetector, RiskRegimeLoader
 from database.local_store import LocalStore
+from desktop.config.preferences import load_preferences
 from models.order import AITradeSuggestion, OptionRight, OrderAction, PortfolioGreeks, RiskBreach
+
+
+def _default_trades_model() -> str:
+    return (os.getenv("LLM_FAST_MODEL") or os.getenv("LLM_MODEL") or "gpt-5-mini").strip() or "gpt-5-mini"
 
 
 class AIRiskTab(QWidget):
@@ -110,9 +156,6 @@ class AIRiskTab(QWidget):
             "Crisis Mode",
         ])
         top.addWidget(self._cmb_scenario)
-
-        self._btn_context = QPushButton("📡 Refresh Context")
-        top.addWidget(self._btn_context)
 
         self._btn_audit = QPushButton("🛡 Run Risk Audit")
         top.addWidget(self._btn_audit)
@@ -162,7 +205,6 @@ class AIRiskTab(QWidget):
 
     def _connect_signals(self) -> None:
         self._btn_models.clicked.connect(self._on_refresh_models)
-        self._btn_context.clicked.connect(self._on_refresh_context)
         self._btn_audit.clicked.connect(self._on_audit)
         self._btn_suggest.clicked.connect(self._on_suggest)
         self._btn_ask.clicked.connect(self._on_ask)
@@ -175,13 +217,12 @@ class AIRiskTab(QWidget):
         self._load_model_defaults()
 
     def _set_controls_enabled(self, enabled: bool) -> None:
-        self._btn_context.setEnabled(enabled)
         self._btn_audit.setEnabled(enabled)
         self._btn_suggest.setEnabled(enabled)
         self._btn_ask.setEnabled(enabled)
 
     def _load_model_defaults(self) -> None:
-        default_model = (os.getenv("LLM_FAST_MODEL") or os.getenv("LLM_MODEL") or "gpt-5-mini").strip()
+        default_model = _default_trades_model()
         bootstrap = [
             ("gpt-5-mini", "GPT-5 mini 🆓"),
             ("gpt-4.1", "GPT-4.1 🆓"),
@@ -201,14 +242,17 @@ class AIRiskTab(QWidget):
         account_id = getattr(self._engine, "account_id", None) or getattr(self._engine, "_account_id", "unknown")
         model = self.current_model
         gh_account = _get_copilot_account()
+        debug_tool_calls = bool(load_preferences().get("debug_tool_calls", True))
+        debug_state = "ON" if debug_tool_calls else "OFF"
         self._append_chat(
             "assistant",
             f"🟢 **Connected**\n"
             f"- IBKR Account: `{account_id}`\n"
             f"- GitHub Copilot: `{gh_account}`\n"
+            f"- Tool Debug Logs: `{debug_state}`\n"
             f"- Model: `{model}`\n\n"
-            f"Click **📡 Refresh Context** to load your portfolio, then use "
-            f"**🛡 Run Risk Audit** or **✨ Suggest Trades**.",
+            f"Use **🛡 Run Risk Audit** or **✨ Suggest Trades** to analyze your portfolio, "
+            f"or ask me a question about risk, Greeks, margin, or positioning.",
         )
         self._lbl_status.setText(f"Connected — {account_id} | {gh_account}")
 
@@ -239,189 +283,361 @@ class AIRiskTab(QWidget):
 
     @property
     def current_model(self) -> str:
-        return str(self._cmb_model.currentData() or "gpt-5-mini")
+        return str(self._cmb_model.currentData() or _default_trades_model())
 
-    @Slot()
-    def _on_refresh_context(self) -> None:
-        loop = asyncio.get_event_loop()
-        loop.create_task(self._async_refresh_context())
+    # ═══════════════════════════════════════════════════════════════════════
+    # Tool handlers for LLM function calling
+    # ═══════════════════════════════════════════════════════════════════════
 
-    async def _async_refresh_context(self) -> None:
-        self._lbl_status.setText("Refreshing context…")
+    async def _tool_get_positions(self) -> list[dict[str, Any]]:
+        """Fetch current portfolio positions with Greeks."""
+        positions = await self._engine.refresh_positions()
+        return [asdict(p) for p in positions]
+
+    async def _tool_get_account(self) -> dict[str, Any]:
+        """Fetch account summary (NLV, margins, cash)."""
+        account = await self._engine.refresh_account()
+        return asdict(account) if account else {}
+
+    async def _tool_get_open_orders(self) -> list[dict[str, Any]]:
+        """Fetch open orders from IB."""
+        orders = await self._engine.get_open_orders()
+        return [asdict(o) for o in orders]
+
+    async def _tool_get_market_snapshot(self, symbol: str, sec_type: str, exchange: str) -> dict[str, Any]:
+        """Fetch current market price snapshot for a symbol."""
+        snap = await self._engine.get_market_snapshot(symbol, sec_type, exchange)
+        return asdict(snap)
+
+    async def _tool_get_bid_ask(
+        self, symbol: str, strike: float, expiry: str, right: str, sec_type: str, exchange: str
+    ) -> dict[str, Any]:
+        """Fetch bid/ask for specific option contract."""
+        # This would call chain data or specific contract lookup
+        # For now, return cached price or empty
+        price_cache = getattr(self._engine, "_last_price_cache", {}) or {}
+        key = f"{symbol}_{strike}_{expiry}_{right}"
+        if key in price_cache:
+            return {"symbol": symbol, "strike": strike, "expiry": expiry, "right": right, "price": price_cache[key]}
+        return {"symbol": symbol, "strike": strike, "expiry": expiry, "right": right, "price": None}
+
+    async def _tool_get_chain(self, underlying: str, expiry: str) -> list[dict[str, Any]]:
+        """Fetch options chain for underlying and expiry."""
+        rows = self._engine.chain_snapshot() or []
+        result = []
+        for row in rows:
+            if getattr(row, "underlying", None) == underlying and getattr(row, "expiry", None) == expiry:
+                # Handle both dataclass and SimpleNamespace/mock objects
+                if hasattr(row, "__dataclass_fields__"):
+                    result.append(asdict(row))
+                else:
+                    result.append(vars(row) if hasattr(row, "__dict__") else dict(row))
+        return result
+
+    async def _tool_whatif_order(self, legs: list[dict[str, Any]]) -> dict[str, Any]:
+        """Run WhatIf simulation for proposed trade legs."""
         try:
-            # ── Tool: positions ───────────────────────────────────────────
-            self._log_tool_call("get_portfolio_positions", "fetching live positions + Greeks…")
-            positions = await self._engine.refresh_positions()
-
-            # ── Tool: account ─────────────────────────────────────────────
-            self._log_tool_call("get_account_summary", "fetching account balances…")
-            account = await self._engine.refresh_account()
-
-            # ── Tool: open orders ─────────────────────────────────────────
-            self._log_tool_call("get_open_orders", "fetching open orders from IB…")
-            open_orders = await self._engine.get_open_orders()
-
-            option_positions = [p for p in positions if p.sec_type in ("OPT", "FOP")]
-            options_with_greeks = [
-                p for p in option_positions
-                if any(v is not None for v in (p.delta, p.gamma, p.theta, p.vega))
-            ]
-            greeks_coverage = (
-                (len(options_with_greeks) / len(option_positions))
-                if option_positions else 1.0
-            )
-
-            # ── Tool: market prices ───────────────────────────────────────
-            self._log_tool_call("get_market_prices", "fetching ES + VIX snapshots…")
-            es_snap = await self._engine.get_market_snapshot("ES", "FUT", "CME")
-            try:
-                vix_snap = await self._engine.get_market_snapshot("VIX", "IND", "CBOE")
-                vix_value = float(vix_snap.last or vix_snap.close or 0.0)
-            except Exception:
-                vix_value = 20.0
-
-            total_spx_delta = sum((p.spx_delta or 0.0) for p in positions)
-            total_gamma = sum((p.gamma or 0.0) for p in positions)
-            total_theta = sum((p.theta or 0.0) for p in positions)
-            total_vega = sum((p.vega or 0.0) for p in positions)
-            nlv = float(account.net_liquidation) if account else 0.0
-            margin_used = float(account.init_margin) if account else 0.0
-
-            greeks_snapshot = {
-                "vix": vix_value,
-                "term_structure": 1.0,
-                "recession_prob": 0.0,
-                "total_vega": total_vega,
-                "spx_delta": total_spx_delta,
-                "total_theta": total_theta,
-                "total_gamma": total_gamma,
-            }
-
-            loader = RiskRegimeLoader()
-            detector = BreachDetector(loader)
-
-            scenario = self._cmb_scenario.currentText()
-            scenario_forced = {
-                "Low Volatility": "low_volatility",
-                "Neutral Volatility": "neutral_volatility",
-                "High Volatility": "high_volatility",
-                "Crisis Mode": "crisis_mode",
-            }.get(scenario)
-
-            regime_name, limits = loader.get_effective_limits(
-                vix=vix_value,
-                term_structure=1.0,
-                recession_prob=0.0,
-                nlv=nlv,
-            )
-            if scenario_forced:
-                regime_name = scenario_forced
-
-            # ── Tool: risk breaches ───────────────────────────────────────
-            self._log_tool_call("get_risk_breaches", f"checking limits for regime '{regime_name}'…")
-            events = detector.check(
-                greeks_snapshot,
-                account_nlv=nlv,
-                account_id=self._engine.account_id,
-                margin_used=margin_used,
-            )
-            violations = [
-                {
-                    "metric": e.greek,
-                    "current": e.current_value,
-                    "limit": e.limit,
-                    "message": f"distance={e.distance_to_target:.2f}",
-                }
-                for e in events
-            ]
-
-            # ── Tool: recent fills (DB, optional) ─────────────────────────
-            recent_fills: list[dict] = []
-            if self._engine._db_ok:
-                try:
-                    self._log_tool_call("get_recent_fills", "loading last 20 fills from DB…")
-                    fill_rows = await self._engine._db.get_fills(
-                        self._engine._account_id, limit=20
-                    )
-                    for row in fill_rows:
-                        if isinstance(row, dict):
-                            recent_fills.append(row)
-                        else:
-                            recent_fills.append(dict(row))
-                except Exception as exc:
-                    self._log_tool_call("get_recent_fills", f"unavailable: {exc}")
-
-            # ── Tool: order log (DB, optional) ────────────────────────────
-            order_log: list[dict] = []
-            if self._engine._db_ok:
-                try:
-                    self._log_tool_call("get_order_log", "loading last 30 orders from DB…")
-                    order_rows = await self._engine._db.get_orders(
-                        self._engine._account_id, limit=30
-                    )
-                    for row in order_rows:
-                        r = dict(row) if not isinstance(row, dict) else row
-                        legs_raw = r.get("legs_json") or r.get("legs") or []
-                        if isinstance(legs_raw, str):
-                            try:
-                                legs_raw = json.loads(legs_raw)
-                            except Exception:
-                                legs_raw = []
-                        order_log.append({
-                            "created_at": str(r.get("created_at") or "")[:19],
-                            "status": r.get("status"),
-                            "side": r.get("side"),
-                            "order_type": r.get("order_type"),
-                            "limit_price": r.get("limit_price"),
-                            "filled_price": r.get("filled_price"),
-                            "source": r.get("source"),
-                            "rationale": str(r.get("rationale") or "")[:120],
-                            "legs": legs_raw,
-                        })
-                except Exception as exc:
-                    self._log_tool_call("get_order_log", f"unavailable: {exc}")
-
-            # ── Tool: last known prices ───────────────────────────────────
-            price_cache = dict(getattr(self._engine, "_last_price_cache", {}) or {})
-            self._log_tool_call("get_last_prices", f"{len(price_cache)} symbols cached")
-
-            self._context = {
-                "summary": {
-                    "total_spx_delta": total_spx_delta,
-                    "total_gamma": total_gamma,
-                    "total_theta": total_theta,
-                    "total_vega": total_vega,
-                    "position_count": len(positions),
-                    "option_count": len(option_positions),
-                    "options_with_greeks": len(options_with_greeks),
-                    "greeks_coverage": greeks_coverage,
-                    "theta_vega_ratio": (total_theta / total_vega) if total_vega else 0.0,
-                    "theta_vega_zone": "unknown",
-                },
-                "regime_name": regime_name,
-                "vix": vix_value,
-                "term_structure": 1.0,
-                "nlv": nlv,
-                "violations": violations,
-                "resolved_limits": limits,
-                "account": asdict(account) if account else {},
-                "positions": [asdict(p) for p in positions],
-                "open_orders": [asdict(o) for o in open_orders],
-                "recent_fills": recent_fills,
-                "order_log": order_log,
-                "last_prices": price_cache,
-                "prices": {
-                    "ES": asdict(es_snap),
-                    "VIX": {"last": vix_value},
-                },
-            }
-            self._lbl_status.setText(
-                f"Context ready: {len(positions)} positions, {len(violations)} breaches, "
-                f"Greeks {len(options_with_greeks)}/{len(option_positions)}, "
-                f"{len(open_orders)} open orders"
-            )
+            result = await self._engine.whatif_order(legs, order_type="LIMIT", limit_price=None)
+            return result
         except Exception as exc:
-            self._lbl_status.setText(f"Context refresh failed: {exc}")
+            return {"error": str(exc)}
+
+    async def _tool_get_recent_fills(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Fetch recent fills from database."""
+        if not self._engine._db_ok:
+            return []
+        try:
+            fill_rows = await self._engine._db.get_fills(self._engine._account_id, limit=limit)
+            return [dict(row) if not isinstance(row, dict) else row for row in fill_rows]
+        except Exception:
+            return []
+
+    async def _tool_get_risk_breaches(self) -> list[dict[str, Any]]:
+        """Check current risk violations against regime limits."""
+        from agents.proposer_engine import BreachDetector, RiskRegimeLoader
+
+        positions = await self._engine.refresh_positions()
+        account = await self._engine.refresh_account()
+
+        total_spx_delta = sum((p.spx_delta or 0.0) for p in positions)
+        total_gamma = sum((p.gamma or 0.0) for p in positions)
+        total_theta = sum((p.theta or 0.0) for p in positions)
+        total_vega = sum((p.vega or 0.0) for p in positions)
+        nlv = float(account.net_liquidation) if account else 0.0
+        margin_used = float(account.init_margin) if account else 0.0
+
+        try:
+            vix_snap = await self._engine.get_market_snapshot("VIX", "IND", "CBOE")
+            vix_value = float(vix_snap.last or vix_snap.close or 0.0)
+        except Exception:
+            vix_value = 20.0
+
+        greeks_snapshot = {
+            "vix": vix_value,
+            "term_structure": 1.0,
+            "recession_prob": 0.0,
+            "total_vega": total_vega,
+            "spx_delta": total_spx_delta,
+            "total_theta": total_theta,
+            "total_gamma": total_gamma,
+        }
+
+        loader = RiskRegimeLoader()
+        detector = BreachDetector(loader)
+
+        events = detector.check(
+            greeks_snapshot,
+            account_nlv=nlv,
+            account_id=self._engine.account_id,
+            margin_used=margin_used,
+        )
+
+        return [
+            {
+                "metric": e.greek,
+                "current": e.current_value,
+                "limit": e.limit,
+                "distance": e.distance_to_target,
+            }
+            for e in events
+        ]
+
+    def _create_tools_for_session(self) -> list:
+        """Create Copilot SDK tool definitions that call instance methods."""
+        # Define tools with closures over self
+        @define_tool(description="Get current portfolio positions with Greeks and P&L")
+        async def get_positions(params: EmptyParams) -> list[dict]:
+            return await self._tool_get_positions()
+
+        @define_tool(description="Get account summary (NLV, margins, cash)")
+        async def get_account(params: EmptyParams) -> dict:
+            return await self._tool_get_account()
+
+        @define_tool(description="Get open orders from IB")
+        async def get_open_orders(params: EmptyParams) -> list[dict]:
+            return await self._tool_get_open_orders()
+
+        @define_tool(description="Get current market price snapshot for a symbol")
+        async def get_market_snapshot(params: GetMarketSnapshotParams) -> dict:
+            return await self._tool_get_market_snapshot(params.symbol, params.sec_type, params.exchange)
+
+        @define_tool(description="Get bid/ask for specific option contract")
+        async def get_bid_ask(params: GetBidAskParams) -> dict:
+            return await self._tool_get_bid_ask(
+                params.symbol, params.strike, params.expiry, params.right, params.sec_type, params.exchange
+            )
+
+        @define_tool(description="Get options chain for underlying and expiry")
+        async def get_chain(params: GetChainParams) -> list[dict]:
+            return await self._tool_get_chain(params.underlying, params.expiry)
+
+        @define_tool(description="Run WhatIf simulation for proposed trade legs")
+        async def whatif_order(params: WhatIfOrderParams) -> dict:
+            return await self._tool_whatif_order(params.legs)
+
+        @define_tool(description="Get recent fills from database")
+        async def get_recent_fills(params: GetRecentFillsParams) -> list[dict]:
+            return await self._tool_get_recent_fills(params.limit)
+
+        @define_tool(description="Check current risk violations against regime limits")
+        async def get_risk_breaches(params: EmptyParams) -> list[dict]:
+            return await self._tool_get_risk_breaches()
+
+        return [
+            get_positions,
+            get_account,
+            get_open_orders,
+            get_market_snapshot,
+            get_bid_ask,
+            get_chain,
+            whatif_order,
+            get_recent_fills,
+            get_risk_breaches,
+        ]
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # End of tool handlers
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _top_positions_for_metric(self, metric: str, *, limit: int = 4) -> list[dict[str, Any]]:
+        positions = [p for p in (self._context.get("positions") or []) if isinstance(p, dict)]
+        ranked = sorted(
+            positions,
+            key=lambda p: abs(float(p.get(metric) or 0.0)),
+            reverse=True,
+        )
+        result: list[dict[str, Any]] = []
+        for row in ranked[:limit]:
+            result.append({
+                "symbol": row.get("symbol"),
+                "sec_type": row.get("sec_type"),
+                "quantity": row.get("quantity"),
+                "expiry": row.get("expiry"),
+                metric: row.get(metric),
+            })
+        return result
+
+    def _build_chain_snapshot_summary(self, *, limit: int = 8) -> dict[str, Any]:
+        rows = list(self._engine.chain_snapshot() or [])
+        if not rows:
+            return {"row_count": 0, "underlying": None, "expiry": None, "sample": []}
+
+        sample = []
+        for row in rows[:limit]:
+            sample.append({
+                "underlying": getattr(row, "underlying", None),
+                "expiry": getattr(row, "expiry", None),
+                "strike": getattr(row, "strike", None),
+                "right": getattr(row, "right", None),
+                "bid": getattr(row, "bid", None),
+                "ask": getattr(row, "ask", None),
+                "delta": getattr(row, "delta", None),
+            })
+        first = rows[0]
+        return {
+            "row_count": len(rows),
+            "underlying": getattr(first, "underlying", None),
+            "expiry": getattr(first, "expiry", None),
+            "sample": sample,
+        }
+
+    def _serialize_suggestions(self, *, limit: int = 5) -> list[dict[str, Any]]:
+        serialized: list[dict[str, Any]] = []
+        for suggestion in self._suggestions[:limit]:
+            serialized.append({
+                "rationale": suggestion.rationale,
+                "projected_delta_change": suggestion.projected_delta_change,
+                "projected_theta_cost": suggestion.projected_theta_cost,
+                "legs": [
+                    {
+                        "symbol": leg.symbol,
+                        "action": leg.action.value,
+                        "quantity": leg.quantity,
+                        "strike": leg.strike,
+                        "right": leg.option_right.value if leg.option_right else None,
+                        "expiry": leg.expiration.strftime("%Y%m%d") if leg.expiration else None,
+                    }
+                    for leg in suggestion.legs
+                ],
+            })
+        return serialized
+
+    def _build_portfolio_state(self) -> dict[str, Any]:
+        summary = dict(self._context.get("summary") or {})
+        open_orders = [o for o in (self._context.get("open_orders") or []) if isinstance(o, dict)]
+        fills = [f for f in (self._context.get("recent_fills") or []) if isinstance(f, dict)]
+        positions = [p for p in (self._context.get("positions") or []) if isinstance(p, dict)]
+        expiries = sorted(
+            {
+                str(p.get("expiry") or "").strip()
+                for p in positions
+                if p.get("sec_type") in ("OPT", "FOP") and p.get("expiry")
+            }
+        )
+        return {
+            "selected_scenario": self._cmb_scenario.currentText(),
+            "copilot_profile": (os.getenv("GITHUB_COPILOT_ACTIVE_PROFILE") or "personal").strip() or "personal",
+            "current_model": self.current_model,
+            "regime_name": self._context.get("regime_name"),
+            "vix": self._context.get("vix"),
+            "nlv": self._context.get("nlv"),
+            "headline_metrics": summary,
+            "risk_breaches": list(self._context.get("violations") or []),
+            "resolved_limits": dict(self._context.get("resolved_limits") or {}),
+            "active_option_expiries": expiries[:8],
+            "largest_spx_delta_positions": self._top_positions_for_metric("spx_delta"),
+            "largest_theta_positions": self._top_positions_for_metric("theta"),
+            "largest_vega_positions": self._top_positions_for_metric("vega"),
+            "open_order_count": len(open_orders),
+            "open_order_symbols": sorted({str(o.get("symbol") or "").upper() for o in open_orders if o.get("symbol")}),
+            "recent_fill_symbols": sorted({str(f.get("symbol") or "").upper() for f in fills if f.get("symbol")}),
+            "cached_price_symbols": sorted((self._context.get("last_prices") or {}).keys())[:12],
+            "active_chain": self._build_chain_snapshot_summary(),
+            "current_ai_suggestions": self._serialize_suggestions(),
+        }
+
+    def _build_tools_context(self) -> tuple[dict[str, Any], list[str]]:
+        tools_context: dict[str, Any] = {}
+        tool_names = [
+            ("tool:get_account_summary", "account"),
+            ("tool:get_portfolio_positions", "positions"),
+            ("tool:get_open_orders", "open_orders"),
+            ("tool:get_portfolio_greeks", "summary"),
+            ("tool:get_market_prices", "prices"),
+            ("tool:get_last_prices", "last_prices"),
+            ("tool:get_risk_breaches", "violations"),
+            ("tool:get_effective_limits", "resolved_limits"),
+            ("tool:get_recent_fills", "recent_fills"),
+            ("tool:get_order_log", "order_log"),
+        ]
+        tool_log_lines = ["🔧 Tools dispatched to LLM:"]
+        for tool_key, ctx_key in tool_names:
+            value = self._context.get(ctx_key)
+            tools_context[tool_key] = value
+            if value is None:
+                size_hint = "—"
+            elif isinstance(value, list):
+                size_hint = f"{len(value)} items"
+            elif isinstance(value, dict):
+                size_hint = f"{len(value)} keys"
+            else:
+                size_hint = "✓"
+            tool_log_lines.append(f"   {tool_key}: {size_hint}")
+
+        tools_context["tool:get_portfolio_state"] = self._build_portfolio_state()
+        tools_context["tool:get_trades_view_state"] = {
+            "selected_scenario": self._cmb_scenario.currentText(),
+            "current_model": self.current_model,
+            "copilot_profile": (os.getenv("GITHUB_COPILOT_ACTIVE_PROFILE") or "personal").strip() or "personal",
+            "suggestion_count": len(self._suggestions),
+        }
+        tool_log_lines.append("   tool:get_portfolio_state: structured summary")
+        tool_log_lines.append("   tool:get_trades_view_state: UI state")
+        return tools_context, tool_log_lines
+
+    def _build_chat_request(self, question: str) -> tuple[str, str, dict[str, Any], list[str]]:
+        tools_context, tool_log_lines = self._build_tools_context()
+        recent_history = self._chat_history[-10:]
+        history_text = "\n".join(
+            f"{role}: {msg}" for role, msg in recent_history
+            if role in ("user", "assistant")
+        )
+        system = (
+            "You are the desktop AI risk copilot for an options portfolio manager. "
+            "You have access to the full portfolio via the tool outputs below.\n\n"
+            "CAPABILITIES:\n"
+            "- Answer questions about positions, Greeks, margin, P&L, risk breaches.\n"
+            "- Propose specific trades to adjust risk, hedge, or generate income.\n"
+            "- Reference open orders, recent fills, and the active chain when assessing current exposure.\n"
+            "- Prioritize the structured portfolio state summary, then cite supporting tool outputs.\n\n"
+            "TRADE PROPOSAL FORMAT:\n"
+            "When proposing any trade, you MUST output a JSON block in this exact format "
+            "so it can be auto-loaded into Order Entry. Use triple-backtick json fences:\n"
+            "```json\n"
+            "{\"trade_proposal\": {\n"
+            "  \"strategy\": \"short description\",\n"
+            "  \"legs\": [\n"
+            "    {\"symbol\": \"MES\", \"sec_type\": \"FOP\", \"exchange\": \"CME\","
+            "     \"action\": \"SELL\", \"qty\": 1, \"strike\": 5700,"
+            "     \"right\": \"C\", \"expiry\": \"YYYYMMDD\"}\n"
+            "  ],\n"
+            "  \"rationale\": \"reason\",\n"
+            "  \"credit_per_contract\": 12.50,\n"
+            "  \"pop_pct\": 80\n"
+            "}}\n"
+            "```\n"
+            "sec_type must be FOP (ES/MES/NQ/MNQ options), OPT (equity options), "
+            "STK (stocks), or FUT (futures). Use precise YYYYMMDD expiry dates.\n\n"
+            "Always be concrete: use actual strikes, expiries, and quantities."
+        )
+        prompt = (
+            f"Conversation so far:\n{history_text}\n\n"
+            f"Portfolio state (prioritize this summary first):\n"
+            f"{json.dumps(tools_context.get('tool:get_portfolio_state'), default=str)[:40_000]}\n\n"
+            f"Tool outputs (JSON):\n{json.dumps(tools_context, default=str)[:180_000]}\n\n"
+            f"User question:\n{question}\n"
+        )
+        return system, prompt, tools_context, tool_log_lines
 
     @Slot()
     def _on_audit(self) -> None:
@@ -429,26 +645,75 @@ class AIRiskTab(QWidget):
         loop.create_task(self._async_audit())
 
     async def _async_audit(self) -> None:
-        if not self._context:
-            await self._async_refresh_context()
-            if not self._context:
-                return
+        """Run risk audit using fresh data from tool handlers."""
         self._lbl_status.setText("Running audit…")
         try:
+            # Fetch fresh data via tool handlers
+            positions_data = await self._tool_get_positions()
+            account_data = await self._tool_get_account()
+            breaches_data = await self._tool_get_risk_breaches()
+
+            # Compute summary metrics
+            total_spx_delta = sum(p.get("spx_delta", 0.0) or 0.0 for p in positions_data)
+            total_gamma = sum(p.get("gamma", 0.0) or 0.0 for p in positions_data)
+            total_theta = sum(p.get("theta", 0.0) or 0.0 for p in positions_data)
+            total_vega = sum(p.get("vega", 0.0) or 0.0 for p in positions_data)
+            nlv = float(account_data.get("net_liquidation", 0.0) or 0.0)
+
+            option_positions = [p for p in positions_data if p.get("sec_type") in ("OPT", "FOP")]
+            options_with_greeks = [
+                p for p in option_positions
+                if any(p.get(g) is not None for g in ("delta", "gamma", "theta", "vega"))
+            ]
+            greeks_coverage = (len(options_with_greeks) / len(option_positions)) if option_positions else 1.0
+            theta_vega_ratio = (total_theta / total_vega) if total_vega else 0.0
+
+            summary_dict = {
+                "total_spx_delta": total_spx_delta,
+                "total_gamma": total_gamma,
+                "total_theta": total_theta,
+                "total_vega": total_vega,
+                "position_count": len(positions_data),
+                "option_count": len(option_positions),
+                "options_with_greeks": len(options_with_greeks),
+                "greeks_coverage": greeks_coverage,
+                "theta_vega_ratio": theta_vega_ratio,
+                "theta_vega_zone": "unknown",
+            }
+
+            # Determine regime and get limits
+            from agents.proposer_engine import RiskRegimeLoader
+            loader = RiskRegimeLoader()
+
+            try:
+                vix_snap = await self._engine.get_market_snapshot("VIX", "IND", "CBOE")
+                vix_value = float(vix_snap.last or vix_snap.close or 0.0)
+            except Exception:
+                vix_value = 20.0
+
+            regime_name, limits = loader.get_effective_limits(
+                vix=vix_value,
+                term_structure=1.0,
+                recession_prob=0.0,
+                nlv=nlv,
+            )
+
+            # Run LLM audit
             auditor = LLMRiskAuditor(db=LocalStore())
             auditor._model = self.current_model
             result = await auditor.audit_now(
-                summary=self._context["summary"],
-                regime_name=self._context["regime_name"],
-                vix=float(self._context["vix"]),
-                term_structure=float(self._context["term_structure"]),
-                nlv=float(self._context["nlv"] or 0.0),
-                violations=list(self._context.get("violations") or []),
-                resolved_limits=dict(self._context.get("resolved_limits") or {}),
+                summary=summary_dict,
+                regime_name=regime_name,
+                vix=vix_value,
+                term_structure=1.0,
+                nlv=nlv,
+                violations=breaches_data,
+                resolved_limits=limits,
             )
             self._append_chat("assistant", f"[Risk Audit] {result.get('headline','')}\n{result.get('body','')}")
             self._lbl_status.setText(f"Audit complete ({result.get('urgency', 'unknown')})")
         except Exception as exc:
+            self._append_chat("assistant", f"Audit failed: {exc}")
             self._lbl_status.setText(f"Audit failed: {exc}")
 
     @Slot()
@@ -457,40 +722,63 @@ class AIRiskTab(QWidget):
         loop.create_task(self._async_suggest())
 
     async def _async_suggest(self) -> None:
-        if not self._context:
-            await self._async_refresh_context()
-            if not self._context:
-                return
+        """Generate trade suggestions using fresh data from tool handlers."""
         self._lbl_status.setText("Generating trade suggestions…")
         try:
-            summary = self._context["summary"]
-            coverage = float(summary.get("greeks_coverage") or 0.0)
-            option_count = int(summary.get("option_count") or 0)
-            with_greeks = int(summary.get("options_with_greeks") or 0)
-            if option_count > 0 and coverage < 0.5:
+            # Fetch fresh data via tool handlers
+            positions_data = await self._tool_get_positions()
+            breaches_data = await self._tool_get_risk_breaches()
+
+            # Compute summary metrics
+            total_spx_delta = sum(p.get("spx_delta", 0.0) or 0.0 for p in positions_data)
+            total_gamma = sum(p.get("gamma", 0.0) or 0.0 for p in positions_data)
+            total_theta = sum(p.get("theta", 0.0) or 0.0 for p in positions_data)
+            total_vega = sum(p.get("vega", 0.0) or 0.0 for p in positions_data)
+
+            option_positions = [p for p in positions_data if p.get("sec_type") in ("OPT", "FOP")]
+            options_with_greeks = [
+                p for p in option_positions
+                if any(p.get(g) is not None for g in ("delta", "gamma", "theta", "vega"))
+            ]
+            greeks_coverage = (len(options_with_greeks) / len(option_positions)) if option_positions else 1.0
+
+            if option_positions and greeks_coverage < 0.5:
                 self._append_chat(
                     "assistant",
-                    f"[Data Quality] Greeks coverage is too low ({with_greeks}/{option_count}). Refresh context before requesting suggestions.",
+                    f"[Data Quality] Greeks coverage is too low ({len(options_with_greeks)}/{len(option_positions)}). "
+                    f"Request may be inaccurate.",
                 )
-                self._lbl_status.setText("Suggestion blocked: insufficient Greeks coverage")
-                return
 
             pg = PortfolioGreeks(
-                spx_delta=float(summary.get("total_spx_delta") or 0.0),
-                gamma=float(summary.get("total_gamma") or 0.0),
-                theta=float(summary.get("total_theta") or 0.0),
-                vega=float(summary.get("total_vega") or 0.0),
+                spx_delta=total_spx_delta,
+                gamma=total_gamma,
+                theta=total_theta,
+                vega=total_vega,
             )
+
+            # Construct bre ach object if violations exist
             breach_obj = None
-            violations = self._context.get("violations") or []
-            if violations:
-                first = violations[0]
+            if breaches_data:
+                first = breaches_data[0]
+                try:
+                    vix_snap = await self._engine.get_market_snapshot("VIX", "IND", "CBOE")
+                    vix_value = float(vix_snap.last or vix_snap.close or 0.0)
+                except Exception:
+                    vix_value = 20.0
+
+                from agents.proposer_engine import RiskRegimeLoader
+                loader = RiskRegimeLoader()
+                regime_name, _ = loader.get_effective_limits(
+                    vix=vix_value, term_structure=1.0, recession_prob=0.0,
+                    nlv=sum(float(p.get("market_value", 0.0) or 0.0) for p in positions_data)
+                )
+
                 breach_obj = RiskBreach(
-                    breach_type=str(first.get("metric") or "risk"),
-                    threshold_value=float(first.get("limit") or 0.0),
-                    actual_value=float(first.get("current") or 0.0),
-                    regime=str(self._context.get("regime_name") or "unknown"),
-                    vix=float(self._context.get("vix") or 0.0),
+                    breach_type=str(first.get("metric", "risk")),
+                    threshold_value=float(first.get("limit", 0.0)),
+                    actual_value=float(first.get("current", 0.0)),
+                    regime=regime_name,
+                    vix=vix_value,
                 )
 
             auditor = LLMRiskAuditor(db=LocalStore())
@@ -498,32 +786,45 @@ class AIRiskTab(QWidget):
             theta_budget = max(0.0, abs(pg.theta) * 0.30)
 
             # Extract nearest active expiry from FOP/OPT positions
-            positions_raw = self._context.get("positions") or []
             fop_expiries = sorted(
                 {
                     p.get("expiration") or p.get("last_trade_date")
-                    for p in positions_raw
+                    for p in positions_data
                     if p.get("sec_type") in ("FOP", "OPT") and (p.get("expiration") or p.get("last_trade_date"))
                 }
             )
             active_expiry = ""
             if fop_expiries:
                 raw_exp = str(fop_expiries[0])
-                # Normalise: remove dashes, keep YYYYMMDD
                 active_expiry = raw_exp.replace("-", "")[:8]
+
+            try:
+                vix_snap = await self._engine.get_market_snapshot("VIX", "IND", "CBOE")
+                vix_value = float(vix_snap.last or vix_snap.close or 0.0)
+            except Exception:
+                vix_value = 20.0
+
+            from agents.proposer_engine import RiskRegimeLoader
+            loader = RiskRegimeLoader()
+            regime_name, _ = loader.get_effective_limits(
+                vix=vix_value, term_structure=1.0, recession_prob=0.0,
+                nlv=sum(float(p.get("market_value", 0.0) or 0.0) for p in positions_data)
+            )
 
             self._suggestions = await auditor.suggest_trades(
                 portfolio_greeks=pg,
-                vix=float(self._context.get("vix") or 0.0),
-                regime=str(self._context.get("regime_name") or "unknown"),
+                vix=vix_value,
+                regime=regime_name,
                 breach=breach_obj,
                 theta_budget=theta_budget,
                 active_expiry=active_expiry,
                 underlying="MES",
+                ib_engine=self._engine,
             )
             self._render_suggestions()
             self._lbl_status.setText(f"Generated {len(self._suggestions)} suggestions")
         except Exception as exc:
+            self._append_chat("assistant", f"Suggestion failed: {exc}")
             self._lbl_status.setText(f"Suggestion generation failed: {exc}")
 
     def _render_suggestions(self) -> None:
@@ -582,82 +883,98 @@ class AIRiskTab(QWidget):
         loop.create_task(self._async_ask(question))
 
     async def _async_ask(self, question: str) -> None:
-        if not self._context:
-            await self._async_refresh_context()
-            if not self._context:
-                return
+        """Use Copilot SDK with function calling to answer questions on-demand."""
         self._lbl_status.setText("Thinking…")
-        try:
-            # ── Assemble tool outputs shown to the LLM ────────────────────
-            tools_context = {}
-            tool_names = [
-                ("tool:get_account_summary",    "account"),
-                ("tool:get_portfolio_positions","positions"),
-                ("tool:get_open_orders",        "open_orders"),
-                ("tool:get_portfolio_greeks",   "summary"),
-                ("tool:get_market_prices",      "prices"),
-                ("tool:get_last_prices",        "last_prices"),
-                ("tool:get_risk_breaches",      "violations"),
-                ("tool:get_effective_limits",   "resolved_limits"),
-                ("tool:get_recent_fills",       "recent_fills"),
-                ("tool:get_order_log",          "order_log"),
-            ]
-            tool_log_lines = ["🔧 Tools dispatched to LLM:"]
-            for tool_key, ctx_key in tool_names:
-                value = self._context.get(ctx_key)
-                tools_context[tool_key] = value
-                if value is None:
-                    size_hint = "—"
-                elif isinstance(value, list):
-                    size_hint = f"{len(value)} items"
-                elif isinstance(value, dict):
-                    size_hint = f"{len(value)} keys"
-                else:
-                    size_hint = "✓"
-                tool_log_lines.append(f"   {tool_key}: {size_hint}")
-            self._append_chat("tool", "\n".join(tool_log_lines))
+        from copilot import CopilotClient
+        from copilot.generated.session_events import SessionEventType
 
-            recent_history = self._chat_history[-10:]
-            history_text = "\n".join(
-                f"{role}: {msg}" for role, msg in recent_history
-                if role in ("user", "assistant")
-            )
+        client = None
+        session = None
+        try:
+            # Create SDK client and session with tools
+            client = CopilotClient({"log_level": "error"})
+            await client.start()
+
+            tools = self._create_tools_for_session()
             system = (
                 "You are the desktop AI risk copilot for an options portfolio manager. "
-                "You have access to the full portfolio via the tool outputs below.\n\n"
+                "You have access to real-time portfolio data via function calls.\n\n"
                 "CAPABILITIES:\n"
-                "- Answer questions about positions, Greeks, margin, P&L, risk breaches.\n"
-                "- Propose specific trades to adjust risk, hedge, or generate income.\n"
-                "- Reference open orders and recent fills when assessing current exposure.\n\n"
+                "- get_positions() → fetch current positions with Greeks\n"
+                "- get_account() → fetch account balances and margins\n"
+                "- get_open_orders() → fetch open orders\n"
+                "- get_market_snapshot(symbol, sec_type, exchange) → fetch current market price\n"
+                "- get_bid_ask(symbol, strike, expiry, right, sec_type, exchange) → fetch option bid/ask\n"
+                "- get_chain(underlying, expiry) → fetch options chain\n"
+                "- whatif_order(legs) → simulate trade P&L and Greeks impact\n"
+                "- get_recent_fills(limit) → fetch recent fills from DB\n"
+                "- get_risk_breaches() → check current risk violations\n\n"
+                "IMPORTANT:\n"
+                "- Always call functions to get fresh data — do not make assumptions about portfolio state\n"
+                "- Prices are dynamic — call get_market_snapshot or get_bid_ask for current quotes\n"
+                "- Contract resolution requires market hours — if WhatIf fails, explain gracefully\n\n"
                 "TRADE PROPOSAL FORMAT:\n"
-                "When proposing any trade, you MUST output a JSON block in this exact format "
-                "so it can be auto-loaded into Order Entry. Use triple-backtick json fences:\n"
+                "When proposing a trade, output JSON in triple-backtick fences:\n"
                 "```json\n"
                 "{\"trade_proposal\": {\n"
-                "  \"strategy\": \"short description\",\n"
-                "  \"legs\": [\n"
-                "    {\"symbol\": \"MES\", \"sec_type\": \"FOP\", \"exchange\": \"CME\","
-                "     \"action\": \"SELL\", \"qty\": 1, \"strike\": 5700,"
-                "     \"right\": \"C\", \"expiry\": \"YYYYMMDD\"}\n"
-                "  ],\n"
+                "  \"strategy\": \"description\",\n"
+                "  \"legs\": [{\"symbol\": \"MES\", \"action\": \"SELL\", \"qty\": 1, "
+                "\"strike\": 5700, \"right\": \"C\", \"expiry\": \"YYYYMMDD\", "
+                "\"sec_type\": \"FOP\", \"exchange\": \"CME\"}],\n"
                 "  \"rationale\": \"reason\",\n"
                 "  \"credit_per_contract\": 12.50,\n"
                 "  \"pop_pct\": 80\n"
                 "}}\n"
-                "```\n"
-                "sec_type must be FOP (ES/MES/NQ/MNQ options), OPT (equity options), "
-                "STK (stocks), or FUT (futures). Use precise YYYYMMDD expiry dates.\n\n"
-                "Always be concrete: use actual strikes, expiries, and quantities."
+                "```"
             )
-            prompt = (
-                f"Conversation so far:\n{history_text}\n\n"
-                f"Tool outputs (JSON):\n{json.dumps(tools_context, default=str)[:180_000]}\n\n"
-                f"User question:\n{question}\n"
+
+            session = await client.create_session({
+                "model": self.current_model,
+                "streaming": True,
+                "tools": tools,
+                "system_message": {"content": system, "role": "system"},
+                "infinite_sessions": {"enabled": False},
+            })
+
+            # Track streaming response and tool calls
+            response_chunks: list[str] = []
+            tool_calls: list[str] = []
+            debug_tool_calls = bool(load_preferences().get("debug_tool_calls", True))
+
+            def handle_event(event):
+                if event.type == SessionEventType.ASSISTANT_MESSAGE_DELTA:
+                    delta = event.data.delta_content
+                    response_chunks.append(delta)
+                elif event.type == SessionEventType.TOOL_EXECUTION_START:
+                    tool_name = getattr(event.data, "tool_name", "unknown")
+                    if debug_tool_calls:
+                        logger.info("AI Risk tool start: %s", tool_name)
+                        tool_calls.append(f"🔧 Calling tool: {tool_name}")
+                elif event.type == SessionEventType.TOOL_EXECUTION_COMPLETE:
+                    tool_name = getattr(event.data, "tool_name", "unknown")
+                    if debug_tool_calls:
+                        logger.info("AI Risk tool complete: %s", tool_name)
+                        tool_calls.append(f"✓ Tool complete: {tool_name}")
+
+            session.on(handle_event)
+
+            # Send question and wait for full response
+            await asyncio.wait_for(
+                session.send_and_wait({"prompt": question}),
+                timeout=90.0,
             )
-            reply = await async_llm_chat(prompt, model=self.current_model, system=system, timeout=60.0)
+
+            # Log tool calls if any
+            if tool_calls:
+                self._append_chat("tool", "\n".join(tool_calls))
+            elif debug_tool_calls:
+                self._append_chat("tool", "ℹ️ Tool logging enabled, but no tools were invoked for this answer.")
+
+            # Assemble and display response
+            reply = "".join(response_chunks)
             self._append_chat("assistant", reply or "(No response)")
 
-            # ── Parse any inline trade proposals from the reply ────────────
+            # Parse any inline trade proposals from the reply
             proposals = self._parse_trade_proposals_from_reply(reply or "")
             if proposals:
                 self._append_chat(
@@ -667,9 +984,24 @@ class AIRiskTab(QWidget):
                 self._add_inline_trade_suggestions(proposals)
 
             self._lbl_status.setText("Ready")
+
+        except asyncio.TimeoutError:
+            self._append_chat("assistant", "Error: Request timed out after 90 seconds")
+            self._lbl_status.setText("Timeout")
         except Exception as exc:
             self._append_chat("assistant", f"Error: {exc}")
             self._lbl_status.setText("AI call failed")
+        finally:
+            if session is not None:
+                try:
+                    await session.destroy()
+                except Exception:
+                    pass
+            if client is not None:
+                try:
+                    await client.stop()
+                except Exception:
+                    pass
 
     # ── Tool call log & trade proposal helpers ────────────────────────────
 

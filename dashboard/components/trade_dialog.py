@@ -72,11 +72,11 @@ def open_trade_dialog(
     st.session_state[_TD_SUBMITTING]   = False
     st.session_state[_TD_SUB_RESULT]   = None
     st.session_state[_TD_ORDER]        = None
-    # Reset per-leg qty overrides, quotes, and limit prices
+    # Reset per-leg qty overrides, quotes, and combo price
     for i in range(len(legs)):
         st.session_state.pop(f"td_qty_{i}", None)
         st.session_state.pop(f"td_quote_{i}", None)
-        st.session_state.pop(f"td_price_{i}", None)
+    st.session_state.pop("td_combo_price", None)
 
 
 def render_trade_dialog(
@@ -146,6 +146,9 @@ def _render_trade_ticket(
     st.markdown("#### Legs")
     for i, leg in enumerate(legs):
         _render_leg_card(i, leg, market_data_service)
+
+    # ── Combo Net Quote (for multi-leg) ───────────────────────────────────
+    _render_combo_pricing(legs)
 
     st.markdown("---")
 
@@ -218,14 +221,14 @@ def _render_trade_ticket(
 # ---------------------------------------------------------------------------
 
 def _render_leg_card(leg_index: int, leg: dict, market_data_service) -> None:
-    """Render one leg as a bordered card with qty input and bid/ask fetch."""
+    """Render one leg as a compact card with qty input and per-leg bid/ask (read-only)."""
     action   = str(leg.get("action", "BUY")).upper()
     symbol   = str(leg.get("symbol", "?")).upper()
     itype    = str(leg.get("instrument_type", "Option"))
     strike   = leg.get("strike")
     right    = str(leg.get("right") or "").upper()
     expiry   = leg.get("expiry")
-    conid    = leg.get("conid")
+    conid    = leg.get("conid") or leg.get("conId")
 
     # Format expiry
     expiry_str = ""
@@ -246,7 +249,7 @@ def _render_leg_card(leg_index: int, leg: dict, market_data_service) -> None:
     action_color = "#e74c3c" if action == "SELL" else "#27ae60"
 
     with st.container(border=True):
-        # Header row
+        # Header row: action badge + symbol + description + qty input
         h1, h2 = st.columns([6, 4])
         with h1:
             st.markdown(
@@ -254,14 +257,12 @@ def _render_leg_card(leg_index: int, leg: dict, market_data_service) -> None:
                 f"padding:3px 10px;border-radius:4px;font-weight:700;"
                 f"font-size:0.9em'>{action}</span> "
                 f"&nbsp;<b style='font-size:1.1em'>{symbol}</b>&nbsp;"
-                f"<span style='color:#888;font-size:0.9em'>{leg_label}</span>"
-                + (f"&nbsp;<span style='color:#aaa;font-size:0.75em'>conId:{conid}</span>" if conid else ""),
+                f"<span style='color:#888;font-size:0.9em'>{leg_label}</span>",
                 unsafe_allow_html=True,
             )
 
         with h2:
-            # Qty input — stored in session state under td_qty_{i}
-            default_qty = int(leg.get("qty", 1) or 1)
+            default_qty = int(leg.get("qty", leg.get("quantity", 1)) or 1)
             qty_key = f"td_qty_{leg_index}"
             if qty_key not in st.session_state:
                 st.session_state[qty_key] = default_qty
@@ -277,9 +278,14 @@ def _render_leg_card(leg_index: int, leg: dict, market_data_service) -> None:
             )
             st.caption("contracts")
 
-        # Bid/Ask row
+        # Bid/Ask row — per-leg (informational, not editable price)
         quote_key = f"td_quote_{leg_index}"
         cached_quote = st.session_state.get(quote_key)
+
+        # Inline bid/ask from leg data (proposer provides bid/ask/mid)
+        leg_bid = leg.get("bid")
+        leg_ask = leg.get("ask")
+        leg_mid = leg.get("mid")
 
         qa_col, btn_col = st.columns([6, 2])
         with qa_col:
@@ -296,6 +302,17 @@ def _render_leg_card(leg_index: int, leg: dict, market_data_service) -> None:
                     f"<b>{last}</b>",
                     unsafe_allow_html=True,
                 )
+            elif leg_bid is not None and leg_ask is not None:
+                # Use proposer-provided prices as fallback
+                st.markdown(
+                    f"<span style='font-size:0.85em;color:#aaa'>Bid&nbsp;</span>"
+                    f"<b style='color:#e74c3c'>${float(leg_bid):.2f}</b>"
+                    f"<span style='font-size:0.85em;color:#aaa'>&nbsp;/&nbsp;Ask&nbsp;</span>"
+                    f"<b style='color:#27ae60'>${float(leg_ask):.2f}</b>"
+                    + (f"<span style='font-size:0.85em;color:#aaa'>&nbsp;Mid&nbsp;</span>"
+                       f"<b>${float(leg_mid):.2f}</b>" if leg_mid is not None else ""),
+                    unsafe_allow_html=True,
+                )
             else:
                 st.caption("Bid / Ask — click 💲 to fetch")
 
@@ -310,9 +327,8 @@ def _render_leg_card(leg_index: int, leg: dict, market_data_service) -> None:
             ):
                 with st.spinner(""):
                     try:
-                        _conid_int = int(conid) if conid else None
-                        if _conid_int and market_data_service is not None:
-                            # Direct conid lookup — works for FOP/OPT/FUT/STK
+                        _conid_int = int(conid) if conid else 0
+                        if _conid_int > 0 and market_data_service is not None:
                             quote = market_data_service.get_quote_by_conid(_conid_int, symbol=symbol)
                         elif itype == "Future":
                             quote = market_data_service.get_futures_quote(symbol)
@@ -325,41 +341,122 @@ def _render_leg_card(leg_index: int, leg: dict, market_data_service) -> None:
                         st.warning(f"Price fetch failed: {exc}")
                 st.rerun()
 
-        # ── Limit price input with auto-fill from bid/ask ─────────────────
-        price_key = f"td_price_{leg_index}"
-        if price_key not in st.session_state:
-            st.session_state[price_key] = 0.0
-
-        bid_val  = cached_quote.bid  if (cached_quote and cached_quote.bid  is not None) else None
-        ask_val  = cached_quote.ask  if (cached_quote and cached_quote.ask  is not None) else None
-
-        p_col, bid_btn_col, ask_btn_col = st.columns([4, 2, 2])
-        with p_col:
-            st.number_input(
-                "Limit Price",
-                min_value=0.0,
-                step=0.05,
-                format="%.2f",
-                key=price_key,
-                help="Net debit/credit per contract (leave 0 for market)",
-            )
-        with bid_btn_col:
-            if bid_val is not None:
-                if st.button(f"📥 Bid {bid_val:.2f}", key=f"td_use_bid_{leg_index}", use_container_width=True):
-                    st.session_state[price_key] = float(bid_val)
-                    st.rerun()
-            else:
-                st.button("📥 Bid —", key=f"td_use_bid_{leg_index}", disabled=True, use_container_width=True)
-        with ask_btn_col:
-            if ask_val is not None:
-                if st.button(f"📥 Ask {ask_val:.2f}", key=f"td_use_ask_{leg_index}", use_container_width=True):
-                    st.session_state[price_key] = float(ask_val)
-                    st.rerun()
-            else:
-                st.button("📥 Ask —", key=f"td_use_ask_{leg_index}", disabled=True, use_container_width=True)
-
-        # Update leg qty in session so _build_order_from_dialog can read it
+        # Store qty for _build_order_from_dialog
         leg["_dialog_qty"] = qty_val
+
+
+# ---------------------------------------------------------------------------
+# Combo net pricing (multi-leg) + limit price input
+# ---------------------------------------------------------------------------
+
+def _render_combo_pricing(legs: list[dict]) -> None:
+    """Show combo net bid/ask/mid for multi-leg + a single limit price input.
+
+    For single-leg trades, shows limit price directly from that leg's quote.
+    For multi-leg (spreads), calculates the net debit/credit from all legs.
+    """
+    n_legs = len(legs)
+    has_quotes = False
+
+    # Gather per-leg quote data (from live fetch or proposer data)
+    leg_quotes: list[dict] = []
+    for i, leg in enumerate(legs):
+        cached = st.session_state.get(f"td_quote_{i}")
+        action = str(leg.get("action", "BUY")).upper()
+        qty = int(st.session_state.get(f"td_qty_{i}", leg.get("qty", leg.get("quantity", 1))) or 1)
+
+        bid = ask = mid = None
+        if cached:
+            bid = cached.bid
+            ask = cached.ask
+            mid = (bid + ask) / 2.0 if (bid is not None and ask is not None) else None
+            has_quotes = True
+        elif leg.get("bid") is not None and leg.get("ask") is not None:
+            bid = float(leg["bid"])
+            ask = float(leg["ask"])
+            mid = float(leg["mid"]) if leg.get("mid") is not None else (bid + ask) / 2.0
+            has_quotes = True
+
+        leg_quotes.append({"action": action, "qty": qty, "bid": bid, "ask": ask, "mid": mid})
+
+    # ── Combo net calculation ─────────────────────────────────────────────
+    combo_bid = combo_ask = combo_mid = None
+    if has_quotes:
+        _cb = _ca = _cm = 0.0
+        all_quoted = True
+        for lq in leg_quotes:
+            if lq["bid"] is None or lq["ask"] is None:
+                all_quoted = False
+                break
+            if lq["action"] == "SELL":
+                _cb += lq["qty"] * lq["bid"]
+                _ca += lq["qty"] * lq["ask"]
+                _cm += lq["qty"] * lq["mid"]
+            else:  # BUY
+                _cb -= lq["qty"] * lq["ask"]
+                _ca -= lq["qty"] * lq["bid"]
+                _cm -= lq["qty"] * lq["mid"]
+        if all_quoted:
+            combo_bid = _cb
+            combo_ask = _ca
+            combo_mid = _cm
+
+    # ── Display ───────────────────────────────────────────────────────────
+    st.markdown("---")
+    if n_legs > 1:
+        st.markdown("#### Combo Net Price")
+    else:
+        st.markdown("#### Order Price")
+
+    if combo_bid is not None:
+        _sign = "Credit" if combo_mid > 0 else "Debit"
+        q1, q2, q3, q4 = st.columns(4)
+        with q1:
+            st.metric("Net Bid", f"${combo_bid:+.2f}")
+        with q2:
+            st.metric("Net Ask", f"${combo_ask:+.2f}")
+        with q3:
+            st.metric("Net Mid", f"${combo_mid:+.2f}")
+        with q4:
+            spread = abs(combo_ask - combo_bid)
+            st.metric("Spread", f"${spread:.2f}")
+        st.caption(f"{'💰 Net ' + _sign if combo_mid != 0 else 'Even'} "
+                   f"{'— positive = you receive premium' if combo_mid > 0 else '— negative = you pay premium' if combo_mid < 0 else ''}")
+    elif not has_quotes:
+        st.caption("Fetch quotes on each leg above to see combo pricing")
+    else:
+        st.warning("Not all legs have quotes — combo price incomplete")
+
+    # ── Limit price input with auto-fill from combo ───────────────────────
+    price_key = "td_combo_price"
+    if price_key not in st.session_state:
+        st.session_state[price_key] = 0.0
+
+    p_col, mid_btn, nat_btn = st.columns([4, 2, 2])
+    with p_col:
+        st.number_input(
+            "Limit Price (net)",
+            step=0.05,
+            format="%.2f",
+            key=price_key,
+            help="Net debit/credit for the combo. Negative = debit (you pay). Positive = credit (you receive). 0 = market order.",
+        )
+    with mid_btn:
+        if combo_mid is not None:
+            if st.button(f"📥 Mid {combo_mid:+.2f}", key="td_use_mid", use_container_width=True):
+                st.session_state[price_key] = round(combo_mid, 2)
+                st.rerun()
+        else:
+            st.button("📥 Mid —", key="td_use_mid", disabled=True, use_container_width=True)
+    with nat_btn:
+        if combo_bid is not None:
+            # "Natural" = best available (bid for sells, worst for buyers)
+            nat = combo_bid if combo_mid >= 0 else combo_ask
+            if st.button(f"📥 Nat {nat:+.2f}", key="td_use_nat", use_container_width=True):
+                st.session_state[price_key] = round(nat, 2)
+                st.rerun()
+        else:
+            st.button("📥 Nat —", key="td_use_nat", disabled=True, use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
@@ -582,12 +679,9 @@ def _build_order_from_dialog(
         st.error(f"Unknown order type: {order_type_str}")
         return None
 
-    # Collect limit prices from dialog inputs; use first non-zero as net price
-    _prices = [
-        float(st.session_state.get(f"td_price_{i}", 0.0) or 0.0)
-        for i in range(len(legs))
-    ]
-    _net_price: Optional[float] = next((p for p in _prices if p > 0.0), None)
+    # Collect limit price from the combo net price input
+    _combo_price = float(st.session_state.get("td_combo_price", 0.0) or 0.0)
+    _net_price: Optional[float] = _combo_price if _combo_price != 0.0 else None
 
     try:
         return Order(

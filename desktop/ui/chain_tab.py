@@ -51,6 +51,7 @@ class ChainTab(QWidget):
         self._engine = engine
         self._last_chain_params: tuple | None = None  # (underlying, expiry, sec_type, exchange)
         self._cart: list[tuple] = []  # list of (ChainRow, action_str)
+        self._loading_expiries = False
         self._setup_ui()
         self._connect_signals()
         # ── Live price refresh timer (visible strikes only) ──
@@ -189,6 +190,7 @@ class ChainTab(QWidget):
         self._engine.positions_updated.connect(self._on_positions_loaded)
         self._cmb_sec_type.currentTextChanged.connect(self._on_sec_type_changed)
         self._cmb_underlying.currentTextChanged.connect(self._on_underlying_changed)
+        self._cmb_expiry.currentTextChanged.connect(self._on_expiry_changed)
         # Cart buttons
         self._btn_cart_remove.clicked.connect(self._on_cart_remove)
         self._btn_cart_clear.clicked.connect(self._on_cart_clear)
@@ -232,6 +234,14 @@ class ChainTab(QWidget):
         self._cmb_expiry.clear()
         self._stream_timer.stop()
 
+    @Slot(str)
+    def _on_expiry_changed(self, _expiry_text: str) -> None:
+        self._clear_chain_view("Loading new expiry…")
+        if self._loading_expiries or not self._engine.is_connected:
+            return
+        if self._cmb_expiry.currentText().strip():
+            self._on_fetch()
+
     @Slot()
     def _on_clear_reload(self) -> None:
         """Cancel all streaming subscriptions, clear the model, and re-fetch."""
@@ -262,14 +272,23 @@ class ChainTab(QWidget):
             pos_expiries = self._engine.get_position_expiries(underlying)
             all_expiries = sorted(set(expiries) | set(pos_expiries))
             try:
+                self._loading_expiries = True
+                self._cmb_expiry.blockSignals(True)
                 self._cmb_expiry.clear()
                 self._cmb_expiry.addItems(all_expiries[:30])  # limit to 30 nearest
                 if all_expiries:
                     self._cmb_expiry.setCurrentIndex(0)
-                    # Auto-fetch chain for the first expiry immediately
-                    self._on_fetch()
+                self._cmb_expiry.blockSignals(False)
+                if all_expiries:
+                    self._on_expiry_changed(self._cmb_expiry.currentText())
             except RuntimeError:
                 return  # Widget deleted during shutdown
+            finally:
+                self._loading_expiries = False
+                try:
+                    self._cmb_expiry.blockSignals(False)
+                except RuntimeError:
+                    pass
         except Exception as exc:
             try:
                 self._lbl_status.setText(f"Expiry load failed: {exc}")
@@ -325,7 +344,12 @@ class ChainTab(QWidget):
 
     @Slot(list)
     def _on_chain_ready(self, rows: list) -> None:
-        self._model.set_data(rows)
+        current_expiry = self._cmb_expiry.currentText().strip()
+        filtered_rows = [
+            row for row in rows
+            if not current_expiry or str(getattr(row, "expiry", "")).startswith(current_expiry)
+        ]
+        self._model.set_data(filtered_rows)
 
     @Slot()
     def _on_stream_tick(self) -> None:
@@ -370,6 +394,15 @@ class ChainTab(QWidget):
                 )
         except Exception:
             pass  # silent — streaming failures are non-fatal
+
+    def _clear_chain_view(self, status: str) -> None:
+        self._stream_timer.stop()
+        try:
+            self._engine.cancel_chain_streaming()
+        except Exception:
+            pass
+        self._model.set_data([])
+        self._lbl_status.setText(status)
 
     @Slot(QModelIndex)
     def _on_double_click(self, index: QModelIndex) -> None:

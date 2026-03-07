@@ -14,17 +14,17 @@ Portfolio risk dashboard combining IBKR positions with options Greeks enrichment
 - **BetaWeighter** — per-position SPX beta-weighted delta (Tastytrade data + yfinance fallback)
 - **ExecutionEngine** — multi-leg BAG combo order routing, WhatIf simulation, PARTIAL fill support
 - **Trade Journal** — persistent SQLite log of all fills with VIX, regime, Greeks captured at fill time; CSV export
-- **AI Risk Analyst** — GPT-4.1 trade suggestions on risk breaches; pre-fills order builder on "Use This Trade"
+- **AI Risk Analyst** — GPT-5-mini trade suggestions on risk breaches; pre-fills order builder on "Use This Trade"
 - **Historical Charts** — NLV vs SPX-Delta dual-axis, Theta/Delta efficiency ratio, Sebastian |Θ|/|V| ratio
 - **Flatten Risk** — one-click buy-to-close all short options with mandatory confirmation dialog
 - AI assistant scaffolding with tool schema definitions
 
 ## New Environment Variables
 
-| Variable                    | Default   | Description                                        |
-| --------------------------- | --------- | -------------------------------------------------- |
-| `LLM_MODEL`                 | `gpt-4.1` | LLM model for AI Risk Analyst / Market Brief       |
-| `SNAPSHOT_INTERVAL_SECONDS` | `900`     | Seconds between account snapshot captures (15 min) |
+| Variable                    | Default      | Description                                        |
+| --------------------------- | ------------ | -------------------------------------------------- |
+| `LLM_MODEL`                 | `gpt-5-mini` | LLM model for AI Risk Analyst / Market Brief       |
+| `SNAPSHOT_INTERVAL_SECONDS` | `900`        | Seconds between account snapshot captures (15 min) |
 
 ## Setup
 
@@ -48,6 +48,24 @@ cp .env.example .env
 ```
 
 This script ensures IBKR Client Portal is reachable, then launches Streamlit.
+
+To launch the desktop app (PySide6):
+
+```bash
+./start_desktop.sh
+```
+
+On macOS, you can also double-click:
+
+```bash
+start_desktop.command
+```
+
+You can override runtime values via env vars, for example:
+
+```bash
+IB_SOCKET_HOST=127.0.0.1 IB_SOCKET_PORT=4001 DESKTOP_CLIENT_ID=30 ./start_desktop.sh
+```
 
 ## Testing
 
@@ -89,6 +107,7 @@ Integration tests (require credentials/network):
 ### Feature 006: Trade Proposer
 
 Every 300 s the agent:
+
 1. Fetches live Greeks from IBKR (or uses `MOCK_BREACH=TRUE` synthetic breach for CI)
 2. Detects regime-adjusted limit breaches via `BreachDetector` → `config/risk_matrix.yaml`
 3. Generates SPX/SPY/ES option candidates (bear put spreads, calendar spreads)

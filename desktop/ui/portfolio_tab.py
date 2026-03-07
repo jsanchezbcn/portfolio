@@ -18,12 +18,13 @@ from typing import TYPE_CHECKING
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTableView, QHeaderView, QGroupBox, QSplitter,
-    QButtonGroup, QRadioButton, QFrame,
+    QButtonGroup, QRadioButton, QFrame, QComboBox, QCheckBox,
 )
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Qt, Slot, Signal, QPoint
 
 from desktop.models.table_models import PositionsTableModel
 from desktop.models.trade_groups import TradeGroupsModel
+from desktop.ui.widgets.position_menu import PositionContextMenu
 
 if TYPE_CHECKING:
     from desktop.engine.ib_engine import IBEngine, AccountSummary
@@ -35,10 +36,13 @@ class PortfolioTab(QWidget):
     The view toggle (Raw | Trades) lives in the toolbar.
     """
 
+    position_action_requested = Signal(dict)
+
     def __init__(self, engine: IBEngine, parent=None):
         super().__init__(parent)
         self._engine = engine
         self._raw_positions: list = []   # last fetched rows
+        self._compact_mode = False
         self._setup_ui()
         self._connect_signals()
 
@@ -102,6 +106,32 @@ class PortfolioTab(QWidget):
         toolbar.addWidget(self._btn_raw)
         toolbar.addWidget(self._btn_trades)
 
+        toolbar.addSpacing(12)
+        sort_lbl = QLabel("Sort by:")
+        sort_lbl.setStyleSheet("color:#aaa;")
+        toolbar.addWidget(sort_lbl)
+
+        self._cmb_sort_metric = QComboBox()
+        self._cmb_sort_metric.addItem("Default", userData="none")
+        self._cmb_sort_metric.addItem("Unrealized PnL", userData="unrealized_pnl")
+        self._cmb_sort_metric.addItem("Market Value", userData="market_value")
+        self._cmb_sort_metric.addItem("Delta (Δ)", userData="delta")
+        self._cmb_sort_metric.addItem("Gamma (Γ)", userData="gamma")
+        self._cmb_sort_metric.addItem("Theta (Θ)", userData="theta")
+        self._cmb_sort_metric.addItem("Vega (V)", userData="vega")
+        self._cmb_sort_metric.addItem("SPX Delta", userData="spx_delta")
+        toolbar.addWidget(self._cmb_sort_metric)
+
+        self._chk_sort_abs = QCheckBox("Abs")
+        self._chk_sort_abs.setChecked(True)
+        self._chk_sort_abs.setToolTip("Sort by absolute value (magnitude)")
+        toolbar.addWidget(self._chk_sort_abs)
+
+        self._cmb_sort_order = QComboBox()
+        self._cmb_sort_order.addItem("Desc", userData=True)
+        self._cmb_sort_order.addItem("Asc", userData=False)
+        toolbar.addWidget(self._cmb_sort_order)
+
         toolbar.addStretch()
         self._lbl_status = QLabel("Ready")
         self._lbl_status.setStyleSheet("color: #888;")
@@ -111,17 +141,25 @@ class PortfolioTab(QWidget):
         # ── Positions table ───────────────────────────────────────────────
         self._raw_model    = PositionsTableModel()
         self._trades_model = TradeGroupsModel()
+        self._model = self._raw_model
         self._table = QTableView()
         self._table.setModel(self._raw_model)
         self._table.setAlternatingRowColors(True)
         self._table.setSortingEnabled(False)
         self._table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self._table.verticalHeader().setVisible(False)
 
         layout.addWidget(self._table, stretch=1)
+
+    def set_compact_mode(self, enabled: bool) -> None:
+        self._compact_mode = bool(enabled)
+        hidden_columns = {2, 4, 8, 9, 10, 11, 16} if self._compact_mode else set()
+        for col in range(self._table.model().columnCount() if self._table.model() else 18):
+            self._table.setColumnHidden(col, col in hidden_columns)
 
 
     def _metric_label(self, title: str, value: str) -> QLabel:
@@ -139,6 +177,10 @@ class PortfolioTab(QWidget):
         self._engine.positions_updated.connect(self._on_positions_updated)
         self._engine.account_updated.connect(self._on_account_updated)
         self._view_group.idToggled.connect(self._on_view_toggled)
+        self._table.customContextMenuRequested.connect(self._on_context_menu_requested)
+        self._cmb_sort_metric.currentIndexChanged.connect(self._on_sort_changed)
+        self._cmb_sort_order.currentIndexChanged.connect(self._on_sort_changed)
+        self._chk_sort_abs.stateChanged.connect(self._on_sort_changed)
 
     # ── slots ─────────────────────────────────────────────────────────────
 
@@ -146,14 +188,15 @@ class PortfolioTab(QWidget):
     def _on_view_toggled(self, btn_id: int, checked: bool) -> None:
         if not checked:
             return
-        if btn_id == 0:
-            self._table.setModel(self._raw_model)
-        else:
-            self._trades_model.set_data(self._raw_positions)
-            self._table.setModel(self._trades_model)
+        self._apply_current_view_data()
         self._table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents
         )
+        self.set_compact_mode(self._compact_mode)
+
+    @Slot()
+    def _on_sort_changed(self) -> None:
+        self._apply_current_view_data()
 
     @Slot()
     def _on_refresh(self) -> None:
@@ -172,10 +215,7 @@ class PortfolioTab(QWidget):
     @Slot(list)
     def _on_positions_updated(self, rows: list) -> None:
         self._raw_positions = rows
-        if self._view_group.checkedId() == 0:
-            self._raw_model.set_data(rows)
-        else:
-            self._trades_model.set_data(rows)
+        self._apply_current_view_data()
         self._lbl_status.setText(f"{len(rows)} positions loaded")
 
         # ── Data quality banner ──────────────────────────────────────────
@@ -187,13 +227,42 @@ class PortfolioTab(QWidget):
             1 for r in rows
             if getattr(r, "sec_type", "") == "STK" and getattr(r, "spx_delta", None) is None
         )
+        estimated_greeks = sum(
+            1 for r in rows
+            if getattr(r, "sec_type", "") in ("OPT", "FOP") and getattr(r, "greeks_source", None) == "estimated_bsm"
+        )
         parts: list[str] = []
         if missing_greeks:
             parts.append(f"⚠ {missing_greeks} option(s) missing Greeks")
+        if estimated_greeks:
+            parts.append(f"≈ {estimated_greeks} option(s) using local estimated Greeks")
         if missing_spx:
             parts.append(f"⚠ {missing_spx} stock(s) missing SPX Δ")
         self._lbl_data_quality.setText("   |   ".join(parts))
         self._lbl_data_quality.setVisible(bool(parts))
+        self.set_compact_mode(self._compact_mode)
+
+    def _apply_current_view_data(self) -> None:
+        metric = str(self._cmb_sort_metric.currentData() or "none")
+        descending = bool(self._cmb_sort_order.currentData())
+        absolute = self._chk_sort_abs.isChecked()
+
+        # Trade-groups view is intentionally grouped/structured and does not support
+        # numeric metric sorting. When a sort metric is selected, force Raw view.
+        if metric != "none" and self._view_group.checkedId() != 0:
+            self._btn_raw.setChecked(True)
+            self._lbl_status.setText("Sorted view uses Raw mode")
+
+        if self._view_group.checkedId() == 0:
+            self._raw_model.set_sorting(metric, descending=descending, absolute=absolute)
+            self._raw_model.set_data(self._raw_positions)
+            self._model = self._raw_model
+            self._table.setModel(self._raw_model)
+            return
+
+        self._trades_model.set_data(self._raw_positions)
+        self._model = self._trades_model
+        self._table.setModel(self._trades_model)
 
     @Slot(object)
     def _on_account_updated(self, summary: AccountSummary) -> None:
@@ -212,3 +281,41 @@ class PortfolioTab(QWidget):
             f"<small>Realized PnL</small><br/>"
             f"<b style='color:{rpnl_color}'>${summary.realized_pnl:+,.2f}</b>"
         )
+
+    @Slot(QPoint)
+    def _on_context_menu_requested(self, point: QPoint) -> None:
+        index = self._table.indexAt(point)
+        if not index.isValid():
+            return
+        payload = self._payload_for_row(index.row())
+        if not payload:
+            return
+        menu = PositionContextMenu(self, payload)
+        action = menu.exec_for_table(self._table, point)
+        if action:
+            self._emit_position_action(payload, action)
+
+    def _payload_for_row(self, row: int) -> dict | None:
+        model = self._table.model()
+        if model is self._raw_model:
+            position = self._raw_model.position_at(row)
+            if position is None:
+                return None
+            return {
+                "kind": "position",
+                "view": "raw",
+                "description": position.symbol,
+                "legs": [position],
+            }
+        if model is self._trades_model:
+            payload = self._trades_model.payload_at(row)
+            if payload is None:
+                return None
+            payload["view"] = "trades"
+            return payload
+        return None
+
+    def _emit_position_action(self, payload: dict, action: str) -> None:
+        outbound = dict(payload)
+        outbound["action"] = action.upper()
+        self.position_action_requested.emit(outbound)

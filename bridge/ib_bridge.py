@@ -125,7 +125,7 @@ class SocketBridge(IBridgeBase):
 
     Environment variables:
       IB_SOCKET_HOST   – default: 127.0.0.1
-      IB_SOCKET_PORT   – default: 7496
+            IB_SOCKET_PORT   – default: 4001
       IB_CLIENT_ID     – default: 10  (must differ from TWS/iPad client; those use 0)
     """
 
@@ -133,7 +133,7 @@ class SocketBridge(IBridgeBase):
         from ib_async import IB
         self._ib = IB()
         self._host    = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
-        self._port    = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        self._port    = int(os.getenv("IB_SOCKET_PORT", "4001"))
         self._client_id = int(os.getenv("IB_CLIENT_ID", "10"))
 
     # ── lifecycle ──────────────────────────────────────────────────────────
@@ -206,7 +206,7 @@ class SocketBridge(IBridgeBase):
 
             sec_type = getattr(contract, "secType", "")
 
-            if sec_type == "OPT":
+            if sec_type in ("OPT", "FOP"):
                 try:
                     ticker = await asyncio.wait_for(
                         self._request_greeks(contract),
@@ -244,7 +244,8 @@ class SocketBridge(IBridgeBase):
     async def _request_greeks(self, contract):
         """Subscribe to market data and wait for modelGreeks to populate."""
         from ib_async import util as ib_util
-        ticker = self._ib.reqMktData(contract, "", False, False)
+        generic_ticks = os.getenv("IB_GREEKS_GENERIC_TICKS", "100,101,104,106").strip()
+        ticker = self._ib.reqMktData(contract, generic_ticks, False, False)
         # wait until modelGreeks is available (poll up to 3 s)
         for _ in range(30):
             if ticker.modelGreeks is not None:

@@ -540,7 +540,7 @@ class IBKRAdapter(BrokerAdapter):
             return []
 
         host      = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
-        port      = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        port      = int(os.getenv("IB_SOCKET_PORT", "4001"))
         client_id = int(os.getenv("IB_POSITIONS_CLIENT_ID", "11"))
 
         ib = IB()
@@ -761,7 +761,7 @@ class IBKRAdapter(BrokerAdapter):
             return 0.0
 
         host            = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
-        port            = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        port            = int(os.getenv("IB_SOCKET_PORT", "4001"))
         client_id       = int(os.getenv("IB_SPX_PRICE_CLIENT_ID", "14"))
         market_data_type = int(os.getenv("IB_GREEKS_MARKET_DATA_TYPE", "3"))
 
@@ -828,7 +828,7 @@ class IBKRAdapter(BrokerAdapter):
             return {}
 
         host = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
-        port = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        port = int(os.getenv("IB_SOCKET_PORT", "4001"))
         client_id = int(os.getenv("IB_ACCT_SUMMARY_CLIENT_ID", "13"))
 
         ib = IB()
@@ -963,10 +963,11 @@ class IBKRAdapter(BrokerAdapter):
             return {}
 
         host      = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
-        port      = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        port      = int(os.getenv("IB_SOCKET_PORT", "4001"))
         client_id = int(os.getenv("IB_GREEKS_CLIENT_ID", "12"))
         poll_secs = float(os.getenv("IB_GREEKS_POLL_SECS", "45"))
         market_data_type = int(os.getenv("IB_GREEKS_MARKET_DATA_TYPE", "3"))
+        greeks_generic_ticks = os.getenv("IB_GREEKS_GENERIC_TICKS", "100,101,104,106").strip()
 
         ib = IB()
         built_contracts: list[Contract] = []
@@ -1021,7 +1022,7 @@ class IBKRAdapter(BrokerAdapter):
                 for c, (pos, cid) in zip(built_contracts, active, strict=False):
                     if cid not in pending_conids:
                         continue
-                    ticker = ib.reqMktData(c, "", False, False)
+                    ticker = ib.reqMktData(c, greeks_generic_ticks, False, False)
                     tickers.append((cid, ticker))
 
                 loop = asyncio.get_running_loop()
@@ -1524,7 +1525,7 @@ class IBKRAdapter(BrokerAdapter):
             return {"init_margin_change": 0.0, "maint_margin_change": 0.0}
 
         host      = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
-        port      = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        port      = int(os.getenv("IB_SOCKET_PORT", "4001"))
         client_id = int(os.getenv("IB_WHATIF_CLIENT_ID", "15"))  # distinct from acct-summary (13)
 
         ib = IB()
@@ -1708,7 +1709,7 @@ class IBKRAdapter(BrokerAdapter):
             return []
 
         host = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
-        port = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        port = int(os.getenv("IB_SOCKET_PORT", "4001"))
         client_id = int(os.getenv("IB_CHAIN_CLIENT_ID", "19"))
         connect_timeout = float(os.getenv("IB_CHAIN_CONNECT_TIMEOUT", "10.0"))
 
@@ -1806,7 +1807,7 @@ class IBKRAdapter(BrokerAdapter):
             return []
 
         host = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
-        port = int(os.getenv("IB_SOCKET_PORT", "7496"))
+        port = int(os.getenv("IB_SOCKET_PORT", "4001"))
         # Use a distinct client ID for chain-matrix fetches (separate from expiration lookup)
         client_id = int(os.getenv("IB_CHAIN_MATRIX_CLIENT_ID", os.getenv("IB_CHAIN_CLIENT_ID", "20")))
         poll_secs = float(os.getenv("IB_CHAIN_POLL_SECS", "4.0"))
@@ -1833,6 +1834,7 @@ class IBKRAdapter(BrokerAdapter):
 
         ib = IB()
         rows: list[dict[str, Any]] = []
+        ticker_map: list[tuple[Any, Any]] = []
         try:
             await ib.connectAsync(host=host, port=port, clientId=client_id, timeout=connect_timeout)
             try:
@@ -1909,9 +1911,9 @@ class IBKRAdapter(BrokerAdapter):
             if not qualified_opts:
                 return []
 
-            ticker_map: list[tuple[Any, Any]] = []
+            chain_generic_ticks = os.getenv("IB_CHAIN_GENERIC_TICKS", "100,101,104,106").strip()
             for contract in qualified_opts:
-                ticker = ib.reqMktData(contract, "", snapshot=True)
+                ticker = ib.reqMktData(contract, chain_generic_ticks, snapshot=False)
                 ticker_map.append((contract, ticker))
 
             await asyncio.sleep(poll_secs)
@@ -1961,6 +1963,11 @@ class IBKRAdapter(BrokerAdapter):
             LOGGER.warning("fetch_option_chain_matrix_tws failed for %s %s: %s", underlying, expiry, exc)
             return []
         finally:
+            for contract, _ticker in ticker_map:
+                try:
+                    ib.cancelMktData(contract)
+                except Exception:
+                    pass
             try:
                 ib.disconnect()
             except Exception:

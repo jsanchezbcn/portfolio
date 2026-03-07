@@ -450,7 +450,7 @@ def _prefill_order_builder_from_legs(
     normalized: list[dict[str, Any]] = []
     for leg in legs[:4]:
         action = str(leg.get("action", "BUY")).upper()
-        symbol = str(leg.get("symbol") or leg.get("underlying") or "SPX").upper()
+        symbol = str(leg.get("symbol") or leg.get("underlying") or "ES").upper()
         qty_raw = leg.get("quantity", leg.get("qty", 1))
         try:
             qty = max(1, int(float(qty_raw)))
@@ -479,21 +479,12 @@ def _prefill_order_builder_from_legs(
             }
         )
 
-    # Store all prefill data under a SINGLE non-widget key.
-    # render_order_builder will pop this at the TOP of the next run and
-    # write the individual ob_* widget keys before any widgets render.
-    # NOTE: ob_approved and ob_rationale are widget keys — they MUST NOT be
-    # set here (after their widgets have rendered).  They go into the staging
-    # dict and are applied by _render_inner before widgets instantiate.
-    st.session_state["ob_prefill_data"] = {
-        "leg_count": len(normalized),
-        "legs": normalized,
-        "rationale": rationale,
-        "reset_approved": True,   # tell render_order_builder to clear approval
-    }
-    st.session_state["ob_submit_result"] = None  # not a widget key — safe
-    st.session_state["ob_force_expand"] = True    # persistent open flag for Order Builder
-    # Open the inline Trade Ticket dialog (bid/ask + simulate + submit)
+    # Open the inline Trade Ticket dialog (bid/ask + simulate + submit).
+    # We intentionally do NOT set ob_prefill_data / ob_force_expand any more
+    # because the Trade Ticket dialog is the primary interaction — opening
+    # the Order Builder alongside it caused widget-key conflicts
+    # ("ob_symbol_0_1 was created with a default value but also had its
+    # value set via the Session State API").
     open_trade_dialog(normalized, source_label, rationale)
     return True
 
@@ -594,7 +585,7 @@ def _render_order_draft_preview_block(*, key_prefix: str = "order_draft_preview"
                 st.rerun()
 
 
-def _build_order_legs_from_signal(signal: dict[str, Any], default_underlying: str = "SPX") -> list[dict[str, Any]]:
+def _build_order_legs_from_signal(signal: dict[str, Any], default_underlying: str = "ES") -> list[dict[str, Any]]:
     """Convert an arbitrage signal or proposed-trade legs_json into a list of order-leg dicts."""
     signal_type = str(signal.get("signal_type") or "").upper()
     legs_json = signal.get("legs_json") or {}
@@ -633,7 +624,7 @@ def _build_order_legs_from_signal(signal: dict[str, Any], default_underlying: st
             or raw_leg.get("underlying")
             or raw_leg.get("root")
             or fallback_symbol
-            or "SPX"
+            or "ES"
         ).upper()
 
         qty_raw = raw_leg.get("quantity", raw_leg.get("qty", raw_leg.get("contracts", raw_leg.get("size", 1))))
@@ -740,7 +731,7 @@ def _build_order_legs_from_signal(signal: dict[str, Any], default_underlying: st
         return _explicit
 
     # ── 2. Signal-type–specific parsers ──────────────────────────────────────
-    symbol = str(legs_json.get("symbol") or default_underlying or "SPX").upper()
+    symbol = str(legs_json.get("symbol") or default_underlying or "ES").upper()
     # Accept both "expiry" and "expiration" keys
     expiry = legs_json.get("expiry") or legs_json.get("expiration")
 
@@ -978,9 +969,12 @@ def _get_available_models() -> list[dict]:
         return result if result else []
     except Exception:
         return [
+            {"id": "gpt-5-mini", "name": "GPT-5 mini", "is_free": True},
             {"id": "gpt-4.1",     "name": "GPT-4.1",    "is_free": True},
             {"id": "gpt-4o",      "name": "GPT-4o",      "is_free": True},
             {"id": "gpt-4o-mini", "name": "GPT-4o mini", "is_free": True},
+            {"id": "gpt-5",       "name": "GPT-5",       "is_free": False},
+            {"id": "o3",          "name": "o3",          "is_free": False},
         ]
 
 
@@ -1349,7 +1343,7 @@ def _render_trade_proposer_queue(
                 _prem = row.get("net_premium", 0.0)
                 _just = row.get("justification", "")
                 _legs = _build_order_legs_from_signal(
-                    {"signal_type": "", "legs_json": row.get("legs_json", [])}, default_underlying="SPX",
+                    {"signal_type": "", "legs_json": row.get("legs_json", [])}, default_underlying="ES",
                 ) or [lg for lg in row.get("legs_json", []) if isinstance(lg, dict)]
                 _ts = row.get("created_at", "")[:16]
                 _stat = row.get("status", "")
@@ -1534,7 +1528,8 @@ def render_portfolio_content() -> None:
         _all_models = _get_available_models()
         _model_labels = [f"{m['name']} {'🆓' if m['is_free'] else '💰'}" for m in _all_models]
         _model_ids = [m["id"] for m in _all_models]
-        _default_model_idx = next((i for i, m in enumerate(_all_models) if m["id"] == "gpt-4.1"), 0)
+        _preferred_model = (os.getenv("LLM_FAST_MODEL") or os.getenv("LLM_MODEL") or "gpt-5-mini").strip()
+        _default_model_idx = next((i for i, m in enumerate(_all_models) if m["id"] == _preferred_model), 0)
         _sel_idx = st.selectbox(
             "Model",
             options=range(len(_model_labels)),
@@ -1542,7 +1537,7 @@ def render_portfolio_content() -> None:
             index=_default_model_idx,
             key="llm_model_picker",
         )
-        selected_llm_model: str = _model_ids[_sel_idx] if _model_ids else "gpt-4.1"
+        selected_llm_model: str = _model_ids[_sel_idx] if _model_ids else "gpt-5-mini"
 
     with st.sidebar.expander("🔬 Greeks Diagnostics", expanded=False):
         disable_tasty_cache = st.checkbox(
@@ -2087,7 +2082,7 @@ def render_portfolio_content() -> None:
             adapter=adapter,
             summary=summary,
             prefill_order_fn=_prefill_order_builder_from_legs,
-            symbols=["SPX", "/ES", "ES", "SPY", "MES", "QQQ"],
+            symbols=["ES", "MES", "SPY", "/ES", "QQQ"],
         )
     except Exception as _chain_exc:
         LOGGER.warning("Options book panel failed: %s", _chain_exc, exc_info=True)

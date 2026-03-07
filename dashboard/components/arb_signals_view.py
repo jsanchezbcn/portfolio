@@ -113,7 +113,7 @@ def render_arb_signals(
     # Global underlying override
     arb_underlying = st.text_input(
         "Default underlying symbol",
-        value="SPX",
+        value="ES",
         key="arb_signal_underlying_v2",
     )
 

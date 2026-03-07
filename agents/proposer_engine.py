@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-BENCHMARK_ALLOWLIST = frozenset({"SPX", "SPY", "ES"})   # FR-011
+BENCHMARK_ALLOWLIST = frozenset({"ES", "MES", "SPY"})   # FR-011 — tradeable only
 _RISK_MATRIX_PATH   = Path(__file__).parent.parent / "config" / "risk_matrix.yaml"
 
 
@@ -411,7 +411,7 @@ class CandidateGenerator:
 
         if not atm_price:
             # Use rough defaults so candidates can be built without live prices
-            atm_price = {"SPX": 5500.0, "SPY": 550.0, "ES": 5500.0}.get(underlying, 5500.0)
+            atm_price = {"ES": 5500.0, "MES": 5500.0, "SPY": 550.0}.get(underlying, 5500.0)
 
         strike_short = round(atm_price * (1 - self._PUT_SPREAD_WING / 100), -1)
         strike_long  = round(atm_price * (1 - self._PUT_SPREAD_FLOOR / 100), -1)
@@ -447,8 +447,8 @@ class CandidateGenerator:
                 underlying=underlying,
                 strategy_name=f"{underlying} Bear Put Spread {dte_target} DTE",
                 legs=legs,
-                vega_reduction=50.0 * (1 if underlying == "SPX" else 0.1),
-                delta_reduction=-5.0 * (1 if underlying == "SPX" else 0.1),
+                vega_reduction=50.0 * (1 if underlying == "SPY" else 0.1),
+                delta_reduction=-5.0 * (1 if underlying == "SPY" else 0.1),
                 breach=breach,
             ))
 
@@ -478,7 +478,7 @@ class CandidateGenerator:
                 underlying=underlying,
                 strategy_name=f"{underlying} Put Calendar {dte_min}/{dte_max} DTE",
                 legs=legs_cal,
-                vega_reduction=80.0 * (1 if underlying == "SPX" else 0.1),
+                vega_reduction=80.0 * (1 if underlying == "SPY" else 0.1),
                 delta_reduction=0.0,
                 breach=breach,
             ))
@@ -555,7 +555,7 @@ class CandidateGenerator:
         candidates: list[CandidateTrade] = []
 
         if not atm_price:
-            atm_price = {"SPX": 5500.0, "SPY": 550.0, "ES": 5500.0}.get(underlying, 5500.0)
+            atm_price = {"ES": 5500.0, "MES": 5500.0, "SPY": 550.0}.get(underlying, 5500.0)
 
         # Puts strictly below ATM, sorted nearest-ATM first
         otm_puts = sorted(
@@ -606,8 +606,8 @@ class CandidateGenerator:
                     f"({short_data['strike']:.0f}/{long_data['strike']:.0f})"
                 ),
                 legs=[short_leg, long_leg],
-                vega_reduction=50.0 * (1 if underlying == "SPX" else 0.1),
-                delta_reduction=-5.0 * (1 if underlying == "SPX" else 0.1),
+                vega_reduction=50.0 * (1 if underlying == "SPY" else 0.1),
+                delta_reduction=-5.0 * (1 if underlying == "SPY" else 0.1),
                 net_premium=net_prem,
                 breach=breach,
             ))
@@ -674,7 +674,7 @@ class ProposerEngine:
         all_candidates: list[CandidateTrade] = []
 
         for breach in breaches[:3]:  # process top-3 breaches max
-            for underlying in ("SPX", "ES"):  # primary benchmarks
+            for underlying in ("ES", "MES", "SPY"):  # tradeable benchmarks only
                 raw = await self._generator.get_candidates(
                     underlying=underlying,
                     breach=breach,

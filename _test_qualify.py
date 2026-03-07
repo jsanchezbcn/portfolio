@@ -12,7 +12,7 @@ async def test_qualify():
     from ib_async import IB, Contract
 
     host = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
-    port = int(os.getenv("IB_SOCKET_PORT", "7496"))
+    port = int(os.getenv("IB_SOCKET_PORT", "4001"))
     client_id = 21  # Fresh client ID for test
 
     ib = IB()

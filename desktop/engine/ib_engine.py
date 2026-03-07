@@ -34,6 +34,7 @@ import time as _time_mod  # for cache TTL checks
 from PySide6.QtCore import QObject, Signal
 
 from desktop.db.database import Database
+from desktop.engine.greeks_engine import GreeksEngine
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,8 @@ class PositionRow:
     vega: float | None
     iv: float | None
     spx_delta: float | None
+    greeks_source: str | None = None
+    underlying_price: float | None = None
 
 
 @dataclass
@@ -186,6 +189,7 @@ class IBEngine(QObject):
     orders_updated    = Signal(list)                    # list[OpenOrder]
     market_snapshot   = Signal(object)                  # MarketSnapshot
     error_occurred    = Signal(str)                     # error message
+    connection_state  = Signal(str, str)                # state, detail
 
     def __init__(
         self,
@@ -203,8 +207,17 @@ class IBEngine(QObject):
         self._db = Database(db_dsn)
         self._db_ok = False
         self._account_id: str = ""
+        self._manual_disconnect_requested = False
+        self._reconnect_task: asyncio.Task | None = None
+        self._reconnect_lock = asyncio.Lock()
+        self._watchdog_max_attempts = max(1, int(os.getenv("IB_RECONNECT_MAX_ATTEMPTS", "5")))
+        self._watchdog_backoff_cap = max(5, int(os.getenv("IB_RECONNECT_BACKOFF_CAP_SECONDS", "120")))
+        self._resolve_warning_ttl = max(5.0, float(os.getenv("IB_RESOLVE_WARNING_TTL_SECONDS", "60")))
+        self._resolve_warning_cache: dict[str, float] = {}
+        self._active_chain_request: dict[str, Any] | None = None
         self._beta_default = 1.0
         self._symbol_betas: dict[str, float] = {}
+        self._greeks_engine = GreeksEngine(risk_free_rate=float(os.getenv("IB_LOCAL_GREEKS_RISK_FREE_RATE", "0.01")))
         self._load_beta_config()
         # ── Option chain caches (keyed by "underlying|expiry|sec_type|exchange") ──
         # TTL: 86400s (1 day).  Cleared on reconnect.
@@ -238,11 +251,21 @@ class IBEngine(QObject):
 
     async def connect(self) -> None:
         """Connect to IB Gateway and (optionally) PostgreSQL."""
+        self._manual_disconnect_requested = False
+        self.connection_state.emit("connecting", f"Connecting to {self._host}:{self._port}")
         # Database is optional — don't block IB connection if DB is down
         try:
             await self._db.connect()
             self._db_ok = True
             logger.info("Database connected")
+            # Load last known Greeks from database for after-hours display
+            try:
+                cached_greeks = await self._db.get_cached_greeks(self._account_id or "U2052408")
+                self._greeks_cache.update(cached_greeks)
+                if cached_greeks:
+                    logger.info("Loaded %d cached Greeks from database", len(cached_greeks))
+            except Exception as exc:
+                logger.debug("Failed to load cached Greeks: %s", exc)
         except Exception as exc:
             self._db_ok = False
             logger.warning("Database unavailable (continuing without): %s", exc)
@@ -251,11 +274,28 @@ class IBEngine(QObject):
         await self._ib.connectAsync(self._host, self._port, clientId=self._client_id, timeout=30)
         accounts = self._ib.managedAccounts()
         self._account_id = accounts[0] if accounts else ""
+        
+        # Reload Greeks cache with the correct account_id
+        if self._db_ok and self._account_id:
+            try:
+                cached_greeks = await self._db.get_cached_greeks(self._account_id)
+                self._greeks_cache.clear()
+                self._greeks_cache.update(cached_greeks)
+                if cached_greeks:
+                    logger.info("Loaded %d cached Greeks from database for account %s", len(cached_greeks), self._account_id)
+            except Exception as exc:
+                logger.debug("Failed to reload cached Greeks after account discovery: %s", exc)
+        
         logger.info("IB connected — account %s", self._account_id)
+        self.connection_state.emit("connected", f"Connected to {self._account_id}")
         self.connected.emit()
 
     async def disconnect(self) -> None:
         """Gracefully disconnect from IB and cancel all open subscriptions."""
+        self._manual_disconnect_requested = True
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
         # ── Cancel all live chain market-data subscriptions ──────────────
         for _conid, (c, _t) in list(getattr(self, "_chain_tickers", {}).items()):
             try:
@@ -283,7 +323,9 @@ class IBEngine(QObject):
             except Exception:
                 pass
             self._db_ok = False
-        self.disconnected.emit()
+        if not self._ib.isConnected():
+            self.connection_state.emit("disconnected", "Disconnected from IBKR")
+            self.disconnected.emit()
 
     @property
     def account_id(self) -> str:
@@ -455,10 +497,20 @@ class IBEngine(QObject):
             pnl = pnl_by_conid.get(c.conId, {})
             # Prefer live greeks; fall back to last known non-empty greeks when live is empty
             live_g = option_greeks_by_conid.get(c.conId, {})
+            greeks_source: str | None = None
             if not any(live_g.get(k) is not None for k in ("delta", "gamma", "theta", "vega")) and c.conId in self._greeks_cache:
                 ticker_greeks = {**self._greeks_cache[c.conId], **{k: v for k, v in live_g.items() if v is not None}}
+                greeks_source = "cached"
             else:
                 ticker_greeks = live_g
+                if any(live_g.get(k) is not None for k in ("delta", "gamma", "theta", "vega")):
+                    greeks_source = "live"
+
+            if c.secType in ("OPT", "FOP"):
+                estimated = self._estimate_option_greeks(contract=c, ticker_greeks=ticker_greeks)
+                if estimated and not any(ticker_greeks.get(k) is not None for k in ("delta", "gamma", "theta", "vega")):
+                    ticker_greeks = {**ticker_greeks, **estimated}
+                    greeks_source = str(estimated.get("source") or "estimated_bsm")
 
             mkt_price = pnl.get("market_price", 0.0)
             mkt_value = pnl.get("market_value", 0.0)
@@ -537,6 +589,16 @@ class IBEngine(QObject):
             else:
                 spx_delta = delta
 
+            # Capture underlying price for display
+            if c.secType in ("OPT", "FOP"):
+                und_price = ticker_greeks.get("undPrice")
+            elif c.secType == "STK":
+                und_price = mkt_price  # For stocks, underlying price = market price
+            elif c.secType == "FUT":
+                und_price = mkt_price  # For futures, show the contract price
+            else:
+                und_price = None
+
             row = {
                 "conid": c.conId,
                 "symbol": c.localSymbol or c.symbol,
@@ -571,12 +633,14 @@ class IBEngine(QObject):
                 market_value=mkt_value,
                 unrealized_pnl=upnl,
                 realized_pnl=rpnl,
+                underlying_price=und_price,
                 delta=delta,
                 gamma=gamma,
                 theta=theta,
                 vega=vega,
                 iv=iv,
                 spx_delta=spx_delta,
+                greeks_source=greeks_source,
             ))
 
             # ── Populate last-price cache from position data ──────────────
@@ -678,6 +742,40 @@ class IBEngine(QObject):
                     "undPrice": und_price,
                 }
         return {"delta": None, "gamma": None, "theta": None, "vega": None, "iv": None, "undPrice": und_price}
+
+    def _estimate_option_greeks(self, *, contract: Any, ticker_greeks: dict[str, Any]) -> dict[str, float | str] | None:
+        """Estimate missing option Greeks from last known underlying price and IV."""
+        iv = self._finite_or_none(ticker_greeks.get("iv"))
+        if iv is None and getattr(contract, "conId", 0) in self._greeks_cache:
+            iv = self._finite_or_none(self._greeks_cache[getattr(contract, "conId", 0)].get("iv"))
+        if iv is None or iv <= 0:
+            return None
+
+        und_price = self._finite_or_none(ticker_greeks.get("undPrice"))
+        if und_price is None or und_price <= 0:
+            und_price = self.last_price(getattr(contract, "symbol", ""))
+        if und_price is None or und_price <= 0:
+            return None
+
+        expiry = self._parse_expiry(getattr(contract, "lastTradeDateOrContractMonth", None))
+        estimate = self._greeks_engine.estimate(
+            underlying_price=und_price,
+            strike=float(getattr(contract, "strike", 0.0) or 0.0),
+            expiry=expiry,
+            right=str(getattr(contract, "right", "C") or "C"),
+            iv=iv,
+        )
+        if estimate is None:
+            return None
+        return {
+            "delta": estimate.delta,
+            "gamma": estimate.gamma,
+            "theta": estimate.theta,
+            "vega": estimate.vega,
+            "iv": estimate.iv,
+            "undPrice": und_price,
+            "source": estimate.source,
+        }
 
     @staticmethod
     def _finite_or_none(value: Any) -> float | None:
@@ -905,6 +1003,13 @@ class IBEngine(QObject):
         force_refresh=True bypasses the 1-day cache (used for streaming tick updates).
         """
         expiry_key = expiry.strftime("%Y%m%d") if expiry else "nearest"
+        self._active_chain_request = {
+            "underlying": underlying,
+            "expiry": expiry,
+            "sec_type": sec_type,
+            "exchange": exchange,
+            "max_strikes": max_strikes,
+        }
         cache_key  = f"{underlying}|{expiry_key}|{sec_type}|{exchange}"
         now = _time_mod.time()
         if not force_refresh and cache_key in self._chain_cache:
@@ -1296,6 +1401,42 @@ class IBEngine(QObject):
                     return row.conid
         return 0
 
+    async def _prepare_leg_for_resolution(self, leg: dict[str, Any]) -> dict[str, Any]:
+        """Normalize a leg before contract resolution, inferring missing expiry when possible."""
+        prepared = dict(leg)
+        expiry_raw = str(prepared.get("expiry") or "").replace("-", "").strip()
+        if expiry_raw:
+            prepared["expiry"] = expiry_raw
+            return prepared
+
+        sec_type = str(prepared.get("sec_type") or "FOP").upper()
+        if sec_type not in ("FOP", "OPT"):
+            return prepared
+
+        symbol = str(prepared.get("symbol") or "").upper().strip()
+        if not symbol:
+            return prepared
+
+        exchange = str(prepared.get("exchange") or ("CME" if sec_type == "FOP" else "SMART"))
+        expiries = self.get_position_expiries(symbol)
+        if not expiries:
+            try:
+                expiries = await self.get_available_expiries(symbol, sec_type=sec_type, exchange=exchange)
+            except Exception as exc:
+                logger.debug("_prepare_leg_for_resolution: expiry lookup failed for %s: %s", symbol, exc)
+
+        if expiries:
+            inferred = expiries[0]
+            prepared["expiry"] = inferred
+            logger.info("Inferred missing expiry for %s %s %.2f %s -> %s",
+                        symbol,
+                        sec_type,
+                        float(prepared.get("strike") or 0),
+                        str(prepared.get("right") or ""),
+                        inferred)
+
+        return prepared
+
     async def _resolve_contracts(self, legs: list[dict]) -> list:
         """Build contracts for legs, using chain cache and qualifyContractsAsync as fallback.
 
@@ -1303,12 +1444,13 @@ class IBEngine(QObject):
         2. If all conIds are found skip qualifyContractsAsync entirely.
         3. Otherwise qualify only the contracts still missing conIds.
         """
-        contracts = [self._leg_to_contract(lg) for lg in legs]
+        prepared_legs = [await self._prepare_leg_for_resolution(lg) for lg in legs]
+        contracts = [self._leg_to_contract(lg) for lg in prepared_legs]
         # -- Stage 1: fill conIds from leg dict itself (chain click-to-trade)
         # -- Stage 2: chain cache lookup
         # -- Stage 3: positions snapshot lookup
         original_contracts = list(contracts)  # keep a copy for fallback
-        for i, (c, lg) in enumerate(zip(contracts, legs)):
+        for i, (c, lg) in enumerate(zip(contracts, prepared_legs)):
             if getattr(c, "conId", 0) > 0:
                 continue
             sym  = lg.get("symbol", "")
@@ -1345,14 +1487,15 @@ class IBEngine(QObject):
 
         # Last-resort: if we ended up with fewer contracts than legs, use original
         # unqualified contracts so IB can attempt validation on its end
-        if len(contracts) < len(legs):
-            logger.warning(
-                "_resolve_contracts: only %d/%d legs resolved after all lookups — "
-                "falling back to unqualified contracts for remaining legs",
-                len(contracts), len(legs),
-            )
+        if len(contracts) < len(prepared_legs):
             resolved_count = len(contracts)
-            missing_legs = legs[resolved_count:]
+            missing_legs = prepared_legs[resolved_count:]
+            missing_symbols = [f"{lg.get('symbol')} {lg.get('expiry')} {lg.get('strike')} {lg.get('right')}" for lg in missing_legs]
+            logger.warning(
+                "_resolve_contracts: only %d/%d legs resolved — "
+                "unresolved: %s — using unqualified contracts as fallback",
+                resolved_count, len(prepared_legs), ", ".join(missing_symbols),
+            )
             contracts += [self._leg_to_contract(lg) for lg in missing_legs]
 
         return contracts
@@ -1480,13 +1623,18 @@ class IBEngine(QObject):
         order_type: str = "LIMIT",
         limit_price: float | None = None,
     ) -> dict[str, Any]:
-        """Run a WhatIf simulation without transmitting."""
+        """Run a WhatIf simulation without transmitting.
+        
+        Uses IB's whatIfOrderAsync() method to properly simulate margin impact.
+        Returns margin deltas (init_margin_change, maint_margin_change).
+        """
         contracts = await self._resolve_contracts(legs)
+        qualified_count = sum(1 for c in contracts if getattr(c, "conId", 0) > 0)
 
-        if not contracts:
-            return {"error": "No contracts qualified — check symbol, expiry, and strike"}
-        if len(contracts) != len(legs):
-            return {"error": f"Only {len(contracts)}/{len(legs)} leg(s) qualified"}
+        if qualified_count == 0:
+            return {"error": "No contracts qualified — check symbol, expiry, and strike", "status": "error"}
+        if qualified_count != len(legs):
+            return {"error": f"Only {qualified_count}/{len(legs)} leg(s) qualified", "status": "error"}
 
         if order_type == "LIMIT" and limit_price is not None:
             ib_order = LimitOrder(
@@ -1500,14 +1648,12 @@ class IBEngine(QObject):
                 totalQuantity=int(legs[0].get("qty", 1)),
             )
 
-        ib_order.whatIf = True
-
         if len(contracts) > 1:
             from ib_async import ComboLeg, Contract as IBC
             bag = IBC()
             bag.symbol = contracts[0].symbol
             bag.secType = "BAG"
-            bag.exchange = contracts[0].exchange or "SMART"
+            bag.exchange = getattr(contracts[0], "exchange", None) or "SMART"
             bag.currency = "USD"
             bag.comboLegs = []
             for c, lg in zip(contracts, legs):
@@ -1515,24 +1661,52 @@ class IBEngine(QObject):
                 cl.conId = c.conId
                 cl.ratio = int(lg.get("qty", 1))
                 cl.action = lg["action"]
-                cl.exchange = c.exchange or "SMART"
+                cl.exchange = getattr(c, "exchange", None) or "SMART"
                 bag.comboLegs.append(cl)
-            trade = self._ib.placeOrder(bag, ib_order)
+            contract = bag
         else:
-            trade = self._ib.placeOrder(contracts[0], ib_order)
+            contract = contracts[0]
 
-        # Wait for WhatIf response — margin data lives on trade.order.orderState (OrderState),
-        # NOT on trade.orderStatus (OrderStatus) which has no margin attributes.
-        # MarketOrder/LimitOrder may not have orderState populated until IB responds.
-        await asyncio.sleep(2)
-
-        os = getattr(trade.order, "orderState", None)
-        return {
-            "init_margin": _safe_float(getattr(os, "initMarginChange", None)) if os else None,
-            "maint_margin": _safe_float(getattr(os, "maintMarginChange", None)) if os else None,
-            "equity_with_loan": _safe_float(getattr(os, "equityWithLoanChange", None)) if os else None,
-            "status": getattr(trade.orderStatus, "status", "unknown"),
-        }
+        # Use whatIfOrderAsync() which properly waits for IB's WhatIf response
+        # Returns OrderState object with margin change attributes
+        # IB margin calculations can take 5-30s depending on portfolio complexity
+        whatif_timeout = 90.0  # Increased from 15s for complex portfolios
+        try:
+            order_state = await asyncio.wait_for(
+                self._ib.whatIfOrderAsync(contract, ib_order),
+                timeout=whatif_timeout,
+            )
+            
+            init_change = _safe_float(getattr(order_state, "initMarginChange", None)) or 0.0
+            maint_change = _safe_float(getattr(order_state, "maintMarginChange", None)) or 0.0
+            equity_change = _safe_float(getattr(order_state, "equityWithLoanChange", None)) or 0.0
+            
+            logger.info(
+                "WhatIf margin impact: init_change=%s, maint_change=%s, equity_change=%s",
+                init_change, maint_change, equity_change,
+            )
+            
+            return {
+                "init_margin_change": init_change,
+                "maint_margin_change": maint_change,
+                "equity_with_loan_change": equity_change,
+                "status": "success",
+            }
+        except asyncio.TimeoutError:
+            logger.warning(
+                "WhatIf simulation timed out after %.0f seconds — IB Gateway may be slow or unavailable",
+                whatif_timeout,
+            )
+            return {
+                "error": "WhatIf simulation timed out — IB Gateway may be slow or unavailable",
+                "status": "timeout",
+            }
+        except Exception as exc:
+            logger.error("WhatIf simulation failed: %s: %s", type(exc).__name__, exc)
+            return {
+                "error": f"WhatIf simulation failed: {exc}",
+                "status": "error",
+            }
 
     # ── market data ─────────────────────────────────────────────────────
 
@@ -1814,6 +1988,70 @@ class IBEngine(QObject):
             "broker_order_id": str(trade.order.orderId),
         }
 
+    async def _attempt_reconnect(self) -> None:
+        async with self._reconnect_lock:
+            for attempt in range(1, self._watchdog_max_attempts + 1):
+                if self._manual_disconnect_requested:
+                    return
+
+                delay = min(2 ** (attempt - 1), self._watchdog_backoff_cap)
+                self.connection_state.emit(
+                    "reconnecting",
+                    f"Reconnecting to IBKR (attempt {attempt}/{self._watchdog_max_attempts}) in {delay}s",
+                )
+                await asyncio.sleep(delay)
+
+                try:
+                    await self._ib.connectAsync(self._host, self._port, clientId=self._client_id, timeout=30)
+                    accounts = self._ib.managedAccounts()
+                    self._account_id = accounts[0] if accounts else self._account_id
+                    self.connection_state.emit("reconnected", f"Reconnected to {self._account_id or 'IBKR'}")
+                    self.connected.emit()
+                    await self._restore_streams_after_reconnect()
+                    self._reconnect_task = None
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("Reconnect attempt %d/%d failed: %s", attempt, self._watchdog_max_attempts, exc)
+
+            message = f"Unable to reconnect after {self._watchdog_max_attempts} attempts"
+            logger.error(message)
+            self.connection_state.emit("failed", message)
+            self.error_occurred.emit(message)
+            self._reconnect_task = None
+
+    async def _restore_streams_after_reconnect(self) -> None:
+        if not self._active_chain_request:
+            return
+        try:
+            await self.get_chain(force_refresh=True, **self._active_chain_request)
+        except Exception as exc:
+            logger.debug("Failed to restore chain subscriptions after reconnect: %s", exc)
+
+    def _log_resolve_warning(
+        self,
+        signature: str,
+        resolved_count: int,
+        total_legs: int,
+        missing_symbols: list[str],
+    ) -> None:
+        now = _time_mod.time()
+        last_ts = self._resolve_warning_cache.get(signature, 0.0)
+        if now - last_ts >= self._resolve_warning_ttl:
+            logger.warning(
+                "_resolve_contracts: only %d/%d legs resolved after all lookups — falling back to unqualified contracts for remaining legs",
+                resolved_count,
+                total_legs,
+            )
+            self._resolve_warning_cache[signature] = now
+            return
+        logger.debug(
+            "Suppressed duplicate resolve warning for %s (unresolved: %s)",
+            signature,
+            ", ".join(missing_symbols),
+        )
+
     # ── ib_async event handlers ───────────────────────────────────────────
 
     def _on_ib_connected(self) -> None:
@@ -1821,7 +2059,16 @@ class IBEngine(QObject):
 
     def _on_ib_disconnected(self) -> None:
         logger.warning("IB disconnected event")
+        self.connection_state.emit("disconnected", "IB Gateway connection lost")
         self.disconnected.emit()
+        if self._manual_disconnect_requested:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._reconnect_task is None or self._reconnect_task.done():
+            self._reconnect_task = loop.create_task(self._attempt_reconnect())
 
     def _on_ib_error(self, reqId: int, errorCode: int, errorString: str, contract: Any) -> None:
         # Filter out benign warnings (farm connections, market data, snapshot cancels)
@@ -1835,7 +2082,7 @@ class IBEngine(QObject):
         # Error 10090 = Part of requested market data is not subscribed
         # Error 10358 = Fundamentals data is not allowed for this account type
         # Error 2103 = Market data farm connection broken (market closed/reconnecting)
-        if errorCode in (200, 300, 321, 322, 10089, 10090, 10358, 2103):
+        if errorCode in (200, 300, 321, 322, 430, 10089, 10090, 10358, 2103):
             logger.debug("IB Error %d (reqId %d): %s", errorCode, reqId, errorString)
             return
         msg = f"IB Error {errorCode}: {errorString}"
@@ -1862,3 +2109,6 @@ def _safe_float(val: Any) -> float | None:
         return f if f < 1e15 else None  # IB returns 1.7976931348623157E308 for "not applicable"
     except (ValueError, TypeError):
         return None
+
+
+

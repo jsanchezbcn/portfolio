@@ -30,9 +30,9 @@ cd src [ONLY COMMANDS FOR ACTIVE TECHNOLOGIES][ONLY COMMANDS FOR ACTIVE TECHNOLO
 Python 3.11+ (asyncio runtime): Follow standard conventions
 
 ## Recent Changes
+- 001-desktop-enhancements: Added [if applicable, e.g., PostgreSQL, CoreData, files or N/A]
 - 006-trade-proposer: Added Python 3.13 + `ib_async`, `aiohttp`, `SQLAlchemy/SQLModel`, `NotificationDispatcher`
 - 005-ibkr-trading-bridge: Added Python 3.13.x + `ib_async==2.1.0`, `aiohttp>=3.9.0`, `psycopg2-binary`, existing `database.circuit_breaker.DBCircuitBreaker`
-- 005-ibkr-trading-bridge: Added Python 3.13 (`.venv`) + `ib_async 2.1.0`, `aiohttp>=3.9.0`, `asyncpg 0.31.0`, `python-dotenv`
 
 
 <!-- MANUAL ADDITIONS START -->

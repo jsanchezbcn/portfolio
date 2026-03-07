@@ -1,7 +1,7 @@
 """
 agents/llm_risk_auditor.py — LLM-powered live portfolio risk audit.
 
-Uses GitHub Copilot SDK (gpt-4.1 by default — FREE via subscription) to
+Uses GitHub Copilot SDK (gpt-5-mini by default — FREE via subscription) to
 continuously audit portfolio Greeks against the active market regime and
 generate natural-language explanations of risks and actionable suggestions.
 
@@ -18,7 +18,7 @@ The audit result is written to the ``market_intel`` table so it surfaces
 on the dashboard without any polling overhead.
 
 Environment variables:
-  LLM_MODEL                    : model name (default "gpt-4.1")
+    LLM_MODEL                    : model name (default "gpt-5-mini")
   RISK_AUDIT_INTERVAL_SECONDS  : cadence in seconds (default 300 = 5 min)
 """
 from __future__ import annotations
@@ -31,15 +31,22 @@ from typing import Any, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from agents.llm_client import async_llm_chat
+from datetime import date as _date
+
 from models.order import (
     AITradeSuggestion,
     OrderAction,
     OrderLeg,
+    OptionRight,
     PortfolioGreeks,
     RiskBreach,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _default_risk_model() -> str:
+    return (os.getenv("LLM_FAST_MODEL") or os.getenv("LLM_MODEL") or "gpt-5-mini").strip() or "gpt-5-mini"
 
 _SYSTEM_PROMPT = """\
 You are a professional options portfolio risk manager specialising in
@@ -60,23 +67,61 @@ Rules:
 
 
 _SUGGEST_SYSTEM_PROMPT = """\
-You are a quantitative options risk analyst specializing in income strategies \
-(SPX/ES iron condors, strangles, and spreads).
+You are a quantitative options risk analyst for a trader who ONLY trades ES and MES \
+futures options (FOP) on CME. We do NOT trade SPX options.
 
 A portfolio risk breach has been detected. Your job is to suggest exactly 3 \
-concrete remediation trades that would reduce the breach while preserving \
-theta income within the given budget.
+concrete remediation trades using ES or MES futures options that would reduce \
+the breach while preserving theta income within the given budget.
+
+Product reference:
+  ES  = E-mini S&P 500 Futures Option, exchange CME, multiplier 50, sec_type FOP
+  MES = Micro E-mini S&P 500 Futures Option, exchange CME, multiplier 5, sec_type FOP
+  Use MES for smaller adjustments (< 20 deltas), ES for larger (>= 20 deltas).
+
+Commission schedule (IB Pro rate, per contract per side):
+  ES  FOP: ~$1.40/side → ~$2.80 round-trip per contract
+  MES FOP: ~$0.47/side → ~$0.94 round-trip per contract
+  Delta equivalence: 1 ES contract = 10 MES contracts (multiplier ratio 50:5)
+  Cost for equivalent delta:
+    1 ES round-trip  = $2.80
+    10 MES round-trip = $9.40  (3.4× more expensive for identical delta exposure)
+  Fee efficiency rule:
+    → PREFER ES when the target quantity is ≥ 1 ES-equivalent (i.e. ≥ 10 MES legs
+      for a single-leg trade or ≥ 5 MES per leg in a multi-leg spread).
+    → ONLY use MES when fine-tuning delta by < 10 contracts (sub-ES granularity).
+    If your suggestion would require 10 or more MES contracts, convert to ES instead.
 
 Rules:
 - Respond ONLY with a valid JSON array of exactly 3 objects. No markdown fences, \
 no extra text.
-- Each object must have these fields:
-    "legs": array of {symbol, action ("BUY"|"SELL"), quantity (positive int)}
+- Each object must have these top-level fields:
+    "legs": array of leg objects (see below)
     "projected_delta_change": float (negative = delta reduced)
     "projected_theta_cost": float (negative = theta earned; positive = theta spent)
     "rationale": string (1-2 sentences, cite specific Greek values)
+- Each leg object MUST have ALL of these fields:
+    "symbol":   "ES" or "MES"
+    "sec_type": "FOP"
+    "exchange": "CME"
+    "action":   "BUY" or "SELL"
+    "quantity": positive integer
+    "strike":   float (option strike price, e.g. 5850.0)
+    "right":    "C" for call or "P" for put
+    "expiry":   "YYYYMMDD" string matching the active expiry provided in the prompt
+- Never use SPX, SPXW, SPY, or any equity option symbol.
 - If action cannot be determined, omit the suggestion (return fewer objects).
 - Never raise exceptions — always return valid JSON.
+
+Available execution/planning tools in the host app (do not invent new tools):
+    - get_bid_ask_for_legs(legs): returns live bid/ask/mid for specific legs (can be slow: ~2-10s)
+    - get_chain(symbol, expiry, strikes_each_side): returns options chain around ATM (can be slow: ~5-15s)
+    - whatif_order(legs): margin/risk simulation for a candidate trade (can be very slow: up to ~90s)
+
+Latency guidance:
+    - Prefer chain + bid/ask data first for liquidity screening.
+    - Use WhatIf only when needed for final candidate validation due to latency.
+    - If tool data is missing/stale, state assumptions briefly in rationale.
 """
 
 
@@ -97,7 +142,7 @@ class LLMRiskAuditor:
         self.db = db
         self.interval_seconds = interval_seconds
         self._scheduler: AsyncIOScheduler | None = None
-        self._model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+        self._model = _default_risk_model()
         # Latest snapshot pushed externally by the dashboard/streaming pipeline
         self._latest_context: dict[str, Any] | None = None
 
@@ -331,6 +376,9 @@ with the keys described in the system prompt.
         regime: str,
         breach: Optional[RiskBreach],
         theta_budget: float,
+        active_expiry: str = "",
+        underlying: str = "MES",
+        ib_engine: Any = None,
     ) -> list[AITradeSuggestion]:
         """Return up to 3 AI-generated trades to remediate a risk breach.
 
@@ -340,17 +388,35 @@ with the keys described in the system prompt.
             regime:           Active market regime name.
             breach:           The detected breach (or None for general audit).
             theta_budget:     Maximum theta that can be spent/risked.
+            active_expiry:    Active expiry to use for suggestions (YYYYMMDD string).
+            underlying:       Underlying symbol to use (default "MES").
+            ib_engine:        Optional IBEngine instance for fetching live bid/ask spreads.
 
         Returns:
             List of ``AITradeSuggestion`` (0–3 elements).  Never raises.
         """
         try:
+            # Pre-fetch live market data (bid/ask spreads, underlying price) if engine available
+            market_data_context = ""
+            if ib_engine is not None and active_expiry:
+                try:
+                    market_data_context = await self._fetch_market_data_context(
+                        ib_engine=ib_engine,
+                        underlying=underlying,
+                        active_expiry=active_expiry,
+                    )
+                except Exception as exc:
+                    logger.debug("Failed to fetch market data context: %s", exc)
+
             prompt = self._build_suggest_prompt(
                 portfolio_greeks=portfolio_greeks,
                 vix=vix,
                 regime=regime,
                 breach=breach,
                 theta_budget=theta_budget,
+                active_expiry=active_expiry,
+                underlying=underlying,
+                market_data_context=market_data_context,
             )
             raw = await async_llm_chat(
                 prompt,
@@ -358,12 +424,102 @@ with the keys described in the system prompt.
                 system=_SUGGEST_SYSTEM_PROMPT,
                 timeout=45.0,
             )
-            return self._parse_suggestions(raw)
+            parsed = self._parse_suggestions(raw)
+            if parsed:
+                return parsed
+            logger.warning("suggest_trades: empty/invalid LLM output, using deterministic fallback suggestions")
+            return self._fallback_suggestions(
+                portfolio_greeks=portfolio_greeks,
+                breach=breach,
+                theta_budget=theta_budget,
+                active_expiry=active_expiry,
+                underlying=underlying,
+            )
         except Exception as exc:
             logger.warning("suggest_trades() error: %s", exc, exc_info=True)
-            return []
+            return self._fallback_suggestions(
+                portfolio_greeks=portfolio_greeks,
+                breach=breach,
+                theta_budget=theta_budget,
+                active_expiry=active_expiry,
+                underlying=underlying,
+            )
 
     # --- private helpers for suggest_trades ---
+
+    async def _fetch_market_data_context(
+        self,
+        *,
+        ib_engine: Any,
+        underlying: str,
+        active_expiry: str,
+    ) -> str:
+        """Fetch live bid/ask spreads and underlying price for the LLM prompt.
+        
+        Returns formatted string with:
+        - Underlying price
+        - ATM strike region
+        - Bid/ask spreads for ~5 strikes around ATM (calls and puts)
+        
+        If any fetch fails, returns empty string (non-blocking).
+        """
+        try:
+            # 1. Get underlying price
+            snap = await ib_engine.get_market_snapshot(underlying)
+            underlying_price = snap.get("last") or snap.get("close") or 0.0
+            if not underlying_price:
+                return ""
+            
+            # 2. Round to nearest 25 for ATM strike
+            atm_strike = round(underlying_price / 25) * 25
+            
+            # 3. Fetch options chain (±3 strikes around ATM)
+            # Convert active_expiry YYYYMMDD -> YYYY-MM-DD
+            if len(active_expiry) == 8:
+                expiry_iso = f"{active_expiry[:4]}-{active_expiry[4:6]}-{active_expiry[6:8]}"
+            else:
+                return ""
+            
+            chain = await ib_engine.get_chain(
+                underlying=underlying,
+                expiry=expiry_iso,
+                strikes_each_side=3,
+            )
+            if not chain or not chain.get("rows"):
+                return ""
+            
+            # 4. Build bid/ask table
+            lines = [
+                f"\\n## Live Market Data (Expiry {active_expiry})",
+                f"Underlying {underlying} price: ${underlying_price:.2f}",
+                f"ATM strike: {atm_strike}",
+                "\\nOptions Chain (Bid/Ask/Mid):",
+                "Strike | Call Bid | Call Ask | Call Mid | Put Bid | Put Ask | Put Mid",
+                "-------|----------|----------|----------|---------|---------|--------",
+            ]
+            
+            for row in chain.get("rows", [])[:7]:  # Limit to 7 strikes
+                strike = row.get("strike", 0)
+                call_bid = row.get("call_bid") or 0.0
+                call_ask = row.get("call_ask") or 0.0
+                call_mid = row.get("call_mid") or 0.0
+                put_bid = row.get("put_bid") or 0.0
+                put_ask = row.get("put_ask") or 0.0
+                put_mid = row.get("put_mid") or 0.0
+                
+                lines.append(
+                    f"{strike:>6.0f} | {call_bid:>8.2f} | {call_ask:>8.2f} | "
+                    f"{call_mid:>8.2f} | {put_bid:>7.2f} | {put_ask:>7.2f} | {put_mid:>7.2f}"
+                )
+            
+            lines.append("\\nUse these bid/ask spreads to ensure your suggested trades are realistic.")
+            lines.append("Pick strikes with tight spreads (low bid/ask difference) for better execution probability.")
+            
+            return "\\n".join(lines)
+            
+        except Exception as exc:
+            logger.debug("_fetch_market_data_context failed: %s", exc)
+            return ""
 
     @staticmethod
     def _build_suggest_prompt(
@@ -373,6 +529,9 @@ with the keys described in the system prompt.
         regime: str,
         breach: Optional[RiskBreach],
         theta_budget: float,
+        active_expiry: str = "",
+        underlying: str = "MES",
+        market_data_context: str = "",
     ) -> str:
         g = portfolio_greeks
         breach_section = (
@@ -383,6 +542,14 @@ with the keys described in the system prompt.
             f"Breach VIX:     {breach.vix}\n"
         ) if breach else "No specific breach — general portfolio optimisation requested.\n"
 
+        expiry_hint = (
+            f"Active expiry to use for suggestions: {active_expiry}\n"
+            if active_expiry else
+            "No active expiry in portfolio — pick the nearest front-month expiry.\n"
+        )
+
+        market_section = market_data_context if market_data_context else ""
+
         return (
             f"## Portfolio Greeks\n"
             f"SPX Beta-Delta:   {g.spx_delta:.2f}\n"
@@ -392,22 +559,39 @@ with the keys described in the system prompt.
             f"## Market Context\n"
             f"VIX:              {vix:.2f}\n"
             f"Regime:           {regime}\n\n"
+            f"## Active Instrument\n"
+            f"Preferred underlying: {underlying}\n"
+            f"{expiry_hint}"
+            f"{market_section}"
             f"## Risk Breach\n"
             f"{breach_section}\n"
             f"## Constraints\n"
             f"Theta Budget (max to spend): {theta_budget:.2f}\n\n"
+            f"## Available Tools (host app)\n"
+            f"- get_bid_ask_for_legs: live bid/ask/mid for candidate legs (slow: ~2-10s)\n"
+            f"- get_chain: broader options chain around ATM for expiry (slow: ~5-15s)\n"
+            f"- whatif_order: margin/risk simulation for final candidates (very slow: up to ~90s)\n"
+            f"Use slow tools only when they materially improve trade quality.\n\n"
             f"Respond ONLY with a JSON array of exactly 3 suggestion objects "
-            f"as described in the system prompt."
+            f"as described in the system prompt. Each leg MUST include symbol, "
+            f"sec_type, exchange, action, quantity, strike, right, and expiry fields."
         )
 
     @staticmethod
     def _parse_suggestions(raw: str) -> list[AITradeSuggestion]:
         """Parse LLM JSON → list[AITradeSuggestion].  Returns [] on any error."""
-        text = raw.strip()
+        text = raw.strip() if raw else ""
+        # Guard against empty response (Copilot SDK sometimes returns "")
+        if not text:
+            logger.warning("suggest_trades: LLM returned empty response — fallback required")
+            return []
         # Strip markdown code fences if present
         if text.startswith("```"):
             lines = text.splitlines()
-            text = "\n".join(l for l in lines if not l.startswith("```")).strip()
+            text = "\n".join(l for l in lines if not l.startswith("""`""")).strip()
+        if not text:
+            logger.warning("suggest_trades: LLM response was only markdown fences — fallback required")
+            return []
         try:
             parsed = json.loads(text)
             if not isinstance(parsed, list):
@@ -426,11 +610,37 @@ with the keys described in the system prompt.
                         action = OrderAction(lr.get("action", "BUY").upper())
                     except ValueError:
                         action = OrderAction.BUY
+                    # Parse option-specific fields
+                    strike_raw = lr.get("strike")
+                    strike = float(strike_raw) if strike_raw is not None else None
+                    right_raw = str(lr.get("right") or "").upper().strip()
+                    right_map = {"C": "C", "CALL": "C", "P": "P", "PUT": "P"}
+                    right_val = right_map.get(right_raw)
+                    option_right: Optional[OptionRight] = None
+                    if right_val:
+                        try:
+                            option_right = OptionRight(right_val)
+                        except ValueError:
+                            pass
+                    expiry_raw = str(lr.get("expiry") or "").replace("-", "").strip()
+                    expiration = None
+                    if len(expiry_raw) == 8:
+                        try:
+                            expiration = _date(
+                                int(expiry_raw[:4]),
+                                int(expiry_raw[4:6]),
+                                int(expiry_raw[6:8]),
+                            )
+                        except (ValueError, OverflowError):
+                            pass
                     legs.append(
                         OrderLeg(
-                            symbol=str(lr.get("symbol", "UNKNOWN")),
+                            symbol=str(lr.get("symbol", "MES")),
                             action=action,
                             quantity=int(lr.get("quantity", 1)),
+                            option_right=option_right,
+                            strike=strike,
+                            expiration=expiration,
                         )
                     )
                 results.append(
@@ -445,6 +655,85 @@ with the keys described in the system prompt.
         except Exception as exc:
             logger.warning("suggest_trades: parse error — %s", exc)
             return []
+
+    @staticmethod
+    def _fallback_suggestions(
+        *,
+        portfolio_greeks: PortfolioGreeks,
+        breach: Optional[RiskBreach],
+        theta_budget: float,
+        active_expiry: str = "",
+        underlying: str = "MES",
+    ) -> list[AITradeSuggestion]:
+        target = (breach.breach_type.lower() if breach and breach.breach_type else "")
+        spx_delta = float(portfolio_greeks.spx_delta or 0.0)
+        vega = float(portfolio_greeks.vega or 0.0)
+        theta = float(portfolio_greeks.theta or 0.0)
+        max_theta_spend = max(1.0, float(theta_budget or 0.0))
+
+        # Parse active_expiry to a date for OrderLeg.expiration
+        expiration: Optional[_date] = None
+        exp_str = active_expiry.replace("-", "").strip()
+        if len(exp_str) == 8:
+            try:
+                expiration = _date(int(exp_str[:4]), int(exp_str[4:6]), int(exp_str[6:8]))
+            except (ValueError, OverflowError):
+                pass
+
+        # Use ES for large moves, MES for small adjustments
+        sym = underlying if underlying in ("ES", "MES") else "MES"
+
+        if "delta" in target or abs(spx_delta) > 80:
+            action = OrderAction.SELL if spx_delta > 0 else OrderAction.BUY
+            right = OptionRight.CALL if spx_delta > 0 else OptionRight.PUT
+            # Estimate an ATM-ish strike from delta (rough heuristic ~5850 for MES)
+            atm = 5850.0
+            rationale = (
+                f"Portfolio SPX delta {spx_delta:+.1f} exceeds target; sell a {sym} "
+                f"{right.value} to reduce directional exposure (approx. strike {atm:.0f})."
+            )
+            projected_delta_change = -20.0 if spx_delta > 0 else 20.0
+            projected_theta_cost = min(max_theta_spend, 20.0)
+            base_leg = OrderLeg(
+                symbol=sym, action=action, quantity=1,
+                option_right=right, strike=atm, expiration=expiration,
+            )
+        elif "vega" in target or abs(vega) > 5000:
+            action = OrderAction.BUY if vega < 0 else OrderAction.SELL
+            right = OptionRight.CALL if vega > 0 else OptionRight.PUT
+            atm = 5850.0
+            rationale = (
+                f"Portfolio vega {vega:+.0f} is elevated; adjust {sym} options exposure "
+                f"to pull vega toward neutral with controlled theta spend."
+            )
+            projected_delta_change = -8.0 if vega > 0 else 8.0
+            projected_theta_cost = min(max_theta_spend, 35.0)
+            base_leg = OrderLeg(
+                symbol=sym, action=action, quantity=1,
+                option_right=right, strike=atm, expiration=expiration,
+            )
+        else:
+            action = OrderAction.SELL if theta < 0 else OrderAction.BUY
+            right = OptionRight.PUT
+            atm = 5800.0
+            rationale = (
+                f"Conservative {sym} put adjustment to improve risk balance; "
+                f"current theta {theta:+.1f}."
+            )
+            projected_delta_change = 0.0
+            projected_theta_cost = min(max_theta_spend, 15.0)
+            base_leg = OrderLeg(
+                symbol=sym, action=action, quantity=1,
+                option_right=right, strike=atm, expiration=expiration,
+            )
+
+        base = AITradeSuggestion(
+            legs=[base_leg],
+            projected_delta_change=projected_delta_change,
+            projected_theta_cost=projected_theta_cost,
+            rationale=rationale,
+        )
+        return [base]
 
 
 

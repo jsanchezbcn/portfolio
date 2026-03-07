@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Slot, QAbstractTableModel, QModelIndex, QTimer
 
+from desktop.models.favorites import FavoriteSymbol, FavoritesStore
+
 if TYPE_CHECKING:
     from desktop.engine.ib_engine import IBEngine, MarketSnapshot
 
@@ -88,17 +90,19 @@ class MarketTab(QWidget):
         ("IWM", "STK", "SMART"),
     ]
 
-    def __init__(self, engine: IBEngine, parent=None):
+    def __init__(self, engine: IBEngine, parent=None, favorites_store: FavoritesStore | None = None):
         super().__init__(parent)
         self._engine = engine
-        self._favorites: list[tuple[str, str, str]] = []
-        self._favorite_lookup: set[tuple[str, str, str]] = set()
+        self._favorites_store = favorites_store or FavoritesStore()
+        self._favorites: list[FavoriteSymbol] = []
+        self._favorite_lookup: set[FavoriteSymbol] = set()
         self._refresh_in_flight = False
         self._setup_ui()
+        self._load_persisted_favorites()
         self._connect_signals()
 
         self._refresh_timer = QTimer(self)
-        self._refresh_timer.setInterval(60_000)  # 60s
+        self._refresh_timer.setInterval(1_000)  # 1s
         self._refresh_timer.timeout.connect(self._on_refresh_favorites)
 
     def _setup_ui(self) -> None:
@@ -187,6 +191,12 @@ class MarketTab(QWidget):
         self._btn_add_favorite.setEnabled(False)
         self._btn_refresh_favorites.setEnabled(False)
         self._btn_remove_favorite.setEnabled(False)
+
+    def _load_persisted_favorites(self) -> None:
+        for favorite in self._favorites_store.load():
+            self._favorite_lookup.add(favorite)
+            self._favorites.append(favorite)
+            self._lst_favorites.addItem(self._favorite_label(favorite))
 
     def _connect_signals(self) -> None:
         self._btn_quote.clicked.connect(self._on_get_quote)
@@ -317,6 +327,7 @@ class MarketTab(QWidget):
                 self._favorite_lookup.discard(entry)
                 del self._favorites[i]
                 self._lst_favorites.takeItem(self._lst_favorites.row(current))
+                self._favorites_store.save(self._favorites)
                 self._lbl_status.setText(f"Removed {item_text}")
                 break
         self._sync_refresh_timer_state()
@@ -333,9 +344,13 @@ class MarketTab(QWidget):
     async def _async_refresh_favorites(self) -> None:
         self._refresh_in_flight = True
         try:
-            for symbol, sec_type, exchange in list(self._favorites):
+            for favorite in list(self._favorites):
                 try:
-                    await self._engine.get_market_snapshot(symbol, sec_type, exchange)
+                    await self._engine.get_market_snapshot(
+                        favorite.symbol,
+                        favorite.sec_type,
+                        favorite.exchange,
+                    )
                 except Exception:
                     continue
             self._lbl_status.setText(f"✅ Refreshed {len(self._favorites)} favorites")
@@ -343,18 +358,18 @@ class MarketTab(QWidget):
             self._refresh_in_flight = False
 
     def _add_favorite(self, symbol: str, sec_type: str, exchange: str) -> bool:
-        entry = (symbol.upper(), sec_type, exchange)
+        entry = FavoriteSymbol(symbol=symbol.upper(), sec_type=sec_type, exchange=exchange)
         if entry in self._favorite_lookup:
             return False
         self._favorite_lookup.add(entry)
         self._favorites.append(entry)
         self._lst_favorites.addItem(self._favorite_label(entry))
+        self._favorites_store.save(self._favorites)
         return True
 
     @staticmethod
-    def _favorite_label(entry: tuple[str, str, str]) -> str:
-        symbol, sec_type, exchange = entry
-        return f"{symbol} ({sec_type}@{exchange})"
+    def _favorite_label(entry: FavoriteSymbol) -> str:
+        return f"{entry.symbol} ({entry.sec_type}@{entry.exchange})"
 
     @Slot(object)
     def _on_market_snapshot(self, snap) -> None:

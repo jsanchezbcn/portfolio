@@ -144,7 +144,7 @@ class TestChainTabData:
 
         # Strike is in column 8 (after 8 call columns)
         idx = tab._model.index(0, 8)
-        assert "5,500" in tab._model.data(idx)
+        assert "5,500" in str(tab._model.data(idx))
 
     def test_chain_table_shows_bid(self, qtbot, mock_engine):
         tab = ChainTab(mock_engine)
@@ -155,7 +155,7 @@ class TestChainTabData:
 
         # Call bid is column 0
         idx = tab._model.index(0, 0)
-        assert "10.00" in tab._model.data(idx)
+        assert "10.00" in str(tab._model.data(idx))
 
     def test_chain_row_selected_signal_emitted(self, qtbot, mock_engine):
         tab = ChainTab(mock_engine)
@@ -196,6 +196,27 @@ class TestChainTabData:
         assert tab._model.rowCount() == 2
 
         mock_engine.chain_ready.emit([])
+        assert tab._model.rowCount() == 0
+
+    def test_expiry_change_clears_existing_rows_immediately(self, qtbot, mock_engine):
+        tab = ChainTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        mock_engine.chain_ready.emit(_sample_chain_rows())
+        assert tab._model.rowCount() == 2
+
+        tab._on_expiry_changed("20260417")
+
+        assert tab._model.rowCount() == 0
+
+    def test_chain_ready_filters_rows_to_selected_expiry(self, qtbot, mock_engine):
+        tab = ChainTab(mock_engine)
+        qtbot.addWidget(tab)
+        tab._cmb_expiry.addItem("20260417")
+        tab._cmb_expiry.setCurrentText("20260417")
+
+        mock_engine.chain_ready.emit(_sample_chain_rows())
+
         assert tab._model.rowCount() == 0
 
 

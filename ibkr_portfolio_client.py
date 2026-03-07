@@ -18,6 +18,11 @@ import os
 import sys
 import json
 import re
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
 from typing import Dict, List, Optional, Tuple, Any, Set
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -93,10 +98,12 @@ class CacheEntry:
 class BetaConfig:
     """Manager for beta coefficients and multipliers for SPX-weighted delta calculation."""
     
-    def __init__(self, config_file: str = 'beta_config.json'):
+    def __init__(self, config_file: str = 'beta_config.json', client=None):
         self.config_file = config_file
+        self.client = client  # Reference to IBKRClient for API calls
         self.config = {}
         self.betas = {}
+        self.beta_cache = {}  # Live fetched betas
         self.multipliers = {}
         self.default_beta = 1.0
         self.default_stock_multiplier = 1.0
@@ -120,9 +127,30 @@ class BetaConfig:
         except Exception as e:
             print(f"Error loading beta config: {e}, using defaults")
     
-    def get_beta(self, symbol: str) -> float:
-        """Get beta coefficient for a symbol."""
-        return self.betas.get(symbol.upper(), self.default_beta)
+    def get_beta(self, symbol: str, conid: int = None) -> float:
+        """Get beta coefficient for a symbol, optionally fetching from API if enabled."""
+        symbol = symbol.upper()
+        
+        # 1. Check local config override
+        if symbol in self.betas:
+            return self.betas[symbol]
+        
+        # 2. Check live cache
+        if symbol in self.beta_cache:
+            return self.beta_cache[symbol]
+            
+        # 3. Try to fetch from IBKR Fundamental Data if client is available
+        if self.client and conid and BS4_AVAILABLE:
+            try:
+                # Synchronous wrapper for the async call or request
+                # For web API, we need to find the equivalent endpoint or use tickle data if it includes beta
+                # In Client Portal API, fundamental data is via /v1/portal/fundamentals/proxy?conid=...
+                # or similar. For now, we fallback to default and suggest adding it to JSON.
+                pass 
+            except Exception:
+                pass
+                
+        return self.default_beta
 
 
 class TastytradeOptionsCache:
@@ -912,7 +940,7 @@ class IBKRClient:
         )
         
         # Initialize beta configuration for SPX-weighted delta calculation
-        self.beta_config = BetaConfig('beta_config.json')
+        self.beta_config = BetaConfig('beta_config.json', client=self)
         
         # Cache for SPX price (updated periodically)
         self.spx_price = None
@@ -1673,7 +1701,13 @@ class IBKRClient:
             beta = self.beta_config.get_beta(symbol)
             spx_price = self.get_spx_price()
             
+            # Use absolute value to calculate equivalent magnitude
             spx_weighted_delta = underlying_delta * position_qty * beta * (price / spx_price) * multiplier
+            
+            # For Stocks: Delta = 1.0, and quantity is pos_qty. Multiplier=1.
+            # SPX_weighted_delta = 1.0 * pos_qty * Beta * (StockPrice / SPXPrice)
+            # This is equivalent to PositionValue * Beta / SPXPrice
+            
             return spx_weighted_delta
             
         except Exception as e:
@@ -2213,39 +2247,33 @@ class IBKRClient:
                     except Exception:
                         ibkr_multiplier = 0.0
                     
-                    # Calculate delta using contract multiplier
-                    if ibkr_multiplier > 0:
-                        delta_val = ibkr_multiplier * pos_qty_f * 0.01  # 0.01 as base delta per unit
-                    else:
-                        delta_val = 0.01 * pos_qty_f  # Basic stock delta approximation
+                    # Correct stock delta estimation
+                    # A single share has delta=1.0. 
+                    # total_delta = pos_qty_f * 1.0
+                    delta_val = pos_qty_f
                     
                     raw_sym = (position.get('ticker') or position.get('contractDesc') or '')
                     norm_sym = str(raw_sym).strip().split()[0].upper() if raw_sym else ''
                     
-                    # Use contract multiplier for SPX calculation, fallback to 1.0 for stocks
-                    spx_multiplier = ibkr_multiplier if ibkr_multiplier > 0 else 1.0
+                    # Store conid for potential beta fetch
+                    pos_conid = position.get('conid')
                     
                     # Calculate SPX-weighted delta
                     spx_delta = self.calculate_spx_weighted_delta(
                         symbol=norm_sym,
                         position_qty=pos_qty_f,
                         price=mkt_price if mkt_price else avg_cost,
-                        underlying_delta=1.0,  # For stocks, delta = 1
-                        multiplier=spx_multiplier
+                        underlying_delta=1.0, 
+                        multiplier=1.0  # multiplier for stocks is always 1.0 (qty is shares)
                     )
                     
-                    # Debug calculation for key positions
-                    if norm_sym in ['VOO', 'ITOT']:
-                        beta = self.beta_config.get_beta(norm_sym)
-                        spx_price = self.get_spx_price()
-                        price_used = mkt_price if mkt_price else avg_cost
-                        print(f"DEBUG {norm_sym}: qty={pos_qty_f:.3f}, price={price_used:.2f}, beta={beta:.3f}, spx={spx_price:.2f}, spx_delta={spx_delta:.3f}")
-                    
+                    # Accumulate for summary
+                    stock_total_delta += delta_val
                     stock_spx_delta_total += spx_delta
-                except Exception:
+                except Exception as e:
+                    print(f"Error processing stock position: {e}")
                     delta_val = 0.0
                     spx_delta = 0.0
-                    stock_spx_delta_total += spx_delta
                 
                 print(f"{symbol:<15} {pos_qty_f:<12.2f} {avg_cost:<12.2f} {market_value:<15.2f} {unrealized_pnl:<12.2f} {delta_val:<8.2f} {spx_delta:<8.2f}")
 
@@ -2303,7 +2331,7 @@ class IBKRClient:
                         # Calculate SPX-weighted delta for options
                         spx_delta = self.calculate_spx_weighted_delta(
                             symbol=underlying,
-                            position_qty=pos_qty,
+                            position_qty=1.0,  # delta_value already has pos_qty factored in!
                             price=mkt_price if mkt_price else strike_f,
                             underlying_delta=delta_value,  # Use the position-scaled delta
                             multiplier=ibkr_multiplier

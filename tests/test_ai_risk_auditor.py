@@ -47,26 +47,32 @@ def _make_greeks(**kwargs) -> PortfolioGreeks:
 
 
 def _valid_llm_json() -> str:
-    """Return a JSON array of exactly 3 suggestions the LLM might return."""
-    legs_template = [{"symbol": "SPX", "action": "SELL", "quantity": 1}]
+    """Return a JSON array of exactly 3 MES FOP suggestions the LLM might return."""
+    legs_template = [
+        {
+            "symbol": "MES", "sec_type": "FOP", "exchange": "CME",
+            "action": "SELL", "quantity": 1,
+            "strike": 5900.0, "right": "C", "expiry": "20260321",
+        }
+    ]
     suggestions = [
         {
             "legs": legs_template,
             "projected_delta_change": -15.0,
             "projected_theta_cost": -120.0,
-            "rationale": "Sell 1 SPX put spread to reduce delta exposure.",
+            "rationale": "Sell 1 MES call to reduce delta exposure.",
         },
         {
             "legs": legs_template,
             "projected_delta_change": -10.0,
             "projected_theta_cost": -90.0,
-            "rationale": "Add short delta via ES futures micro.",
+            "rationale": "Add short delta via MES call spread.",
         },
         {
             "legs": legs_template,
             "projected_delta_change": -5.0,
             "projected_theta_cost": -60.0,
-            "rationale": "Trim existing long call position.",
+            "rationale": "Trim existing long MES call position.",
         },
     ]
     return json.dumps(suggestions)
@@ -84,6 +90,17 @@ class TestSuggestTrades:
         from database.local_store import LocalStore
         store = LocalStore(db_path=":memory:")
         return LLMRiskAuditor(db=store)
+
+    def test_prefers_fast_model_default(self, monkeypatch):
+        from agents.llm_risk_auditor import LLMRiskAuditor
+        from database.local_store import LocalStore
+
+        monkeypatch.setenv("LLM_FAST_MODEL", "gpt-5-mini")
+        monkeypatch.setenv("LLM_MODEL", "gpt-5")
+
+        auditor = LLMRiskAuditor(db=LocalStore(db_path=":memory:"))
+
+        assert auditor._model == "gpt-5-mini"
 
     def test_returns_three_suggestions_on_valid_llm_response(self):
         """When LLM returns 3 valid JSON suggestions, suggest_trades() returns 3 AITradeSuggestion."""
@@ -125,8 +142,8 @@ class TestSuggestTrades:
         assert s.projected_theta_cost == pytest.approx(-120.0)
         assert "delta" in s.rationale.lower()
 
-    def test_llm_timeout_returns_empty_list_no_exception(self):
-        """When async_llm_chat raises asyncio.TimeoutError, suggest_trades() returns [] silently."""
+    def test_llm_timeout_falls_back_to_suggestions(self):
+        """When async_llm_chat raises asyncio.TimeoutError, suggest_trades() returns fallback suggestions."""
         auditor = self._make_auditor()
 
         with patch("agents.llm_risk_auditor.async_llm_chat", new=AsyncMock(side_effect=asyncio.TimeoutError)):
@@ -138,10 +155,12 @@ class TestSuggestTrades:
                 theta_budget=400.0,
             ))
 
-        assert result == []
+        assert isinstance(result, list)
+        assert len(result) >= 1
+        assert all(isinstance(s, AITradeSuggestion) for s in result)
 
-    def test_llm_invalid_json_returns_empty_list_no_exception(self):
-        """When LLM returns non-JSON text, suggest_trades() returns []."""
+    def test_llm_invalid_json_falls_back_to_suggestions(self):
+        """When LLM returns non-JSON text, suggest_trades() returns fallback MES suggestions."""
         auditor = self._make_auditor()
 
         with patch("agents.llm_risk_auditor.async_llm_chat", new=AsyncMock(return_value="I cannot assist with that.")):
@@ -153,10 +172,12 @@ class TestSuggestTrades:
                 theta_budget=400.0,
             ))
 
-        assert result == []
+        assert isinstance(result, list)
+        assert len(result) >= 1
+        assert all(isinstance(s, AITradeSuggestion) for s in result)
 
-    def test_llm_partial_json_returns_empty_list(self):
-        """When LLM returns valid JSON but wrong schema, suggest_trades() returns []."""
+    def test_llm_partial_json_falls_back_to_suggestions(self):
+        """When LLM returns valid JSON but wrong schema, suggest_trades() returns fallback suggestions."""
         auditor = self._make_auditor()
         bad_json = json.dumps({"answer": "not a list"})
 
@@ -169,10 +190,12 @@ class TestSuggestTrades:
                 theta_budget=400.0,
             ))
 
-        assert result == []
+        assert isinstance(result, list)
+        assert len(result) >= 1
+        assert all(isinstance(s, AITradeSuggestion) for s in result)
 
-    def test_llm_exception_returns_empty_list(self):
-        """Any unexpected exception from LLM returns [] without propagating."""
+    def test_llm_exception_falls_back_to_suggestions(self):
+        """Any unexpected exception from LLM returns fallback suggestions without propagating."""
         auditor = self._make_auditor()
 
         with patch("agents.llm_risk_auditor.async_llm_chat", new=AsyncMock(side_effect=RuntimeError("network error"))):
@@ -184,7 +207,9 @@ class TestSuggestTrades:
                 theta_budget=400.0,
             ))
 
-        assert result == []
+        assert isinstance(result, list)
+        assert len(result) >= 1
+        assert all(isinstance(s, AITradeSuggestion) for s in result)
 
     def test_suggestion_id_is_unique(self):
         """Each suggestion has a unique suggestion_id."""
@@ -265,3 +290,50 @@ class TestSuggestTrades:
 
         assert isinstance(result, list)
         assert len(result) == 3
+
+    def test_parsed_legs_include_option_fields(self):
+        """_parse_suggestions populates strike, option_right, and expiration on each leg."""
+        from datetime import date
+        from models.order import OptionRight
+        from agents.llm_risk_auditor import LLMRiskAuditor
+        raw = _valid_llm_json()
+        result = LLMRiskAuditor._parse_suggestions(raw)
+        assert len(result) == 3
+        leg = result[0].legs[0]
+        assert leg.symbol == "MES"
+        assert leg.strike == 5900.0
+        assert leg.option_right == OptionRight.CALL
+        assert leg.expiration == date(2026, 3, 21)
+
+    def test_fallback_uses_mes_with_option_fields(self):
+        """_fallback_suggestions uses MES symbol with strike/right/expiration populated."""
+        from models.order import OptionRight
+        from agents.llm_risk_auditor import LLMRiskAuditor
+        result = LLMRiskAuditor._fallback_suggestions(
+            portfolio_greeks=_make_greeks(spx_delta=120.0),  # delta breach
+            breach=None,
+            theta_budget=100.0,
+            active_expiry="20260321",
+            underlying="MES",
+        )
+        assert len(result) >= 1
+        leg = result[0].legs[0]
+        assert leg.symbol == "MES"
+        assert leg.strike is not None
+        assert leg.option_right in (OptionRight.CALL, OptionRight.PUT)
+        assert leg.expiration is not None
+
+    def test_active_expiry_appears_in_prompt(self):
+        """_build_suggest_prompt includes active_expiry when provided."""
+        from agents.llm_risk_auditor import LLMRiskAuditor
+        prompt = LLMRiskAuditor._build_suggest_prompt(
+            portfolio_greeks=_make_greeks(),
+            vix=20.0,
+            regime="neutral",
+            breach=None,
+            theta_budget=200.0,
+            active_expiry="20260321",
+            underlying="MES",
+        )
+        assert "20260321" in prompt
+        assert "MES" in prompt

@@ -115,7 +115,7 @@ def _fetch_open_orders_socket(account_id: str) -> list[dict]:
         return []
 
     host = os.getenv("IB_SOCKET_HOST", "127.0.0.1")
-    port = int(os.getenv("IB_SOCKET_PORT", "7496"))
+    port = int(os.getenv("IB_SOCKET_PORT", "4001"))
     client_id = int(os.getenv("IB_ORDERS_CLIENT_ID", "18"))
 
     ib = IB()

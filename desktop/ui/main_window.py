@@ -28,15 +28,20 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Slot, QTimer
 from PySide6.QtGui import QAction
 
+from desktop.config.preferences import load_preferences, save_preferences
+from desktop.engine.sound_engine import SoundEngine
 from desktop.ui.portfolio_tab import PortfolioTab
 from desktop.ui.order_entry import OrderEntryPanel
 from desktop.ui.chain_tab import ChainTab
 from desktop.ui.risk_tab import RiskTab
+from desktop.ui.strategies_tab import StrategiesTab
 from desktop.ui.orders_tab import OrdersTab
 from desktop.ui.market_tab import MarketTab
 from desktop.ui.journal_tab import JournalTab
 from desktop.ui.ai_risk_tab import AIRiskTab
+from desktop.ui.widgets.account_picker import AccountPicker
 from desktop.workers.agent_runner import AgentRunner
+from desktop.engine.token_manager import TokenManager
 
 if TYPE_CHECKING:
     from desktop.engine.ib_engine import IBEngine
@@ -45,9 +50,13 @@ if TYPE_CHECKING:
 class MainWindow(QMainWindow):
     """Top-level window for the desktop trading application."""
 
-    def __init__(self, engine: IBEngine, parent=None):
+    def __init__(self, engine: IBEngine, token_manager: TokenManager | None = None, parent=None):
         super().__init__(parent)
         self._engine = engine
+        self._token_manager = token_manager or TokenManager()
+        self._preferences_path = getattr(self._token_manager, "_preferences_path", None)
+        self._preferences = load_preferences(self._preferences_path)
+        self._sound_engine = SoundEngine(enabled=bool(self._preferences.get("sound_enabled", True)))
         self.setWindowTitle("Portfolio Risk Manager — Desktop")
         self.setMinimumSize(1400, 800)
         self.resize(1600, 900)
@@ -79,6 +88,10 @@ class MainWindow(QMainWindow):
         # Risk tab
         self._risk_tab = RiskTab(self._engine)
         self._tabs.addTab(self._risk_tab, "⚠ Risk")
+
+        # Strategies tab
+        self._strategies_tab = StrategiesTab(self._engine)
+        self._tabs.addTab(self._strategies_tab, "🧠 Strategies")
 
         # Orders tab
         self._orders_tab = OrdersTab(self._engine)
@@ -132,6 +145,25 @@ class MainWindow(QMainWindow):
         self._act_refresh.setEnabled(False)
         toolbar.addAction(self._act_refresh)
 
+        self._act_compact_mode = QAction("🗜 Compact Mode", self)
+        self._act_compact_mode.setCheckable(True)
+        self._act_compact_mode.setChecked(bool(self._preferences.get("compact_mode", False)))
+        self._act_compact_mode.triggered.connect(self._on_compact_mode_toggled)
+        toolbar.addAction(self._act_compact_mode)
+
+        toolbar.addSeparator()
+
+        def token_checker(profile: str) -> bool:
+            return self._token_manager.has_configured_token(profile)
+
+        self._account_picker = AccountPicker(
+            active_profile=self._token_manager.active_profile,
+            token_checker=token_checker,
+            parent=self
+        )
+        self._account_picker.profile_changed.connect(self._on_copilot_profile_changed)
+        toolbar.addWidget(self._account_picker)
+
         toolbar.addSeparator()
 
         # Connection status label
@@ -144,7 +176,9 @@ class MainWindow(QMainWindow):
     def _setup_statusbar(self) -> None:
         self._statusbar = QStatusBar()
         self.setStatusBar(self._statusbar)
-        self._statusbar.showMessage("Ready — click Connect to start")
+        self._statusbar.showMessage(
+            f"Ready — click Connect to start · Copilot profile: {self._token_manager.active_profile.title()}"
+        )
 
     def _setup_auto_refresh(self) -> None:
         """Auto-refresh positions every 5 minutes while connected."""
@@ -156,12 +190,14 @@ class MainWindow(QMainWindow):
         self._engine.connected.connect(self._on_engine_connected)
         self._engine.disconnected.connect(self._on_engine_disconnected)
         self._engine.error_occurred.connect(self._on_engine_error)
+        self._engine.connection_state.connect(self._on_connection_state_changed)
 
         # Chain click → Order Entry prefill
         self._chain_tab.chain_row_selected.connect(self._order_entry.prefill_from_chain)
         self._chain_tab.leg_clicked.connect(self._on_chain_leg_clicked)
         # Chain leg-cart → Order Entry multi-leg prefill
         self._chain_tab.leg_cart_ready.connect(self._on_leg_cart_ready)
+        self._portfolio_tab.position_action_requested.connect(self._on_portfolio_action_requested)
         self._ai_tab.suggestion_authorized.connect(self._on_ai_suggestion_authorized)
 
         # Order submitted → auto-refresh orders
@@ -175,6 +211,7 @@ class MainWindow(QMainWindow):
         self._agent_runner.alert_raised.connect(self._ai_tab.on_risk_alert)
         self._agent_runner.arb_signal.connect(self._ai_tab.on_arb_signal)
         self._agent_runner.trade_suggestion.connect(self._ai_tab.on_trade_suggestion)
+        self._apply_compact_mode(self._act_compact_mode.isChecked())
 
     @Slot(dict)
     def _on_order_submitted(self, result: dict) -> None:
@@ -185,6 +222,7 @@ class MainWindow(QMainWindow):
 
     @Slot(dict)
     def _on_order_filled(self, fill_info: dict) -> None:
+        self._sound_engine.play("order_filled")
         self._statusbar.showMessage(
             f"Order filled — avg ${fill_info.get('avg_price', 0):.2f}"
         )
@@ -209,6 +247,51 @@ class MainWindow(QMainWindow):
         self._statusbar.showMessage(
             f"Chain Cart: {len(legs)} leg(s) staged in Order Entry — review bid/ask and submit"
         )
+
+    @Slot(dict)
+    def _on_portfolio_action_requested(self, payload: dict) -> None:
+        action = str(payload.get("action") or "BUY").upper()
+        rows = list(payload.get("legs") or [])
+        if not rows:
+            self._statusbar.showMessage("No tradable legs found for the selected row")
+            return
+
+        staged_legs = self._build_portfolio_order_legs(rows, action, payload.get("kind") == "trade_group")
+        rationale = ""
+        if action == "ROLL":
+            rationale = (
+                "Roll requested — current position legs are staged as closing legs. "
+                "Adjust expiry, strikes, or add opening legs before submitting."
+            )
+        self._order_entry.prefill_from_legs(staged_legs, rationale=rationale, source=f"Portfolio {action.title()}")
+        self._statusbar.showMessage(
+            f"Portfolio action staged: {action.title()} {payload.get('description') or 'position'}"
+        )
+
+    def _build_portfolio_order_legs(self, rows: list, action: str, from_trade_group: bool) -> list[dict]:
+        staged: list[dict] = []
+        for row in rows:
+            sec_type = str(getattr(row, "sec_type", "OPT") or "OPT").upper()
+            current_action = "BUY" if float(getattr(row, "quantity", 0) or 0) > 0 else "SELL"
+            if action == "ROLL":
+                leg_action = "SELL" if current_action == "BUY" else "BUY"
+            elif from_trade_group:
+                leg_action = current_action if action == "SELL" else ("SELL" if current_action == "BUY" else "BUY")
+            else:
+                leg_action = action
+
+            staged.append({
+                "symbol": getattr(row, "underlying", None) or getattr(row, "symbol", ""),
+                "sec_type": sec_type,
+                "exchange": "CME" if sec_type in {"FOP", "FUT"} else "SMART",
+                "action": leg_action,
+                "qty": max(1, int(abs(float(getattr(row, "quantity", 0) or 1)))),
+                "strike": float(getattr(row, "strike", 0) or 0),
+                "right": getattr(row, "right", None) or "C",
+                "expiry": getattr(row, "expiry", None) or "",
+                "conid": int(getattr(row, "conid", 0) or 0),
+            })
+        return staged
 
     @Slot(dict)
     def _on_ai_suggestion_authorized(self, payload: dict) -> None:
@@ -285,6 +368,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_engine_disconnected(self) -> None:
+        self._sound_engine.play("connection_lost")
         self._lbl_conn.setText("  ⚪ Disconnected  ")
         self._lbl_conn.setStyleSheet(
             "background: #e74c3c; color: white; padding: 4px 10px; border-radius: 4px;"
@@ -301,6 +385,46 @@ class MainWindow(QMainWindow):
     def _on_engine_error(self, msg: str) -> None:
         self._statusbar.showMessage(f"⚠ {msg}")
 
+    @Slot(str, str)
+    def _on_connection_state_changed(self, state: str, detail: str) -> None:
+        self._statusbar.showMessage(detail)
+        if state == "reconnecting":
+            self._lbl_conn.setText("  🟡 Reconnecting…  ")
+            self._lbl_conn.setStyleSheet(
+                "background: #f39c12; color: white; padding: 4px 10px; border-radius: 4px;"
+            )
+            self._act_connect.setEnabled(False)
+            self._act_disconnect.setEnabled(False)
+        elif state == "failed":
+            self._sound_engine.play("connection_failed")
+            self._lbl_conn.setText("  🔴 Reconnect Failed  ")
+            self._lbl_conn.setStyleSheet(
+                "background: #c0392b; color: white; padding: 4px 10px; border-radius: 4px;"
+            )
+            self._act_connect.setEnabled(True)
+
+    @Slot(bool)
+    def _on_compact_mode_toggled(self, checked: bool) -> None:
+        self._apply_compact_mode(checked)
+        self._preferences["compact_mode"] = bool(checked)
+        save_preferences(self._preferences, self._preferences_path)
+        mode = "Compact" if checked else "Full"
+        self._statusbar.showMessage(f"{mode} mode enabled")
+
+    def _apply_compact_mode(self, enabled: bool) -> None:
+        if hasattr(self._portfolio_tab, "set_compact_mode"):
+            self._portfolio_tab.set_compact_mode(enabled)
+        if hasattr(self._orders_tab, "set_compact_mode"):
+            self._orders_tab.set_compact_mode(enabled)
+
+    @Slot(str)
+    def _on_copilot_profile_changed(self, profile: str) -> None:
+        state = self._token_manager.set_active_profile(profile)
+        token_state = "configured" if state.token_available else "missing token"
+        self._statusbar.showMessage(
+            f"Copilot profile switched to {state.profile.title()} — {token_state}"
+        )
+
     @Slot(int)
     def _on_tab_changed(self, _: int) -> None:
         if hasattr(self._market_tab, "_sync_refresh_timer_state"):
@@ -311,6 +435,7 @@ class MainWindow(QMainWindow):
         self._refresh_timer.stop()
         self._agent_runner.stop()
         try:
+            self._engine._manual_disconnect_requested = True
             if self._engine._ib.isConnected():
                 self._engine._ib.disconnect()
         except Exception:

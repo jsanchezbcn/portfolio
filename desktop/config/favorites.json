@@ -1,0 +1,22 @@
+[
+  {
+    "symbol": "ES",
+    "sec_type": "FUT",
+    "exchange": "CME"
+  },
+  {
+    "symbol": "SPY",
+    "sec_type": "STK",
+    "exchange": "SMART"
+  },
+  {
+    "symbol": "QQQ",
+    "sec_type": "STK",
+    "exchange": "SMART"
+  },
+  {
+    "symbol": "IWM",
+    "sec_type": "STK",
+    "exchange": "SMART"
+  }
+]

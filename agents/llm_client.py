@@ -1,16 +1,17 @@
 """agents/llm_client.py — Unified LLM chat helper.
 
-Priority order for LLM backend:
-1. GitHub Copilot SDK — authenticates via ``copilot`` CLI (installed via GitHub
-   Copilot for CLI).  No API key required; auth comes from ``gh auth login``
-   stored in keyring.  Optionally enhanced with BYOK when ``OPENAI_API_KEY``
-   is also set (skips GitHub subscription quota).
-2. Direct ``openai.AsyncOpenAI`` fallback — only used when the SDK fails AND
-   ``OPENAI_API_KEY`` is available.
+🚨 IMPORTANT: This project uses GITHUB COPILOT SDK ONLY.
+We do NOT use OpenAI API or OPENAI_API_KEY in this module.
 
-Authentication requirements:
-- Install GitHub Copilot CLI: https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli
-- Authenticate once: ``gh auth login`` (stored in keyring, no env var needed)
+Authentication flow:
+1. Resolve active profile (personal/work).
+2. Resolve configured github.com username for that profile.
+3. Switch `gh` active account to that username on github.com.
+4. Call Copilot SDK using the gh keyring-backed session.
+
+GitHub Copilot CLI setup:
+- Install: https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli
+- Authenticate: ``gh auth login`` (stores credentials in system keyring)
 - Verify: ``copilot --version``
 
 Usage::
@@ -19,7 +20,7 @@ Usage::
 
     result = await async_llm_chat(
         prompt="Summarise the sentiment of these headlines…",
-        model="gpt-4.1",
+        model="gpt-4o",
         system="You are a financial analyst.",
         timeout=30.0,
     )
@@ -29,9 +30,83 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Optional
+import subprocess
+from typing import Any, cast
 
 logger = logging.getLogger(__name__)
+
+_PROFILE_ACCOUNT_KEYS: dict[str, str] = {
+    "personal": "GITHUB_COPILOT_PERSONAL",
+    "work": "GITHUB_COPILOT_WORK",
+}
+_ACTIVE_PROFILE_ENV = "GITHUB_COPILOT_ACTIVE_PROFILE"
+_ACTIVE_ACCOUNT_ENV = "GITHUB_COPILOT_ACTIVE_TOKEN"
+
+
+def _is_token_like(value: str) -> bool:
+    text = (value or "").strip().lower()
+    return text.startswith(("gho_", "ghp_", "github_pat_", "sk-"))
+
+
+def _active_profile_name() -> str:
+    profile = (os.getenv(_ACTIVE_PROFILE_ENV) or "personal").strip().lower()
+    return profile if profile in _PROFILE_ACCOUNT_KEYS else "personal"
+
+
+def _active_profile_account() -> str:
+    active = (os.getenv(_ACTIVE_ACCOUNT_ENV) or "").strip()
+    if active and not _is_token_like(active):
+        return active
+    account_key = _PROFILE_ACCOUNT_KEYS[_active_profile_name()]
+    account = (os.getenv(account_key) or "").strip()
+    return "" if _is_token_like(account) else account
+
+
+def _ordered_profile_accounts() -> list[tuple[str, str]]:
+    """Return unique non-empty profile usernames, active profile first."""
+    active_profile = _active_profile_name()
+    ordered_profiles = [active_profile] + [p for p in _PROFILE_ACCOUNT_KEYS if p != active_profile]
+    seen: set[str] = set()
+    result: list[tuple[str, str]] = []
+    explicit_active = (os.getenv(_ACTIVE_ACCOUNT_ENV) or "").strip()
+    if explicit_active and not _is_token_like(explicit_active):
+        seen.add(explicit_active)
+        result.append((f"{active_profile}:active", explicit_active))
+    elif explicit_active:
+        logger.warning(
+            "Ignoring token-like value in %s; expected github.com username, got token prefix.",
+            _ACTIVE_ACCOUNT_ENV,
+        )
+    for profile in ordered_profiles:
+        account_key = _PROFILE_ACCOUNT_KEYS[profile]
+        account = (os.getenv(account_key) or "").strip()
+        if account and _is_token_like(account):
+            logger.warning(
+                "Ignoring token-like value in %s; configure github.com username for profile '%s'.",
+                account_key,
+                profile,
+            )
+            continue
+        if account and account not in seen:
+            seen.add(account)
+            result.append((profile, account))
+    return result
+
+
+def _switch_gh_account(username: str) -> None:
+    """Switch gh active account to `username` on github.com."""
+    if not username:
+        return
+    proc = subprocess.run(
+        ["gh", "auth", "switch", "--hostname", "github.com", "--user", username],
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "unknown error").strip()
+        raise RuntimeError(f"gh auth switch failed for '{username}': {detail}")
 
 # ------------------------------------------------------------------ #
 # Public helper                                                        #
@@ -41,7 +116,7 @@ logger = logging.getLogger(__name__)
 async def async_llm_chat(
     prompt: str,
     *,
-    model: str = "gpt-4o-mini",
+    model: str = "gpt-5-mini",
     system: str = "",
     timeout: float = 45.0,
 ) -> str:
@@ -56,57 +131,69 @@ async def async_llm_chat(
     Returns:
         The assistant's reply text, or ``""`` on failure.
     """
-    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    profile_accounts = _ordered_profile_accounts()
+    fallback_model = (os.getenv("LLM_FAST_MODEL") or "gpt-5-mini").strip()
 
-    # --- 1. Try Copilot SDK via gh auth keyring (no API key needed) ---
-    # This uses the 'copilot' CLI which picks up 'gh auth login' credentials.
-    try:
-        return await asyncio.wait_for(
-            _copilot_chat(
-                prompt=prompt,
-                model=model,
-                system=system,
-                openai_key="",  # no BYOK — use GitHub Copilot auth via keyring
-                timeout=timeout,
-            ),
-            timeout=timeout + 20,
+    # --- 1. Try configured profile github.com account(s), active profile first ---
+    for label, username in profile_accounts:
+        try:
+            _switch_gh_account(username)
+            return await asyncio.wait_for(
+                _copilot_chat(
+                    prompt=prompt,
+                    model=model,
+                    system=system,
+                    timeout=timeout,
+                ),
+                timeout=timeout + 20,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Copilot SDK profile account (%s) timed out after %.0fs", label, timeout + 20)
+        except Exception as exc:
+            logger.info("Copilot SDK profile account (%s) failed (%s)", label, exc)
+
+    # --- 2. Try Copilot SDK with currently active gh account ---
+    # If no profile account is configured, rely on gh default active github.com account.
+    use_gh_auth_fallback = not profile_accounts
+    if use_gh_auth_fallback:
+        logger.warning(
+            "No profile github.com account found in .env — falling back to current 'gh auth' keyring account. "
+            "⚠️  Copilot SDK requires github.com authentication, NOT GitHub Enterprise. "
+            "Run 'gh auth status' to verify you're logged into github.com."
         )
-    except asyncio.TimeoutError:
-        logger.warning("Copilot SDK (gh auth) timed out after %.0fs", timeout + 20)
-    except Exception as exc:
-        logger.info("Copilot SDK (gh auth) failed (%s: %s); trying fallbacks…", type(exc).__name__, exc)
-
-    # --- 2. Try Copilot SDK + BYOK (requires valid OPENAI_API_KEY) ---
-    if openai_key:
         try:
             return await asyncio.wait_for(
                 _copilot_chat(
                     prompt=prompt,
                     model=model,
                     system=system,
-                    openai_key=openai_key,
                     timeout=timeout,
                 ),
                 timeout=timeout + 20,
             )
-        except (asyncio.TimeoutError, Exception) as exc:
-            logger.info("Copilot SDK BYOK failed (%s); trying direct OpenAI…", exc)
-
-        # --- 3. Direct OpenAI (no CLI dependency) ---
-        try:
-            return await _openai_direct_chat(
-                prompt=prompt,
-                model=model,
-                system=system,
-                timeout=timeout,
-                api_key=openai_key,
-            )
+        except asyncio.TimeoutError:
+            logger.warning("Copilot SDK (gh auth) timed out after %.0fs", timeout + 20)
         except Exception as exc:
-            logger.error("Direct OpenAI fallback failed: %s", exc)
+            logger.info("Copilot SDK (gh auth) failed (%s: %s); trying fallbacks…", type(exc).__name__, exc)
+
+    # --- 3. Final retry with fast model using active gh account ---
+    try:
+        retry_model = fallback_model or model
+        return await asyncio.wait_for(
+            _copilot_chat(
+                prompt=prompt,
+                model=retry_model,
+                system=system,
+                timeout=min(timeout, 35.0),
+            ),
+            timeout=min(timeout, 35.0) + 15,
+        )
+    except Exception as exc:
+        logger.info("Final Copilot retry failed (%s: %s)", type(exc).__name__, exc)
 
     logger.error(
-        "No LLM response available. Ensure 'copilot' CLI is installed "
-        "and authenticated via 'gh auth login', or set a valid OPENAI_API_KEY."
+        "No LLM response available. Ensure the selected profile maps to a valid github.com username "
+        "(GITHUB_COPILOT_PERSONAL / GITHUB_COPILOT_WORK) and gh is authenticated via 'gh auth login'."
     )
     return ""
 
@@ -116,9 +203,12 @@ async def async_llm_chat(
 # ------------------------------------------------------------------ #
 
 _HARDCODED_MODELS: list[dict] = [
+    {"id": "gpt-5-mini",      "name": "GPT-5 mini",      "is_free": True},
     {"id": "gpt-4.1",          "name": "GPT-4.1",          "is_free": True},
     {"id": "gpt-4o",           "name": "GPT-4o",            "is_free": True},
     {"id": "gpt-4o-mini",      "name": "GPT-4o mini",       "is_free": True},
+    {"id": "gpt-5",            "name": "GPT-5",             "is_free": False},
+    {"id": "o3",               "name": "o3",                "is_free": False},
     {"id": "claude-sonnet-4.5","name": "Claude Sonnet 4.5", "is_free": False},
     {"id": "o3-mini",          "name": "o3-mini",           "is_free": False},
     {"id": "o1",               "name": "o1",                "is_free": False},
@@ -183,25 +273,13 @@ async def _copilot_chat(
     *,
     model: str,
     system: str,
-    openai_key: str,
     timeout: float,
 ) -> str:
-    """Call the Copilot SDK, wiring BYOK when OPENAI_API_KEY is available."""
+    """Call the Copilot SDK using gh keyring-backed github.com authentication."""
     from copilot import CopilotClient  # type: ignore[import]
 
-    session_cfg: dict = {"model": model}
-
-    if openai_key:
-        # BYOK — routes through OpenAI directly, skips GitHub subscription quota
-        session_cfg["provider"] = {
-            "type": "openai",
-            "base_url": "https://api.openai.com/v1",
-            "api_key": openai_key,
-        }
-        logger.debug("LLM: Copilot SDK + BYOK (OpenAI key)")
-    else:
-        # Standard — uses GitHub Copilot auth from 'gh auth login' keyring
-        logger.debug("LLM: Copilot SDK via GitHub Copilot CLI (gh auth keyring)")
+    session_cfg: dict[str, Any] = {"model": model}
+    logger.debug("LLM: Copilot SDK via GitHub Copilot CLI (gh auth keyring)")
 
     if system:
         session_cfg["system_message"] = {"content": system, "role": "system"}
@@ -213,12 +291,19 @@ async def _copilot_chat(
     await client.start()
     session = None
     try:
-        session = await client.create_session(session_cfg)
+        session = await client.create_session(cast(Any, session_cfg))
         response = await asyncio.wait_for(
             session.send_and_wait({"prompt": prompt}),
             timeout=timeout,
         )
-        return (response.data.content if response and response.data else "") or ""
+        # Guard against empty response from Copilot SDK
+        content = (response.data.content if response and response.data else "") or ""
+        if not content or not content.strip():
+            logger.warning(
+                "Copilot SDK returned empty response. Check: copilot CLI installed, "
+                "and 'gh auth login' authenticated on github.com."
+            )
+        return content
     finally:
         if session is not None:
             try:
@@ -232,59 +317,17 @@ async def _copilot_chat(
 
 
 # ------------------------------------------------------------------ #
-# Internal: direct OpenAI fallback                                     #
-# ------------------------------------------------------------------ #
-
-
-async def _openai_direct_chat(
-    prompt: str,
-    *,
-    model: str,
-    system: str,
-    timeout: float,
-    api_key: str,
-) -> str:
-    """Call OpenAI directly via openai.AsyncOpenAI (no Copilot CLI needed)."""
-    import openai  # type: ignore[import]
-
-    messages: list[dict] = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-
-    aclient = openai.AsyncOpenAI(api_key=api_key)
-    response = await asyncio.wait_for(
-        aclient.chat.completions.create(
-            model=model,
-            messages=messages,  # type: ignore[arg-type]
-            temperature=0.2,
-        ),
-        timeout=timeout,
-    )
-    if response.choices:
-        return response.choices[0].message.content or ""
-    return ""
-
-
-# ------------------------------------------------------------------ #
 # Session config helper (for agents that manage sessions themselves)   #
 # ------------------------------------------------------------------ #
 
 
 def build_session_config(model: str, *, system: str = "") -> dict:
-    """Return a ``create_session`` config dict with BYOK wired when available.
+    """Return a ``create_session`` config dict for Copilot SDK gh-auth sessions.
 
     Prefer :func:`async_llm_chat` for simple one-shot calls; use this only
     when you need to manage the session lifecycle yourself.
     """
-    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
     cfg: dict = {"model": model, "infinite_sessions": {"enabled": False}}
-    if openai_key:
-        cfg["provider"] = {
-            "type": "openai",
-            "base_url": "https://api.openai.com/v1",
-            "api_key": openai_key,
-        }
     if system:
         cfg["system_message"] = {"content": system, "role": "system"}
     return cfg
