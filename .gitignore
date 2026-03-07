@@ -33,3 +33,13 @@ Thumbs.db
 # Local portfolio snapshot and tastytrade cache
 .portfolio_snapshot.json
 .tastytrade_cache.pkl
+
+# pytest and tooling caches
+.pytest_cache/
+.mypy_cache/
+.cache/
+.coverage
+coverage.xml
+
+# Log directories
+logs/
