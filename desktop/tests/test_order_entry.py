@@ -8,7 +8,7 @@ Verifies:
 """
 from __future__ import annotations
 
-from desktop.ui.order_entry import OrderEntryPanel
+from desktop.ui.order_entry import OrderEntryPanel, _net_prices
 from desktop.engine.ib_engine import ChainRow
 
 
@@ -150,6 +150,15 @@ class TestOrderEntryBehavior:
         assert leg["strike"] == 5500
         assert leg["right"] == "C"
         assert leg["expiry"] == "20260320"
+
+    def test_net_price_not_scaled_by_order_quantity(self):
+        """A 5-lot single option still uses per-contract price in ticket limit."""
+        legs = [{"action": "BUY", "qty": 5, "sec_type": "OPT", "symbol": "SPY"}]
+        bid_ask = [{"bid": 0.09, "ask": 0.11}]
+        lo, hi, mid = _net_prices(legs, bid_ask)
+        assert lo == 0.09
+        assert hi == 0.11
+        assert mid == 0.1
 
 
 class TestOrderEntryPrefill:

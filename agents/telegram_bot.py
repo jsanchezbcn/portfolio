@@ -133,12 +133,15 @@ def require_auth(handler: Callable) -> Callable:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _resolve_account_ids() -> list[str]:
-    """Return a list of account IDs from env, or all detected IBKR accounts."""
+    """Return a list of account IDs from env, or all detected IBKR accounts.
+    
+    If IBKR gateway is not running, returns empty list so commands can fail gracefully.
+    """
     account_id = os.getenv("IBKR_ACCOUNT_ID", "").strip()
     if account_id:
         return [acc.strip() for acc in account_id.split(",") if acc.strip()]
 
-    # Auto-detect from IBKR
+    # Auto-detect from IBKR - fail silently if gateway is down
     try:
         adapter, _, _, _ = _services()
         accounts = await asyncio.get_event_loop().run_in_executor(
@@ -146,8 +149,8 @@ async def _resolve_account_ids() -> list[str]:
         )
         if accounts:
             return [(acc if isinstance(acc, str) else acc.get("id", "")) for acc in accounts if acc]
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Cannot auto-detect IBKR accounts (gateway might be offline): %s", exc)
     return []
 
 
@@ -256,7 +259,11 @@ async def cmd_greeks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     account_ids = await _resolve_account_ids()
     if not account_ids:
         await update.message.reply_text(
-            "⚠️ Cannot resolve IBKR account. Set IBKR_ACCOUNT_ID in .env or ensure the gateway is running."
+            "⚠️ Cannot resolve IBKR account.\n"
+            "\nEither:\n"
+            "1. Set IBKR_ACCOUNT_ID in .env (e.g., IBKR_ACCOUNT_ID=U1234567)\n"
+            "2. Start the IBKR gateway (check if it's running)\n"
+            "\nTip: Greeks are cached - if market is closed, last known values are shown."
         )
         return
 
@@ -289,7 +296,10 @@ async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     account_ids = await _resolve_account_ids()
     if not account_ids:
         await update.message.reply_text(
-            "⚠️ Cannot resolve IBKR account. Set IBKR_ACCOUNT_ID in .env or ensure the gateway is running."
+            "⚠️ Cannot resolve IBKR account.\n"
+            "\nEither:\n"
+            "1. Set IBKR_ACCOUNT_ID in .env (e.g., IBKR_ACCOUNT_ID=U1234567)\n"
+            "2. Start the IBKR gateway (check if it's running)"
         )
         return
 

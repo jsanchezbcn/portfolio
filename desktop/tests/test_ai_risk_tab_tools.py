@@ -168,31 +168,277 @@ async def test_tool_get_market_snapshot(ai_risk_tab, mock_engine):
 
 @pytest.mark.asyncio
 async def test_tool_get_bid_ask_from_cache(ai_risk_tab, mock_engine):
-    """Test _tool_get_bid_ask returns cached price data."""
-    mock_engine._last_price_cache = {
-        "MES_5700_20260320_C": 25.5,
- "MES_5720_20260320_P": 12.3,
-    }
+    """Test _tool_get_bid_ask returns option quote data and caches it."""
+    mock_engine.get_bid_ask_for_legs = AsyncMock(return_value=[{"bid": 25.0, "ask": 26.0, "mid": 25.5}])
 
     result = await ai_risk_tab._tool_get_bid_ask("MES", 5700, "20260320", "C", "FOP", "CME")
+    result_2 = await ai_risk_tab._tool_get_bid_ask("MES", 5700, "20260320", "C", "FOP", "CME")
 
     assert result["symbol"] == "MES"
     assert result["strike"] == 5700
     assert result["expiry"] == "20260320"
     assert result["right"] == "C"
-    assert result["price"] == 25.5
+    assert result["bid"] == 25.0
+    assert result["ask"] == 26.0
+    assert result["mid"] == 25.5
+    assert result["spread"] == 1.0
+    assert result_2["mid"] == 25.5
+    mock_engine.get_bid_ask_for_legs.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_tool_get_bid_ask_no_cache(ai_risk_tab, mock_engine):
-    """Test _tool_get_bid_ask returns None when no cached price."""
-    mock_engine._last_price_cache = {}
+    """Test _tool_get_bid_ask validates missing option fields."""
 
-    result = await ai_risk_tab._tool_get_bid_ask("MES", 5700, "20260320", "C", "FOP", "CME")
+    result = await ai_risk_tab._tool_get_bid_ask("MES", None, None, None, "FOP", "CME")
 
     assert result["symbol"] == "MES"
-    assert result["strike"] == 5700
-    assert result["price"] is None
+    assert result["mid"] is None
+    assert "require strike" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_tool_get_bid_ask_for_stock_uses_snapshot(ai_risk_tab, mock_engine):
+    """Test stock quotes are derived from market snapshots."""
+    mock_engine.get_market_snapshot = AsyncMock(return_value=MarketSnapshot(
+        symbol="AAPL",
+        last=210.0,
+        bid=209.8,
+        ask=210.2,
+        high=211.0,
+        low=208.0,
+        close=208.5,
+        volume=100,
+        timestamp="2026-03-06T10:30:00Z",
+    ))
+
+    result = await ai_risk_tab._tool_get_bid_ask("AAPL", None, None, None, "STK", "SMART")
+
+    assert result["symbol"] == "AAPL"
+    assert result["bid"] == 209.8
+    assert result["ask"] == 210.2
+    assert result["spread"] == pytest.approx(0.4)
+
+
+@pytest.mark.asyncio
+async def test_tool_get_trade_bid_ask_aggregates_multi_leg(ai_risk_tab, mock_engine):
+    """Test multi-leg quote aggregation returns debit/credit estimates."""
+    mock_engine.get_bid_ask_for_legs = AsyncMock(return_value=[
+        {"bid": 4.0, "ask": 4.4, "mid": 4.2},
+        {"bid": 1.2, "ask": 1.4, "mid": 1.3},
+    ])
+    legs = [
+        {"symbol": "MES", "action": "BUY", "qty": 1, "sec_type": "FOP", "strike": 5700, "right": "P", "expiry": "20260320", "exchange": "CME"},
+        {"symbol": "MES", "action": "SELL", "qty": 1, "sec_type": "FOP", "strike": 5650, "right": "P", "expiry": "20260320", "exchange": "CME"},
+    ]
+
+    result = await ai_risk_tab._tool_get_trade_bid_ask(legs)
+
+    assert len(result["legs"]) == 2
+    assert result["natural_net_debit"] == pytest.approx(3.2)
+    assert result["mid_net_debit"] == pytest.approx(2.9)
+    assert result["estimated_slippage_vs_mid"] == pytest.approx(0.3)
+
+
+@pytest.mark.asyncio
+async def test_tool_get_positions_uses_five_minute_cache(ai_risk_tab, mock_engine):
+    """Test repeated position calls reuse the 5-minute snapshot cache."""
+    mock_engine.refresh_positions = AsyncMock(return_value=[
+        PositionRow(
+            conid=123,
+            symbol="AAPL",
+            sec_type="STK",
+            underlying="AAPL",
+            strike=None,
+            right=None,
+            expiry=None,
+            quantity=100,
+            avg_cost=145.0,
+            market_price=150.0,
+            market_value=15000.0,
+            unrealized_pnl=500.0,
+            realized_pnl=0.0,
+            delta=100.0,
+            gamma=None,
+            theta=None,
+            vega=None,
+            iv=None,
+            spx_delta=4.2,
+        ),
+    ])
+
+    await ai_risk_tab._tool_get_positions()
+    await ai_risk_tab._tool_get_positions()
+
+    mock_engine.refresh_positions.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_tool_get_portfolio_greeks_uses_one_minute_cache(ai_risk_tab, mock_engine):
+    """Test repeated aggregate-greeks calls reuse the fresh 1-minute cache."""
+    mock_engine.refresh_positions = AsyncMock(return_value=[
+        PositionRow(
+            conid=456,
+            symbol="MES",
+            sec_type="FOP",
+            underlying="MES",
+            strike=5700,
+            right="C",
+            expiry="20260320",
+            quantity=-2,
+            avg_cost=25.0,
+            market_price=23.0,
+            market_value=-4600.0,
+            unrealized_pnl=400.0,
+            realized_pnl=0.0,
+            delta=-65.0,
+            gamma=0.2,
+            theta=-25.0,
+            vega=16.6,
+            iv=0.20,
+            spx_delta=-6.5,
+        ),
+    ])
+
+    first = await ai_risk_tab._tool_get_portfolio_greeks()
+    second = await ai_risk_tab._tool_get_portfolio_greeks()
+
+    assert first["total_gamma"] == 0.2
+    assert second["greeks_coverage"] == 1.0
+    mock_engine.refresh_positions.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_tool_get_portfolio_metrics(ai_risk_tab, mock_engine):
+    """Test aggregate portfolio metrics tool combines positions and account data."""
+    mock_engine.refresh_positions = AsyncMock(return_value=[
+        PositionRow(
+            conid=1,
+            symbol="AAPL",
+            sec_type="STK",
+            underlying="AAPL",
+            strike=None,
+            right=None,
+            expiry=None,
+            quantity=100,
+            avg_cost=145.0,
+            market_price=150.0,
+            market_value=15000.0,
+            unrealized_pnl=500.0,
+            realized_pnl=0.0,
+            delta=100.0,
+            gamma=None,
+            theta=None,
+            vega=None,
+            iv=None,
+            spx_delta=4.2,
+        ),
+        PositionRow(
+            conid=2,
+            symbol="MES",
+            sec_type="FOP",
+            underlying="MES",
+            strike=5700,
+            right="C",
+            expiry="20260320",
+            quantity=-1,
+            avg_cost=25.0,
+            market_price=23.0,
+            market_value=-2300.0,
+            unrealized_pnl=400.0,
+            realized_pnl=0.0,
+            delta=-20.0,
+            gamma=0.1,
+            theta=-12.0,
+            vega=8.0,
+            iv=0.20,
+            spx_delta=-6.5,
+        ),
+    ])
+    mock_engine.refresh_account = AsyncMock(return_value=AccountSummary(
+        account_id="U123456",
+        net_liquidation=100000.0,
+        total_cash=20000.0,
+        buying_power=80000.0,
+        init_margin=10000.0,
+        maint_margin=8000.0,
+        unrealized_pnl=900.0,
+        realized_pnl=0.0,
+    ))
+
+    result = await ai_risk_tab._tool_get_portfolio_metrics()
+
+    assert result["total_positions"] == 2
+    assert result["options_count"] == 1
+    assert result["stocks_count"] == 1
+    assert result["nlv"] == 100000.0
+    assert result["top_spx_delta_positions"][0]["symbol"] in {"AAPL", "MES"}
+
+
+@pytest.mark.asyncio
+async def test_tool_get_recent_market_intel(ai_risk_tab, mock_engine):
+    """Test recent market intel tool delegates to the shared database layer."""
+    mock_engine._db = MagicMock()
+    mock_engine._db.get_recent_market_intel = AsyncMock(return_value=[{"source": "llm_risk_audit", "symbol": "PORTFOLIO"}])
+
+    result = await ai_risk_tab._tool_get_recent_market_intel(limit=5)
+
+    assert result[0]["source"] == "llm_risk_audit"
+    mock_engine._db.get_recent_market_intel.assert_awaited_once_with(limit=5)
+
+
+@pytest.mark.asyncio
+async def test_tool_analyze_trade_candidate_bundles_context(ai_risk_tab, mock_engine):
+    """Test candidate-trade analysis bundles portfolio, spread, and optional simulation context."""
+    mock_engine.refresh_positions = AsyncMock(return_value=[
+        PositionRow(
+            conid=2,
+            symbol="MES",
+            sec_type="FOP",
+            underlying="MES",
+            strike=5700,
+            right="C",
+            expiry="20260320",
+            quantity=-1,
+            avg_cost=25.0,
+            market_price=23.0,
+            market_value=-2300.0,
+            unrealized_pnl=400.0,
+            realized_pnl=0.0,
+            delta=-20.0,
+            gamma=0.1,
+            theta=-12.0,
+            vega=8.0,
+            iv=0.20,
+            spx_delta=-6.5,
+        ),
+    ])
+    mock_engine.refresh_account = AsyncMock(return_value=AccountSummary(
+        account_id="U123456",
+        net_liquidation=100000.0,
+        total_cash=20000.0,
+        buying_power=80000.0,
+        init_margin=10000.0,
+        maint_margin=8000.0,
+        unrealized_pnl=900.0,
+        realized_pnl=0.0,
+    ))
+    mock_engine.get_market_snapshot = AsyncMock(return_value=SimpleNamespace(last=18.0, close=18.5))
+    mock_engine.get_bid_ask_for_legs = AsyncMock(return_value=[{"bid": 4.0, "ask": 4.4, "mid": 4.2}])
+    mock_engine.whatif_order = AsyncMock(return_value={"margin_impact": 2500.0})
+    mock_engine._db = MagicMock()
+    mock_engine._db.get_recent_market_intel = AsyncMock(return_value=[{"source": "llm_brief"}])
+
+    result = await ai_risk_tab._tool_analyze_trade_candidate(
+        [{"symbol": "MES", "action": "BUY", "qty": 1, "sec_type": "FOP", "strike": 5700, "right": "P", "expiry": "20260320", "exchange": "CME"}],
+        include_whatif=True,
+    )
+
+    assert "portfolio_metrics" in result
+    assert "portfolio_greeks" in result
+    assert "trade_bid_ask" in result
+    assert result["whatif"]["margin_impact"] == 2500.0
+    assert result["recent_market_intel"][0]["source"] == "llm_brief"
 
 
 @pytest.mark.asyncio
@@ -275,12 +521,37 @@ async def test_tool_get_recent_fills_db_unavailable(ai_risk_tab, mock_engine):
 async def test_tool_get_risk_breaches(ai_risk_tab, mock_engine):
     """Test _tool_get_risk_breaches computes violations."""
     mock_engine.refresh_positions = AsyncMock(return_value=[
-        Position(symbol="MES", sec_type="FOP", quantity=-5, delta=-0.65, gamma=0.01, theta=-62.5, vega=20.0, spx_delta=-15.0),
+        PositionRow(
+            conid=1,
+            symbol="MES",
+            sec_type="FOP",
+            underlying="MES",
+            strike=5700.0,
+            right="C",
+            expiry="20260320",
+            quantity=-5,
+            avg_cost=25.0,
+            market_price=20.0,
+            market_value=-10000.0,
+            unrealized_pnl=0.0,
+            realized_pnl=0.0,
+            delta=-0.65,
+            gamma=0.01,
+            theta=-62.5,
+            vega=20.0,
+            iv=0.2,
+            spx_delta=-15.0,
+        ),
     ])
     mock_engine.refresh_account = AsyncMock(return_value=AccountSummary(
-        account_code="U123456",
+        account_id="U123456",
         net_liquidation=50000.0,
+        total_cash=10000.0,
+        buying_power=60000.0,
         init_margin=5000.0,
+        maint_margin=4000.0,
+        unrealized_pnl=0.0,
+        realized_pnl=0.0,
     ))
     mock_engine.get_market_snapshot = AsyncMock(return_value=SimpleNamespace(last=18.0, close=18.5))
     mock_engine.account_id = "U123456"
@@ -300,7 +571,7 @@ def test_create_tools_for_session(ai_risk_tab):
     """Test _create_tools_for_session returns list of tool definitions."""
     tools = ai_risk_tab._create_tools_for_session()
 
-    assert len(tools) == 9  # 9 tools defined
+    assert len(tools) == 14
     # Copilot SDK returns Tool objects with metadata (not callables)
     assert all(hasattr(tool, "name") for tool in tools)
     assert all(hasattr(tool, "description") for tool in tools)
@@ -309,6 +580,7 @@ def test_create_tools_for_session(ai_risk_tab):
 @pytest.mark.asyncio
 async def test_audit_uses_fresh_data(ai_risk_tab, mock_engine):
     """Test _async_audit fetches fresh data instead of using pre-loaded context."""
+    mock_engine._db = MagicMock()
     mock_engine.refresh_positions = AsyncMock(return_value=[
         PositionRow(conid=456, symbol="MES", sec_type="FOP", underlying="MES", strike=5700, right="C", expiry="20260320",
                 quantity=-2, avg_cost=25.0, market_price=23.0, market_value=-4600.0,
@@ -341,9 +613,10 @@ async def test_audit_uses_fresh_data(ai_risk_tab, mock_engine):
         ai_risk_tab._context = {}
         await ai_risk_tab._async_audit()
 
-        # Verify data was fetched fresh (called twice: once in audit, once in _tool_get_risk_breaches)
+        # Verify data was fetched fresh (risk-breach detection may refresh account again)
         assert mock_engine.refresh_positions.call_count >= 1
-        mock_engine.refresh_account.assert_called_once()
+        assert mock_engine.refresh_account.call_count >= 1
+        mock_auditor_cls.assert_called_once_with(db=mock_engine._db)
         mock_auditor.audit_now.assert_called_once()
 
 
@@ -351,12 +624,23 @@ async def test_audit_uses_fresh_data(ai_risk_tab, mock_engine):
 async def test_suggest_uses_fresh_data(ai_risk_tab, mock_engine):
     """Test _async_suggest fetches fresh data instead of using pre-loaded context."""
     mock_engine.account_id = "U123456"
+    mock_engine._db = MagicMock()
     mock_engine.refresh_positions = AsyncMock(return_value=[
         PositionRow(conid=456, symbol="MES", sec_type="FOP", underlying="MES", strike=5700, right="C", expiry="20260320",
                 quantity=-2, avg_cost=25.0, market_price=23.0, market_value=-4600.0,
                 unrealized_pnl=400.0, realized_pnl=0.0,
                 delta=-0.65, gamma=0.002, theta=-25.0, vega=16.6, iv=0.20, spx_delta=-6.5),
     ])
+    mock_engine.refresh_account = AsyncMock(return_value=AccountSummary(
+        account_id="U123456",
+        net_liquidation=100000.0,
+        total_cash=20000.0,
+        buying_power=80000.0,
+        init_margin=10000.0,
+        maint_margin=8000.0,
+        unrealized_pnl=400.0,
+        realized_pnl=0.0,
+    ))
     mock_engine.get_market_snapshot = AsyncMock(return_value=SimpleNamespace(last=15.0, close=15.5))
 
     with patch("desktop.ui.ai_risk_tab.LLMRiskAuditor") as mock_auditor_cls:
@@ -377,6 +661,8 @@ async def test_suggest_uses_fresh_data(ai_risk_tab, mock_engine):
 
             # Verify data was fetched fresh
             assert mock_engine.refresh_positions.call_count >= 1
+            assert mock_engine.refresh_account.call_count >= 1
+            mock_auditor_cls.assert_called_once_with(db=mock_engine._db)
             mock_auditor.suggest_trades.assert_called_once()
 
 

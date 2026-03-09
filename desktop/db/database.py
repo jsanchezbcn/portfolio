@@ -36,6 +36,7 @@ class Database:
             command_timeout=30,
             timeout=10,  # connection timeout per-connection
         )
+        await self.ensure_schema()
         logger.info("Database pool created (%s)", self._dsn.split("@")[-1])
 
     async def close(self) -> None:
@@ -49,6 +50,47 @@ class Database:
         if self._pool is None:
             raise RuntimeError("Database not connected — call await db.connect() first")
         return self._pool
+
+    async def ensure_schema(self) -> None:
+        """Create shared business-data tables required by the desktop runtime."""
+        async with self.pool.acquire() as conn:
+            await conn.execute('CREATE EXTENSION IF NOT EXISTS pgcrypto;')
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS market_intel (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    trade_id UUID,
+                    symbol TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    content TEXT NOT NULL DEFAULT '',
+                    sentiment_score DOUBLE PRECISION,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_market_intel_symbol_source ON market_intel(symbol, source, created_at DESC);"
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS journal_notes (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    account_id TEXT,
+                    order_id UUID REFERENCES orders(id) ON DELETE SET NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL DEFAULT '',
+                    tags TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_journal_notes_account_created ON journal_notes(account_id, created_at DESC);"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_journal_notes_created ON journal_notes(created_at DESC);"
+            )
 
     # ── positions ─────────────────────────────────────────────────────────
 
@@ -153,8 +195,119 @@ class Database:
                 }
         return result
 
+    async def store_cached_greeks(
+        self,
+        underlying: str,
+        expiry,
+        strike: float,
+        option_right: str,
+        conid: int | None = None,
+        bid: float | None = None,
+        ask: float | None = None,
+        last: float | None = None,
+        volume: int | None = None,
+        open_interest: int | None = None,
+        iv: float | None = None,
+        delta: float | None = None,
+        gamma: float | None = None,
+        theta: float | None = None,
+        vega: float | None = None,
+    ) -> None:
+        """Store Greeks and chain data in the option_chain_cache table for offline fallback.
+        
+        Uses UPSERT to replace existing cache entries for the same option.
+        """
+        try:
+            await self.pool.execute(
+                """
+                INSERT INTO option_chain_cache (
+                    underlying, expiry, strike, option_right, conid,
+                    bid, ask, last, volume, open_interest,
+                    iv, delta, gamma, theta, vega, fetched_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
+                ON CONFLICT (underlying, expiry, strike, option_right)
+                DO UPDATE SET
+                    conid = EXCLUDED.conid,
+                    bid = EXCLUDED.bid,
+                    ask = EXCLUDED.ask,
+                    last = EXCLUDED.last,
+                    volume = EXCLUDED.volume,
+                    open_interest = EXCLUDED.open_interest,
+                    iv = EXCLUDED.iv,
+                    delta = EXCLUDED.delta,
+                    gamma = EXCLUDED.gamma,
+                    theta = EXCLUDED.theta,
+                    vega = EXCLUDED.vega,
+                    fetched_at = NOW();
+                """,
+                underlying, expiry, strike, option_right, conid,
+                bid, ask, last, volume, open_interest,
+                iv, delta, gamma, theta, vega
+            )
+        except Exception as exc:
+            logger.debug("Failed to store cached Greeks for %s %s %.0f %s: %s", 
+                        underlying, expiry, strike, option_right, exc)
+
     async def clear_positions(self, account_id: str) -> None:
         await self.pool.execute("DELETE FROM positions WHERE account_id = $1", account_id)
+
+    async def get_cached_expirations(
+        self, 
+        underlying: str, 
+        sec_type: str = "FOP",
+        exchange: str = "CME"
+    ) -> list[str] | None:
+        """Load cached available expirations for an underlying.
+        
+        Returns list of YYYYMMDD strings if cache exists, None otherwise.
+        Used for offline fallback when market is closed or gateway is unavailable.
+        """
+        row = await self.pool.fetchrow(
+            """
+            SELECT expirations, fetched_at 
+            FROM available_expirations 
+            WHERE underlying = $1 AND sec_type = $2 AND exchange = $3
+            """,
+            underlying, sec_type, exchange,
+        )
+        if row:
+            age_seconds = (datetime.now(timezone.utc) - row['fetched_at']).total_seconds()
+            age_hours = age_seconds / 3600
+            logger.debug(
+                "Expiry cache hit (database) for %s/%s/%s - %d expirations, age: %.1fh",
+                underlying, sec_type, exchange, len(row['expirations']), age_hours
+            )
+            return list(row['expirations'])
+        return None
+
+    async def store_cached_expirations(
+        self,
+        underlying: str,
+        expirations: list[str],
+        sec_type: str = "FOP",
+        exchange: str = "CME"
+    ) -> None:
+        """Store available expirations in database for offline fallback.
+        
+        Uses UPSERT to replace existing cache entries for the same underlying/sec_type/exchange.
+        """
+        try:
+            await self.pool.execute(
+                """
+                INSERT INTO available_expirations (underlying, sec_type, exchange, expirations, fetched_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT (underlying, sec_type, exchange)
+                DO UPDATE SET
+                    expirations = EXCLUDED.expirations,
+                    fetched_at = NOW();
+                """,
+                underlying, sec_type, exchange, expirations
+            )
+            logger.debug("Stored %d expirations for %s/%s/%s in database cache", 
+                        len(expirations), underlying, sec_type, exchange)
+        except Exception as exc:
+            logger.debug("Failed to store cached expirations for %s/%s/%s: %s", 
+                        underlying, sec_type, exchange, exc)
 
     # ── orders ────────────────────────────────────────────────────────────
 
@@ -251,6 +404,150 @@ class Database:
             account_id, limit,
         )
 
+    async def create_journal_note(
+        self,
+        *,
+        account_id: str | None,
+        title: str,
+        body: str,
+        tags: list[str] | None = None,
+        order_id: UUID | str | None = None,
+    ) -> UUID:
+        """Create a journal note and return its UUID."""
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO journal_notes (account_id, order_id, title, body, tags)
+            VALUES ($1, $2::UUID, $3, $4, $5::TEXT[])
+            RETURNING id
+            """,
+            account_id,
+            str(order_id) if order_id else None,
+            title,
+            body,
+            list(tags or []),
+        )
+        return row["id"]
+
+    async def list_journal_notes(
+        self,
+        *,
+        account_id: str | None = None,
+        search: str | None = None,
+        tag: str | None = None,
+        limit: int = 200,
+    ) -> list[asyncpg.Record]:
+        """Return recent journal notes newest-first."""
+        clauses: list[str] = []
+        args: list[Any] = []
+
+        if account_id:
+            args.append(account_id)
+            clauses.append(f"(account_id = ${len(args)} OR account_id IS NULL)")
+        if search:
+            args.append(f"%{search}%")
+            clauses.append(
+                f"(title ILIKE ${len(args)} OR body ILIKE ${len(args)})"
+            )
+        if tag:
+            args.append(tag)
+            clauses.append(f"${len(args)} = ANY(tags)")
+
+        args.append(limit)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return await self.pool.fetch(
+            f"""
+            SELECT id, account_id, order_id, title, body, tags, created_at, updated_at
+            FROM journal_notes
+            {where}
+            ORDER BY created_at DESC
+            LIMIT ${len(args)}
+            """,
+            *args,
+        )
+
+    async def upsert_market_intel(
+        self,
+        *,
+        symbol: str,
+        source: str,
+        sentiment_score: float | None = None,
+        summary: str = "",
+        raw_data: dict[str, Any] | None = None,
+    ) -> str:
+        """Insert or replace the latest market intelligence row for a symbol/source."""
+        content = summary
+        if raw_data:
+            try:
+                content = json.dumps(raw_data)
+            except (TypeError, ValueError):
+                content = summary
+
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM market_intel WHERE symbol = $1 AND source = $2",
+                    symbol,
+                    source,
+                )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO market_intel (symbol, source, content, sentiment_score)
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING id::TEXT
+                    """,
+                    symbol,
+                    source,
+                    content,
+                    sentiment_score,
+                )
+        return row["id"]
+
+    async def get_recent_market_intel(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        rows = await self.pool.fetch(
+            """
+            SELECT id::TEXT, trade_id::TEXT, symbol, source, content, sentiment_score, created_at
+            FROM market_intel
+            ORDER BY created_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(row) for row in rows]
+
+    async def get_market_intel_by_source(
+        self,
+        source: str,
+        *,
+        symbol: str | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        if symbol:
+            rows = await self.pool.fetch(
+                """
+                SELECT id::TEXT, trade_id::TEXT, symbol, source, content, sentiment_score, created_at
+                FROM market_intel
+                WHERE source = $1 AND symbol = $2
+                ORDER BY created_at DESC
+                LIMIT $3
+                """,
+                source,
+                symbol,
+                limit,
+            )
+        else:
+            rows = await self.pool.fetch(
+                """
+                SELECT id::TEXT, trade_id::TEXT, symbol, source, content, sentiment_score, created_at
+                FROM market_intel
+                WHERE source = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                source,
+                limit,
+            )
+        return [dict(row) for row in rows]
+
     # ── fills ─────────────────────────────────────────────────────────────
 
     async def insert_fill(self, fill: dict[str, Any]) -> int:
@@ -331,3 +628,95 @@ class Database:
             snap.get("margin_used_pct"),
         )
         return row["id"]
+
+    async def capture_portfolio_snapshot(self, snap: dict[str, Any]) -> None:
+        """Persist a dashboard-style portfolio snapshot across account and risk tables."""
+        await self.insert_account_snapshot(
+            {
+                "account_id": snap.get("account_id", ""),
+                "net_liquidation": snap.get("net_liquidation"),
+                "total_cash": snap.get("cash_balance"),
+                "buying_power": snap.get("buying_power"),
+                "init_margin": snap.get("init_margin"),
+                "maint_margin": snap.get("maint_margin"),
+                "unrealized_pnl": snap.get("unrealized_pnl"),
+                "realized_pnl": snap.get("realized_pnl"),
+            }
+        )
+        await self.insert_risk_snapshot(
+            {
+                "account_id": snap.get("account_id", ""),
+                "spx_delta": snap.get("spx_delta"),
+                "gamma": snap.get("gamma"),
+                "theta": snap.get("theta"),
+                "vega": snap.get("vega"),
+                "vix": snap.get("vix"),
+                "regime": snap.get("regime"),
+                "nlv": snap.get("net_liquidation"),
+                "margin_used_pct": snap.get("margin_used_pct"),
+            }
+        )
+
+    async def query_snapshots(
+        self,
+        *,
+        start_dt: Optional[str] = None,
+        end_dt: Optional[str] = None,
+        account_id: Optional[str] = None,
+        limit: int = 10_000,
+    ) -> list[dict[str, Any]]:
+        """Return chart-friendly portfolio snapshots oldest-first.
+
+        Combines `risk_snapshots` with the latest prior `account_snapshots` row
+        for each risk snapshot so dashboard history charts can use a single API.
+        """
+        clauses: list[str] = []
+        args: list[Any] = []
+
+        if start_dt:
+            args.append(datetime.fromisoformat(start_dt.replace("Z", "+00:00")))
+            clauses.append(f"rs.timestamp >= ${len(args)}")
+        if end_dt:
+            args.append(datetime.fromisoformat(end_dt.replace("Z", "+00:00")))
+            clauses.append(f"rs.timestamp <= ${len(args)}")
+        if account_id:
+            args.append(account_id)
+            clauses.append(f"rs.account_id = ${len(args)}")
+
+        args.append(limit)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        rows = await self.pool.fetch(
+            f"""
+            SELECT
+                rs.timestamp AS captured_at,
+                rs.account_id,
+                acct.net_liquidation,
+                acct.total_cash AS cash_balance,
+                rs.spx_delta,
+                rs.gamma,
+                rs.theta,
+                rs.vega,
+                CASE
+                    WHEN rs.spx_delta IS NOT NULL AND rs.spx_delta <> 0 AND rs.theta IS NOT NULL
+                    THEN rs.theta / rs.spx_delta
+                    ELSE NULL
+                END AS delta_theta_ratio,
+                rs.vix,
+                NULL::DOUBLE PRECISION AS spx_price,
+                rs.regime
+            FROM risk_snapshots rs
+            LEFT JOIN LATERAL (
+                SELECT a.net_liquidation, a.total_cash
+                FROM account_snapshots a
+                WHERE a.account_id = rs.account_id AND a.timestamp <= rs.timestamp
+                ORDER BY a.timestamp DESC
+                LIMIT 1
+            ) acct ON TRUE
+            {where}
+            ORDER BY rs.timestamp ASC
+            LIMIT ${len(args)}
+            """,
+            *args,
+        )
+        return [dict(row) for row in rows]

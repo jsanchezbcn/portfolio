@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date
+from math import gcd
 from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import (
@@ -46,19 +47,37 @@ def _tick_for_legs(legs: list[dict]) -> float:
 
 def _net_prices(legs: list[dict], bid_ask: list[dict]) -> tuple:
     """Net (lo, hi, mid) for a combo using IB price convention (BUY=you pay, SELL=you receive)."""
+    def _ratios(src_legs: list[dict]) -> list[int]:
+        if not src_legs:
+            return []
+        qtys: list[int] = []
+        for leg in src_legs:
+            try:
+                qtys.append(max(1, int(float(leg.get("qty", 1)))))
+            except Exception:
+                qtys.append(1)
+        base = qtys[0]
+        for q in qtys[1:]:
+            base = gcd(base, q)
+        base = max(1, base)
+        return [max(1, q // base) for q in qtys]
+
     combo_lo = combo_hi = 0.0
     any_price = False
-    for leg, ba in zip(legs, bid_ask):
+    for leg, ba, ratio in zip(legs, bid_ask, _ratios(legs)):
         sign = 1.0 if str(leg.get("action", "BUY")).upper() == "BUY" else -1.0
-        qty = float(leg.get("qty", 1))
         bid, ask = ba.get("bid"), ba.get("ask")
         if bid is None and ask is None:
             continue
         any_price = True
-        b = float(bid if bid is not None else ask)
-        a = float(ask if ask is not None else bid)
-        combo_lo += sign * qty * min(b, a)
-        combo_hi += sign * qty * max(b, a)
+        b_raw = bid if bid is not None else ask
+        a_raw = ask if ask is not None else bid
+        if b_raw is None or a_raw is None:
+            continue
+        b = float(b_raw)
+        a = float(a_raw)
+        combo_lo += sign * float(ratio) * min(b, a)
+        combo_hi += sign * float(ratio) * max(b, a)
     if not any_price:
         return None, None, None
     lo, hi = min(combo_lo, combo_hi), max(combo_lo, combo_hi)
@@ -169,7 +188,7 @@ class OrderEntryPanel(QWidget):
         self._cmb_step = QComboBox(); self._cmb_step.addItems(["0.01","0.05","0.10","0.25","1.00"]); self._cmb_step.setCurrentText("0.05"); self._cmb_step.setMaximumWidth(65)
         ctrl_row.addWidget(self._cmb_step)
         ctrl_row.addWidget(QLabel("Type:"))
-        self._cmb_order_type = QComboBox(); self._cmb_order_type.addItems(["LIMIT","MARKET"]); ctrl_row.addWidget(self._cmb_order_type)
+        self._cmb_order_type = QComboBox(); self._cmb_order_type.addItems(["LIMIT","MARKET","PRICE_DISCOVERY"]); ctrl_row.addWidget(self._cmb_order_type)
         ctrl_row.addStretch(); pv.addLayout(ctrl_row); root.addWidget(price_box)
 
         # Buttons
@@ -384,7 +403,7 @@ class OrderEntryPanel(QWidget):
 
     @Slot(str)
     def _on_order_type_changed(self, order_type: str) -> None:
-        is_limit = order_type == "LIMIT"
+        is_limit = order_type in {"LIMIT", "PRICE_DISCOVERY"}
         self._spn_limit.setEnabled(is_limit); self._slider.setEnabled(is_limit and bool(self._staged_legs))
 
     @Slot(str)
@@ -407,10 +426,12 @@ class OrderEntryPanel(QWidget):
 
     async def _async_whatif(self, legs: list[dict]) -> None:
         try:
+            selected_order_type = self._cmb_order_type.currentText()
+            engine_order_type = "LIMIT" if selected_order_type == "PRICE_DISCOVERY" else selected_order_type
             result = await self._engine.whatif_order(
                 legs,
-                order_type=self._cmb_order_type.currentText(),
-                limit_price=self._spn_limit.value() if self._cmb_order_type.currentText()=="LIMIT" else None,
+                order_type=engine_order_type,
+                limit_price=self._spn_limit.value() if selected_order_type in {"LIMIT", "PRICE_DISCOVERY"} else None,
             )
             if result.get("error"):
                 self._lbl_result.setText(f"❌ {result['error']}"); self._lbl_result.setStyleSheet("background:#f8d7da;color:#721c24;padding:6px;")
@@ -463,12 +484,15 @@ class OrderEntryPanel(QWidget):
 
     async def _async_submit(self, legs: list[dict]) -> None:
         """Run WhatIf, show margin result in label, then submit."""
+        selected_order_type = self._cmb_order_type.currentText()
+        engine_order_type = "LIMIT" if selected_order_type == "PRICE_DISCOVERY" else selected_order_type
+
         # Step 1: WhatIf for margin visibility
         try:
             wi = await self._engine.whatif_order(
                 legs,
-                order_type=self._cmb_order_type.currentText(),
-                limit_price=self._spn_limit.value() if self._cmb_order_type.currentText() == "LIMIT" else None,
+                order_type=engine_order_type,
+                limit_price=self._spn_limit.value() if selected_order_type in {"LIMIT", "PRICE_DISCOVERY"} else None,
             )
             if wi.get("error"):
                 self._lbl_result.setText(f"⚠ WhatIf: {wi['error']} — submitting anyway…")
@@ -483,12 +507,17 @@ class OrderEntryPanel(QWidget):
             self._lbl_result.setText(f"⚠ WhatIf unavailable ({exc}) — submitting…")
             self._lbl_result.setStyleSheet("background:#fff3cd;color:#856404;padding:6px;")
 
+        if selected_order_type == "PRICE_DISCOVERY":
+            await self._async_submit_price_discovery(legs)
+            self._btn_submit.setEnabled(True)
+            return
+
         # Step 2: Submit
         try:
             result = await self._engine.place_order(
                 legs,
-                order_type=self._cmb_order_type.currentText(),
-                limit_price=self._spn_limit.value() if self._cmb_order_type.currentText()=="LIMIT" else None,
+                order_type=selected_order_type,
+                limit_price=self._spn_limit.value() if selected_order_type in {"LIMIT", "PRICE_DISCOVERY"} else None,
                 source="manual",
                 rationale=self._txt_rationale.toPlainText(),
             )
@@ -504,6 +533,49 @@ class OrderEntryPanel(QWidget):
             self._lbl_result.setText(f"❌ Error: {exc}"); self._lbl_result.setStyleSheet("background:#f8d7da;color:#721c24;padding:6px;")
         finally:
             self._btn_submit.setEnabled(True)
+
+    async def _async_submit_price_discovery(self, legs: list[dict]) -> None:
+        """Submit as stepped LIMIT retries until execution or max attempts."""
+        base_price = float(self._spn_limit.value())
+        tick = max(0.01, float(self._current_tick or 0.05))
+        max_attempts = 8
+
+        first_action = str((legs[0] if legs else {}).get("action") or "BUY").upper()
+        direction = 1.0 if first_action == "BUY" else -1.0
+
+        last_result: dict | None = None
+        for attempt in range(max_attempts):
+            price = round(base_price + direction * tick * attempt, 2)
+            self._lbl_result.setText(
+                f"⏳ Price discovery {attempt + 1}/{max_attempts} — trying limit {price:.2f}"
+            )
+            self._lbl_result.setStyleSheet("background:#d1ecf1;color:#0c5460;padding:6px;")
+
+            result = await self._engine.place_order(
+                legs,
+                order_type="LIMIT",
+                limit_price=price,
+                source="price_discovery",
+                rationale=self._txt_rationale.toPlainText(),
+            )
+            last_result = result
+            status = str(result.get("status") or "").lower()
+            if "filled" in status or "submitted" in status or "pending" in status:
+                oid = str(result.get("order_id", "?"))[:12]
+                self._lbl_result.setText(
+                    f"✅ Price discovery {result.get('status', 'submitted')} — ID: {oid}  Avg: ${result.get('avg_price', 0):.2f}"
+                )
+                self._lbl_result.setStyleSheet("background:#d4edda;color:#155724;padding:6px;")
+                self.order_submitted.emit(result)
+                self._staged_legs.clear(); self._bid_ask.clear(); self._render_table()
+                return
+
+        if last_result and last_result.get("error"):
+            self._lbl_result.setText(f"❌ Price discovery failed: {last_result['error']}")
+            self._lbl_result.setStyleSheet("background:#f8d7da;color:#721c24;padding:6px;")
+        else:
+            self._lbl_result.setText("❌ Price discovery exhausted attempts without execution")
+            self._lbl_result.setStyleSheet("background:#f8d7da;color:#721c24;padding:6px;")
 
     def _build_leg(self) -> dict:
         right = self._cmb_right.currentText().upper()

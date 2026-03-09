@@ -58,3 +58,8 @@
 
 - [x] T032 Run targeted desktop and unit tests for all completed phases
 - [x] T033 Update feature docs and mark completed tasks in this file
+## Post-Spec Follow-Ups
+
+- [x] T034 Update WhatIf tool schema docs so the LLM reliably calls `whatif_order`
+- [x] T035 Expand the AI model picker to show the full fallback/live model list with cost multipliers
+- [x] T036 Query FOP expiries and chain definitions across multiple active futures months

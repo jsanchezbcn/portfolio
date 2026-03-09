@@ -146,6 +146,9 @@ class TestHelpers:
         ts = cli._now_utc()
         assert "UTC" in ts
 
+    def test_commands_include_metrics(self):
+        assert "metrics" in cli._COMMANDS
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 2. _build_greeks_diag
@@ -249,6 +252,36 @@ class TestBuildGreeksDiag:
         assert diag["positions_total"] == 0
         assert diag["options_total"] == 0
         assert diag["greeks_source_breakdown"] == {}
+
+
+class TestCmdMetrics:
+    def test_metrics_json_output(self, capsys):
+        positions = [_make_equity(), _make_option()]
+        adapter = _make_adapter()
+        args = argparse.Namespace(account="U123", ibkr_only=False, as_json=True)
+
+        with patch.object(cli, "_run_pipeline", new=AsyncMock(return_value=(positions, adapter))):
+            cli.cmd_metrics(args)
+
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload["account"] == "U123"
+        assert "total_spx_delta" in payload
+        assert "gamma_by_dte" in payload
+        assert "greeks_source_breakdown" in payload
+
+    def test_metrics_text_output(self, capsys):
+        positions = [_make_equity(), _make_option()]
+        adapter = _make_adapter()
+        args = argparse.Namespace(account="U123", ibkr_only=False, as_json=False)
+
+        with patch.object(cli, "_run_pipeline", new=AsyncMock(return_value=(positions, adapter))):
+            cli.cmd_metrics(args)
+
+        out = capsys.readouterr().out
+        assert "metrics — U123" in out
+        assert "total_spx_delta" in out
+        assert "gamma_by_dte" in out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

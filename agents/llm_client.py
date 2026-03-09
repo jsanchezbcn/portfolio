@@ -118,7 +118,7 @@ async def async_llm_chat(
     *,
     model: str = "gpt-5-mini",
     system: str = "",
-    timeout: float = 45.0,
+    timeout: float = 90.0,
 ) -> str:
     """Send *prompt* to an LLM and return the assistant's text reply.
 
@@ -126,7 +126,7 @@ async def async_llm_chat(
         prompt:  User message text.
         model:   Model identifier (e.g. ``"gpt-4.1"``).
         system:  Optional system / developer message prepended to the session.
-        timeout: Maximum seconds to wait for a response (default 45).
+        timeout: Maximum seconds to wait for a response (default 90).
 
     Returns:
         The assistant's reply text, or ``""`` on failure.
@@ -203,16 +203,16 @@ async def async_llm_chat(
 # ------------------------------------------------------------------ #
 
 _HARDCODED_MODELS: list[dict] = [
-    {"id": "gpt-5-mini",      "name": "GPT-5 mini",      "is_free": True},
-    {"id": "gpt-4.1",          "name": "GPT-4.1",          "is_free": True},
-    {"id": "gpt-4o",           "name": "GPT-4o",            "is_free": True},
-    {"id": "gpt-4o-mini",      "name": "GPT-4o mini",       "is_free": True},
-    {"id": "gpt-5",            "name": "GPT-5",             "is_free": False},
-    {"id": "o3",               "name": "o3",                "is_free": False},
-    {"id": "claude-sonnet-4.5","name": "Claude Sonnet 4.5", "is_free": False},
-    {"id": "o3-mini",          "name": "o3-mini",           "is_free": False},
-    {"id": "o1",               "name": "o1",                "is_free": False},
-    {"id": "gpt-4.5-preview",  "name": "GPT-4.5 Preview",   "is_free": False},
+    {"id": "gpt-5-mini",        "name": "GPT-5 mini",         "is_free": True,  "cost_multiplier": 0.0},
+    {"id": "gpt-4.1",           "name": "GPT-4.1",            "is_free": True,  "cost_multiplier": 0.0},
+    {"id": "gpt-4o",            "name": "GPT-4o",             "is_free": True,  "cost_multiplier": 0.0},
+    {"id": "gpt-4o-mini",       "name": "GPT-4o mini",        "is_free": True,  "cost_multiplier": 0.0},
+    {"id": "gpt-5",             "name": "GPT-5",              "is_free": False, "cost_multiplier": 1.0},
+    {"id": "o3",                "name": "o3",                 "is_free": False, "cost_multiplier": 3.0},
+    {"id": "claude-sonnet-4.5", "name": "Claude Sonnet 4.5",  "is_free": False, "cost_multiplier": 0.33},
+    {"id": "o3-mini",           "name": "o3-mini",            "is_free": False, "cost_multiplier": 0.25},
+    {"id": "o1",                "name": "o1",                 "is_free": False, "cost_multiplier": 3.0},
+    {"id": "gpt-4.5-preview",   "name": "GPT-4.5 Preview",    "is_free": False, "cost_multiplier": 1.0},
 ]
 
 _FREE_MODEL_IDS: frozenset[str] = frozenset(
@@ -223,9 +223,9 @@ _FREE_MODEL_IDS: frozenset[str] = frozenset(
 async def async_list_models() -> list[dict]:
     """Return available LLM models discovered via the Copilot SDK.
 
-    Each entry is ``{"id": str, "name": str, "is_free": bool}``.
+    Each entry is ``{"id": str, "name": str, "is_free": bool, "cost_multiplier": float | None}``.
     Falls back to :data:`_HARDCODED_MODELS` if the SDK call fails.
-    Free models (gpt-4.1, gpt-4o, gpt-4o-mini) are always listed first.
+    Free models are listed first, then lower-cost models.
     """
     try:
         from copilot import CopilotClient  # type: ignore[import]
@@ -249,17 +249,37 @@ async def async_list_models() -> list[dict]:
             multiplier: float = getattr(billing, "multiplier", 1.0) if billing else 1.0
             # Models with multiplier == 0 or whose id is in the known-free set are free
             is_free = (multiplier == 0) or (m.id in _FREE_MODEL_IDS)
-            result.append({"id": m.id, "name": getattr(m, "name", m.id), "is_free": is_free})
+            result.append({
+                "id": m.id,
+                "name": getattr(m, "name", m.id),
+                "is_free": is_free,
+                "cost_multiplier": float(multiplier) if multiplier is not None else None,
+            })
 
         if result:
-            # Sort: free first, then alphabetical by name
-            result.sort(key=lambda x: (not x["is_free"], x["name"].lower()))
+            # Sort: free first, then lower-cost models, then alphabetical by name.
+            def _cost(model: dict) -> float:
+                raw = model.get("cost_multiplier")
+                return float(raw) if isinstance(raw, (int, float)) else 999.0
+
+            result.sort(
+                key=lambda x: (
+                    not x["is_free"],
+                    _cost(x),
+                    x["name"].lower(),
+                )
+            )
             logger.debug("async_list_models: %d models from SDK", len(result))
             return result
 
     except Exception as exc:
         logger.info("async_list_models: SDK call failed (%s); using hardcoded list", exc)
 
+    return list(_HARDCODED_MODELS)
+
+
+def get_hardcoded_models() -> list[dict]:
+    """Return the fallback model catalog used before live discovery completes."""
     return list(_HARDCODED_MODELS)
 
 

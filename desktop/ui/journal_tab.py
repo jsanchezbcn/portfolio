@@ -1,9 +1,9 @@
 """desktop/ui/journal_tab.py — Trade Journal tab.
 
 Two sub-tabs:
-  1. Strategy Journal  — LocalStore-backed entries (same as Streamlit journal page)
-  2. Order Log         — DB-backed order history with status, fills, and rationale
-     Covers both executed (FILLED) and pending/cancelled orders so nothing is lost.
+    1. Journal Notes — PostgreSQL-backed note history for strategy/thesis review
+    2. Order Log     — DB-backed order history with status, fills, and rationale
+         Covers both executed (FILLED) and pending/cancelled orders so nothing is lost.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import asyncio
 import csv
 import io
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -24,33 +24,32 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QComboBox,
+    QTextEdit,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
     QHeaderView,
 )
 
-from database.local_store import LocalStore
-
 if TYPE_CHECKING:
     from desktop.engine.ib_engine import IBEngine
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Strategy Journal sub-tab (unchanged logic)
+# Journal Notes sub-tab
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _StrategyJournalPane(QWidget):
-    """LocalStore-backed strategy journal (unchanged from original JournalTab)."""
+    """Postgres-backed journal notes pane for discretionary strategy context."""
 
     _HEADERS = [
-        "Timestamp", "Underlying", "Strategy", "Status",
-        "Net Cr/Dr", "VIX", "Regime", "Rationale",
+        "Created", "Title", "Tags", "Body",
     ]
 
-    def __init__(self, parent=None):
+    def __init__(self, engine: "IBEngine | None" = None, journal_store=None, parent=None):
         super().__init__(parent)
-        self._store = LocalStore()
+        self._engine = engine
+        self._store = journal_store or (getattr(engine, "_db", None) if engine is not None else None)
         self._rows: list[dict] = []
         self._setup_ui()
 
@@ -59,26 +58,25 @@ class _StrategyJournalPane(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
 
         toolbar = QHBoxLayout()
-        toolbar.addWidget(QLabel("Range:"))
-        self._cmb_range = QComboBox()
-        self._cmb_range.addItems(["Last 7 days", "Last 30 days", "Last 90 days", "All time"])
-        toolbar.addWidget(self._cmb_range)
+        toolbar.addWidget(QLabel("Search:"))
+        self._txt_search = QLineEdit()
+        self._txt_search.setPlaceholderText("Title or body…")
+        self._txt_search.setMaximumWidth(220)
+        toolbar.addWidget(self._txt_search)
 
-        toolbar.addWidget(QLabel("Instrument:"))
-        self._txt_instrument = QLineEdit()
-        self._txt_instrument.setPlaceholderText("SPX, SPY, ES…")
-        self._txt_instrument.setMaximumWidth(160)
-        toolbar.addWidget(self._txt_instrument)
-
-        toolbar.addWidget(QLabel("Regime:"))
-        self._cmb_regime = QComboBox()
-        self._cmb_regime.addItems(["All", "low_volatility", "neutral_volatility",
-                                   "high_volatility", "crisis_mode"])
-        toolbar.addWidget(self._cmb_regime)
+        toolbar.addWidget(QLabel("Tag:"))
+        self._txt_tag = QLineEdit()
+        self._txt_tag.setPlaceholderText("earnings, hedge, thesis…")
+        self._txt_tag.setMaximumWidth(180)
+        toolbar.addWidget(self._txt_tag)
 
         self._btn_refresh = QPushButton("🔄 Refresh")
         self._btn_refresh.clicked.connect(self._on_refresh)
         toolbar.addWidget(self._btn_refresh)
+
+        self._btn_save = QPushButton("💾 Save Note")
+        self._btn_save.clicked.connect(self._on_save)
+        toolbar.addWidget(self._btn_save)
 
         self._btn_export = QPushButton("⬇ Export CSV")
         self._btn_export.clicked.connect(self._on_export)
@@ -90,6 +88,21 @@ class _StrategyJournalPane(QWidget):
         self._lbl_status.setStyleSheet("color: #888;")
         toolbar.addWidget(self._lbl_status)
         layout.addLayout(toolbar)
+
+        editor = QVBoxLayout()
+        self._txt_title = QLineEdit()
+        self._txt_title.setPlaceholderText("Note title")
+        editor.addWidget(self._txt_title)
+
+        self._txt_tags = QLineEdit()
+        self._txt_tags.setPlaceholderText("Comma-separated tags")
+        editor.addWidget(self._txt_tags)
+
+        self._txt_body = QTextEdit()
+        self._txt_body.setPlaceholderText("Write your thesis, post-mortem, or follow-up note…")
+        self._txt_body.setMaximumHeight(120)
+        editor.addWidget(self._txt_body)
+        layout.addLayout(editor)
 
         self._table = QTableWidget(0, len(self._HEADERS))
         self._table.setHorizontalHeaderLabels(self._HEADERS)
@@ -105,38 +118,91 @@ class _StrategyJournalPane(QWidget):
     def _on_refresh(self) -> None:
         asyncio.get_event_loop().create_task(self._async_refresh())
 
+    @Slot()
+    def _on_save(self) -> None:
+        asyncio.get_event_loop().create_task(self._async_save_note())
+
     async def _async_refresh(self) -> None:
         try:
-            self._lbl_status.setText("Loading journal…")
-            selected = self._cmb_range.currentText()
-            start_dt = None
-            if selected != "All time":
-                days = 7 if "7" in selected else 30 if "30" in selected else 90
-                start_dt = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-            instrument = self._txt_instrument.text().strip() or None
-            regime = self._cmb_regime.currentText()
-            regime = None if regime == "All" else regime
-            self._rows = await self._store.query_journal(
-                start_dt=start_dt, end_dt=None,
-                instrument=instrument, regime=regime, limit=500,
+            if self._store is None or not hasattr(self._store, "list_journal_notes"):
+                self._lbl_status.setText("⚠️ Journal database not available")
+                self._rows = []
+                self._render_rows([])
+                self._btn_export.setEnabled(False)
+                return
+            if self._engine is not None and not getattr(self._engine, "_db_ok", True):
+                self._lbl_status.setText("⚠️ Database not available")
+                self._rows = []
+                self._render_rows([])
+                self._btn_export.setEnabled(False)
+                return
+
+            self._lbl_status.setText("Loading notes…")
+            search = self._txt_search.text().strip() or None
+            tag = self._txt_tag.text().strip() or None
+            account_id = getattr(self._engine, "account_id", None) or getattr(self._engine, "_account_id", None)
+            rows = await self._store.list_journal_notes(
+                account_id=account_id,
+                search=search,
+                tag=tag,
+                limit=500,
             )
+            self._rows = [dict(row) if not isinstance(row, dict) else row for row in rows]
             self._render_rows(self._rows)
             self._btn_export.setEnabled(bool(self._rows))
-            self._lbl_status.setText(f"Loaded {len(self._rows)} journal rows")
+            self._lbl_status.setText(f"Loaded {len(self._rows)} notes")
         except Exception as exc:
             self._lbl_status.setText(f"❌ {exc}")
+
+    async def _async_save_note(self) -> None:
+        title = self._txt_title.text().strip()
+        body = self._txt_body.toPlainText().strip()
+        tags = [part.strip() for part in self._txt_tags.text().split(",") if part.strip()]
+        if not title:
+            self._lbl_status.setText("⚠️ Title is required")
+            return
+        if self._store is None or not hasattr(self._store, "create_journal_note"):
+            self._lbl_status.setText("⚠️ Journal database not available")
+            return
+        if self._engine is not None and not getattr(self._engine, "_db_ok", True):
+            self._lbl_status.setText("⚠️ Database not available")
+            return
+        try:
+            account_id = getattr(self._engine, "account_id", None) or getattr(self._engine, "_account_id", None)
+            await self._store.create_journal_note(
+                account_id=account_id,
+                title=title,
+                body=body,
+                tags=tags,
+            )
+            self._txt_title.clear()
+            self._txt_tags.clear()
+            self._txt_body.clear()
+            self._lbl_status.setText("Saved journal note")
+            await self._async_refresh()
+        except Exception as exc:
+            self._lbl_status.setText(f"❌ Save failed: {exc}")
 
     @Slot()
     def _on_export(self) -> None:
         if not self._rows:
             return
         try:
-            csv_data = self._store.export_csv(self._rows)
             export_dir = Path(__file__).resolve().parents[2] / "data" / "exports"
             export_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            fp = export_dir / f"trade_journal_{ts}.csv"
-            fp.write_text(csv_data, encoding="utf-8")
+            fp = export_dir / f"journal_notes_{ts}.csv"
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(self._HEADERS)
+            for row in self._rows:
+                writer.writerow([
+                    str(row.get("created_at") or "")[:19].replace("T", " "),
+                    str(row.get("title") or ""),
+                    ", ".join(row.get("tags") or []),
+                    str(row.get("body") or ""),
+                ])
+            fp.write_text(buf.getvalue(), encoding="utf-8")
             self._lbl_status.setText(f"Exported {fp.name}")
         except Exception as exc:
             self._lbl_status.setText(f"❌ Export failed: {exc}")
@@ -144,23 +210,16 @@ class _StrategyJournalPane(QWidget):
     def _render_rows(self, rows: list[dict]) -> None:
         self._table.setRowCount(len(rows))
         for i, row in enumerate(rows):
-            created_at = (row.get("created_at") or "")[:19].replace("T", " ")
-            net = row.get("net_debit_credit")
-            vix = row.get("vix_at_fill")
+            created_at = str(row.get("created_at") or "")[:19].replace("T", " ")
+            tags = row.get("tags") or []
             display = [
                 created_at,
-                str(row.get("underlying") or ""),
-                str(row.get("strategy_tag") or "—"),
-                str(row.get("status") or ""),
-                f"${float(net):+,.2f}" if net is not None else "—",
-                f"{float(vix):.1f}" if vix is not None else "—",
-                str(row.get("regime") or "—"),
-                str((row.get("user_rationale") or "")[:80]),
+                str(row.get("title") or ""),
+                ", ".join(str(tag) for tag in tags),
+                str((row.get("body") or "")[:160]),
             ]
             for j, value in enumerate(display):
                 item = QTableWidgetItem(value)
-                if j in (4, 5):
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self._table.setItem(i, j, item)
 
 
@@ -333,10 +392,11 @@ class _OrderLogPane(QWidget):
             writer = csv.writer(buf)
             writer.writerow(self._HEADERS)
             for row in range(self._table.rowCount()):
-                writer.writerow(
-                    self._table.item(row, col).text() if self._table.item(row, col) else ""
-                    for col in range(len(self._HEADERS))
-                )
+                row_values = []
+                for col in range(len(self._HEADERS)):
+                    item = self._table.item(row, col)
+                    row_values.append(item.text() if item is not None else "")
+                writer.writerow(row_values)
             fp.write_text(buf.getvalue(), encoding="utf-8")
             self._lbl_status.setText(f"Exported {fp.name}")
         except Exception as exc:
@@ -352,7 +412,7 @@ class _OrderLogPane(QWidget):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class JournalTab(QWidget):
-    """Trade journal tab with two sub-tabs: Strategy Journal and Order Log."""
+    """Trade journal tab with journal notes and order log sub-tabs."""
 
     def __init__(self, engine: "IBEngine | None" = None, parent=None):
         super().__init__(parent)
@@ -361,8 +421,8 @@ class JournalTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self._sub_tabs = QTabWidget()
-        self._strategy_pane = _StrategyJournalPane()
-        self._sub_tabs.addTab(self._strategy_pane, "📝 Strategy Journal")
+        self._strategy_pane = _StrategyJournalPane(engine=engine)
+        self._sub_tabs.addTab(self._strategy_pane, "📝 Journal Notes")
 
         if engine is not None:
             self._order_log_pane = _OrderLogPane(engine)

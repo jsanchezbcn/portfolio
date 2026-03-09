@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime
+from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -20,6 +21,11 @@ from models.order import (
 )
 
 
+class _FakeAuditDB:
+    def __init__(self) -> None:
+        self.upsert_market_intel = AsyncMock(return_value="intel-1")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -29,7 +35,7 @@ def _run(coro):
 
 
 def _make_breach(**kwargs) -> RiskBreach:
-    defaults = dict(
+    defaults: dict[str, object] = dict(
         breach_type="delta_cap",
         threshold_value=30.0,
         actual_value=45.2,
@@ -37,13 +43,24 @@ def _make_breach(**kwargs) -> RiskBreach:
         vix=22.5,
     )
     defaults.update(kwargs)
-    return RiskBreach(**defaults)
+    return RiskBreach(
+        breach_type=str(defaults["breach_type"]),
+        threshold_value=float(cast(float, defaults["threshold_value"])),
+        actual_value=float(cast(float, defaults["actual_value"])),
+        regime=str(defaults["regime"]),
+        vix=float(cast(float, defaults["vix"])),
+    )
 
 
 def _make_greeks(**kwargs) -> PortfolioGreeks:
-    defaults = dict(spx_delta=45.2, gamma=-0.002, theta=380.0, vega=-7500.0)
+    defaults: dict[str, float] = dict(spx_delta=45.2, gamma=-0.002, theta=380.0, vega=-7500.0)
     defaults.update(kwargs)
-    return PortfolioGreeks(**defaults)
+    return PortfolioGreeks(
+        spx_delta=float(defaults["spx_delta"]),
+        gamma=float(defaults["gamma"]),
+        theta=float(defaults["theta"]),
+        vega=float(defaults["vega"]),
+    )
 
 
 def _valid_llm_json() -> str:
@@ -87,18 +104,15 @@ class TestSuggestTrades:
 
     def _make_auditor(self):
         from agents.llm_risk_auditor import LLMRiskAuditor
-        from database.local_store import LocalStore
-        store = LocalStore(db_path=":memory:")
-        return LLMRiskAuditor(db=store)
+        return LLMRiskAuditor(db=_FakeAuditDB())
 
     def test_prefers_fast_model_default(self, monkeypatch):
         from agents.llm_risk_auditor import LLMRiskAuditor
-        from database.local_store import LocalStore
 
         monkeypatch.setenv("LLM_FAST_MODEL", "gpt-5-mini")
         monkeypatch.setenv("LLM_MODEL", "gpt-5")
 
-        auditor = LLMRiskAuditor(db=LocalStore(db_path=":memory:"))
+        auditor = LLMRiskAuditor(db=_FakeAuditDB())
 
         assert auditor._model == "gpt-5-mini"
 
@@ -134,7 +148,7 @@ class TestSuggestTrades:
                 theta_budget=400.0,
             ))
 
-        s = result[0]
+        s = next(s for s in result if s.projected_delta_change == pytest.approx(-15.0))
         assert isinstance(s.legs, list)
         assert len(s.legs) >= 1
         assert isinstance(s.legs[0], OrderLeg)
@@ -337,3 +351,113 @@ class TestSuggestTrades:
         )
         assert "20260321" in prompt
         assert "MES" in prompt
+
+    def test_prompt_includes_execution_heuristics(self):
+        """Suggestion prompt includes explicit product and direction heuristics."""
+        from agents.llm_risk_auditor import LLMRiskAuditor
+
+        prompt = LLMRiskAuditor._build_suggest_prompt(
+            portfolio_greeks=_make_greeks(spx_delta=120.0, theta=-50.0),
+            vix=28.0,
+            regime="high_volatility",
+            breach=_make_breach(breach_type="delta_cap", threshold_value=75.0, actual_value=120.0),
+            theta_budget=100.0,
+            active_expiry="20260321",
+            underlying="MES",
+        )
+
+        assert "Execution Heuristics" in prompt
+        assert "negative projected_delta_change" in prompt
+        assert "theta spend" in prompt.lower()
+
+    def test_rank_and_filter_suggestions_prefers_directionally_correct_trade(self):
+        """Ranking keeps the suggestion that actually improves the breached delta direction."""
+        from agents.llm_risk_auditor import LLMRiskAuditor
+
+        wrong = AITradeSuggestion(
+            legs=[OrderLeg(symbol="MES", action=OrderAction.BUY, quantity=1)],
+            projected_delta_change=12.0,
+            projected_theta_cost=20.0,
+            rationale="Wrong-way hedge",
+        )
+        right = AITradeSuggestion(
+            legs=[OrderLeg(symbol="MES", action=OrderAction.SELL, quantity=1)],
+            projected_delta_change=-15.0,
+            projected_theta_cost=5.0,
+            rationale="Better execution and spread quality",
+        )
+
+        ranked = LLMRiskAuditor._rank_and_filter_suggestions(
+            [wrong, right],
+            breach=_make_breach(breach_type="delta_cap", threshold_value=30.0, actual_value=45.0),
+            theta_budget=50.0,
+            active_expiry="",
+            underlying="MES",
+        )
+
+        assert ranked[0].projected_delta_change == pytest.approx(-15.0)
+
+    def test_rank_and_filter_suggestions_drops_wrong_symbol_and_overspend(self):
+        """Ranking drops non-ES/MES suggestions and trades that blow through theta budget."""
+        from agents.llm_risk_auditor import LLMRiskAuditor
+        kept = AITradeSuggestion(
+            legs=[OrderLeg(symbol="MES", action=OrderAction.SELL, quantity=1)],
+            projected_delta_change=-10.0,
+            projected_theta_cost=10.0,
+            rationale="Keep me",
+        )
+        bad_symbol = AITradeSuggestion(
+            legs=[OrderLeg(symbol="SPY", action=OrderAction.SELL, quantity=1)],
+            projected_delta_change=-10.0,
+            projected_theta_cost=10.0,
+            rationale="Wrong symbol",
+        )
+        overspend = AITradeSuggestion(
+            legs=[OrderLeg(symbol="MES", action=OrderAction.SELL, quantity=1)],
+            projected_delta_change=-10.0,
+            projected_theta_cost=200.0,
+            rationale="Too expensive",
+        )
+
+        ranked = LLMRiskAuditor._rank_and_filter_suggestions(
+            [kept, bad_symbol, overspend],
+            breach=_make_breach(),
+            theta_budget=50.0,
+            active_expiry="",
+            underlying="MES",
+        )
+
+        assert ranked == [kept]
+
+    def test_fetch_market_data_context_formats_chain_rows(self):
+        """Live market-data context handles engine dataclasses instead of dict-only payloads."""
+        from agents.llm_risk_auditor import LLMRiskAuditor
+        from desktop.engine.ib_engine import MarketSnapshot, ChainRow
+
+        auditor = self._make_auditor()
+        engine = AsyncMock()
+        engine.get_market_snapshot = AsyncMock(return_value=MarketSnapshot(
+            symbol="MES",
+            last=5862.0,
+            bid=5861.5,
+            ask=5862.5,
+            high=5870.0,
+            low=5850.0,
+            close=5855.0,
+            volume=10,
+            timestamp="2026-03-06T10:30:00Z",
+        ))
+        engine.get_chain = AsyncMock(return_value=[
+            ChainRow("MES", "20260321", 5850.0, "C", 1, 15.0, 15.5, 15.25, 0, 0, 0.2, 0.4, 0.01, -2.0, 5.0),
+            ChainRow("MES", "20260321", 5850.0, "P", 2, 13.0, 13.5, 13.25, 0, 0, 0.2, -0.4, 0.01, -2.0, 5.0),
+        ])
+
+        result = _run(auditor._fetch_market_data_context(
+            ib_engine=engine,
+            underlying="MES",
+            active_expiry="20260321",
+        ))
+
+        assert "Live Market Data" in result
+        assert "5850" in result
+        assert "15.00" in result

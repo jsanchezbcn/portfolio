@@ -1,9 +1,14 @@
 """desktop/tests/test_ai_risk_tab.py — Basic tests for AI Risk tab."""
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
+
+import pytest
+
+from PySide6.QtCore import Qt
 
 from models.order import AITradeSuggestion, OrderAction, OrderLeg
 
@@ -44,6 +49,46 @@ class TestAIRiskTab:
         tab = AIRiskTab(mock_engine)
         qtbot.addWidget(tab)
         assert "WhatIf" in tab._btn_whatif.text()
+
+    def test_has_clear_suggestions_button(self, qtbot, mock_engine):
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+        assert "Clear Suggestions" in tab._btn_clear_suggestions.text()
+
+    def test_has_canned_prompts(self, qtbot, mock_engine):
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        assert tab._cmb_preset_group.count() >= 4
+        assert tab._cmb_presets.count() > 1
+
+    def test_changing_prompt_group_updates_prompt_list(self, qtbot, mock_engine):
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        tab._cmb_preset_group.setCurrentText("Execution")
+
+        assert tab._cmb_presets.count() > 1
+        assert "slippage" in tab._cmb_presets.itemText(3).lower()
+
+    def test_use_preset_populates_question_box(self, qtbot, mock_engine):
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        tab._cmb_presets.setCurrentIndex(1)
+        tab._on_use_preset()
+
+        assert tab._txt_user.toPlainText().strip() == tab._cmb_presets.currentData()
+
+    def test_use_preset_button_click_populates_question_box(self, qtbot, mock_engine):
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        tab._cmb_preset_group.setCurrentText("Hedge Ideas")
+        tab._cmb_presets.setCurrentIndex(1)
+        qtbot.mouseClick(tab._btn_use_preset, Qt.MouseButton.LeftButton)
+
+        assert tab._txt_user.toPlainText().strip() == tab._cmb_presets.currentData()
 
     def test_build_tools_context_includes_structured_portfolio_state(self, qtbot, mock_engine, monkeypatch):
         monkeypatch.setenv("GITHUB_COPILOT_ACTIVE_PROFILE", "work")
@@ -113,6 +158,53 @@ class TestAIRiskTab:
         assert "Portfolio state (prioritize this summary first)" in prompt
         assert "What should I trade?" in prompt
         assert "tool:get_portfolio_state" in tools_context
+
+    @pytest.mark.asyncio
+    async def test_wait_for_session_response_resets_inactivity_timeout(self, qtbot, mock_engine):
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        class SlowSession:
+            async def send_and_wait(self, payload):
+                await asyncio.sleep(0.16)
+                return {"ok": True, "payload": payload}
+
+        activity_event = asyncio.Event()
+
+        async def pulse_activity():
+            await asyncio.sleep(0.05)
+            activity_event.set()
+            await asyncio.sleep(0.05)
+            activity_event.set()
+
+        asyncio.create_task(pulse_activity())
+        result = await tab._wait_for_session_response(
+            SlowSession(),
+            {"prompt": "hello"},
+            inactivity_timeout=0.08,
+            activity_event=activity_event,
+        )
+
+        assert result["ok"] is True
+        assert result["payload"]["prompt"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_wait_for_session_response_times_out_without_activity(self, qtbot, mock_engine):
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        class VerySlowSession:
+            async def send_and_wait(self, payload):
+                await asyncio.sleep(0.2)
+                return payload
+
+        with pytest.raises(asyncio.TimeoutError):
+            await tab._wait_for_session_response(
+                VerySlowSession(),
+                {"prompt": "hello"},
+                inactivity_timeout=0.05,
+                activity_event=asyncio.Event(),
+            )
 
 
 class TestGetCopilotAccount:

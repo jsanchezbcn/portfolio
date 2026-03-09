@@ -7,6 +7,9 @@ Verifies:
 """
 from __future__ import annotations
 
+import csv
+import json
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QTableView
 
@@ -43,6 +46,13 @@ class TestPortfolioTabLayout:
         qtbot.addWidget(tab)
         assert tab._btn_refresh is not None
         assert "Refresh" in tab._btn_refresh.text()
+
+    def test_has_export_buttons(self, qtbot, mock_engine):
+        tab = PortfolioTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        assert "Export CSV" in tab._btn_export_csv.text()
+        assert "Export JSON" in tab._btn_export_json.text()
 
     def test_table_starts_empty(self, qtbot, mock_engine):
         tab = PortfolioTab(mock_engine)
@@ -211,3 +221,61 @@ class TestPortfolioTabPositionActions:
             tab._emit_position_action(payload, "sell")
 
         assert blocker.args[0]["action"] == "SELL"
+
+
+class TestPortfolioTabExport:
+    def test_serialize_positions_for_export_includes_greeks_and_bid_ask(self, qtbot, mock_engine, sample_positions):
+        tab = PortfolioTab(mock_engine)
+        qtbot.addWidget(tab)
+        tab._raw_positions = sample_positions
+
+        mock_engine.chain_snapshot = lambda: [
+            type("Row", (), {"underlying": "ES", "expiry": "20260320", "strike": 5500.0, "right": "C", "bid": 10.0, "ask": 11.0})(),
+            type("Row", (), {"underlying": "MES", "expiry": "20260320", "strike": 5600.0, "right": "P", "bid": 5.0, "ask": 6.0})(),
+        ]
+        mock_engine.last_market_snapshot = lambda sym: {"bid": 554.5, "ask": 555.5} if sym == "SPY" else None
+
+        rows = tab._serialize_positions_for_export(sample_positions)
+
+        assert len(rows) == 3
+        es = next(row for row in rows if row["symbol"] == "ES")
+        spy = next(row for row in rows if row["symbol"] == "SPY")
+
+        assert es["delta"] == sample_positions[0].delta
+        assert es["gamma"] == sample_positions[0].gamma
+        assert es["bid"] == 10.0
+        assert es["ask"] == 11.0
+        assert es["bid_ask_source"] == "chain_snapshot"
+
+        assert spy["bid"] == 554.5
+        assert spy["ask"] == 555.5
+        assert spy["bid_ask_source"] == "market_snapshot"
+
+    def test_write_json_export_file(self, qtbot, mock_engine, tmp_path):
+        tab = PortfolioTab(mock_engine)
+        qtbot.addWidget(tab)
+        path = tmp_path / "portfolio.json"
+
+        tab._write_json(
+            str(path),
+            {"positions": [{"symbol": "SPY", "delta": 10.0, "bid": 554.5, "ask": 555.5}]},
+        )
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["positions"][0]["symbol"] == "SPY"
+        assert payload["positions"][0]["bid"] == 554.5
+
+    def test_write_csv_export_file(self, qtbot, mock_engine, tmp_path):
+        tab = PortfolioTab(mock_engine)
+        qtbot.addWidget(tab)
+        path = tmp_path / "portfolio.csv"
+
+        tab._write_csv(
+            str(path),
+            [{"symbol": "ES", "delta": -17.5, "bid": 10.0, "ask": 11.0}],
+        )
+
+        with path.open("r", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        assert rows[0]["symbol"] == "ES"
+        assert rows[0]["bid"] == "10.0"

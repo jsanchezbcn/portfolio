@@ -26,7 +26,7 @@ _RED_BAND_HI = 0.50
 # Public entry point (T065)
 # ---------------------------------------------------------------------------
 
-def render_historical_charts(local_store: Any) -> None:
+def render_historical_charts(store: Any) -> None:
     """Render all portfolio time-series charts in the dashboard."""
     st.subheader("📈 Historical Portfolio Charts")
 
@@ -40,7 +40,7 @@ def render_historical_charts(local_store: Any) -> None:
             key="hist_time_range",
         )
 
-    snapshots = _load_snapshots(local_store, time_range)
+    snapshots = _load_snapshots(store, time_range)
 
     if not snapshots:
         st.info("ℹ️ No snapshot data available yet. Snapshots are captured every 15 minutes while the dashboard is running.")
@@ -249,8 +249,8 @@ def _render_sebastian_ratio_chart(snapshots, go) -> None:
 # Data loader
 # ---------------------------------------------------------------------------
 
-def _load_snapshots(local_store: Any, time_range: str) -> list[dict]:
-    """Fetch snapshots from LocalStore filtered by time range."""
+def _load_snapshots(store: Any, time_range: str) -> list[dict]:
+    """Fetch snapshots from the shared Postgres business store filtered by time range."""
     import asyncio
 
     try:
@@ -263,7 +263,7 @@ def _load_snapshots(local_store: Any, time_range: str) -> list[dict]:
         loop = asyncio.new_event_loop()
         try:
             rows = loop.run_until_complete(
-                local_store.query_snapshots(start_dt=start_dt)
+                store.query_snapshots(start_dt=start_dt)
             )
         finally:
             loop.close()

@@ -17,9 +17,9 @@ st.title("📓 Trade Journal")
 
 try:
     from dashboard.components.trade_journal_view import render_trade_journal
-    from database.local_store import LocalStore
+    from database.business_store import PostgresBusinessStore
 
-    store = LocalStore()
+    store = PostgresBusinessStore()
     render_trade_journal(store)
 except Exception as exc:
     st.error(f"Trade journal unavailable: {exc}")

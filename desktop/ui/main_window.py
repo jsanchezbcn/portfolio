@@ -195,8 +195,6 @@ class MainWindow(QMainWindow):
         # Chain click → Order Entry prefill
         self._chain_tab.chain_row_selected.connect(self._order_entry.prefill_from_chain)
         self._chain_tab.leg_clicked.connect(self._on_chain_leg_clicked)
-        # Chain leg-cart → Order Entry multi-leg prefill
-        self._chain_tab.leg_cart_ready.connect(self._on_leg_cart_ready)
         self._portfolio_tab.position_action_requested.connect(self._on_portfolio_action_requested)
         self._ai_tab.suggestion_authorized.connect(self._on_ai_suggestion_authorized)
 
@@ -237,15 +235,6 @@ class MainWindow(QMainWindow):
             f"✅ Added {action} {chain_row.underlying} "
             f"{chain_row.strike:.0f}{'P' if chain_row.right == 'P' else 'C'} to Order Entry",
             3000,
-        )
-
-    def _on_leg_cart_ready(self, legs: list) -> None:
-        """Chain leg-cart sends combo to Order Entry dock."""
-        if not legs:
-            return
-        self._order_entry.prefill_from_legs(legs, source="Chain Cart")
-        self._statusbar.showMessage(
-            f"Chain Cart: {len(legs)} leg(s) staged in Order Entry — review bid/ask and submit"
         )
 
     @Slot(dict)

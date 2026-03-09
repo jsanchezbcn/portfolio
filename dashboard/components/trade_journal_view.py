@@ -1,23 +1,16 @@
-"""dashboard/components/trade_journal_view.py — T043-T045: Trade Journal UI.
-
-Renders the trade journal tab with:
-- Reverse-chronological fill table
-- Date range / instrument / regime filters
-- Export CSV download button
-"""
+"""dashboard/components/trade_journal_view.py — Postgres-backed journal notes UI."""
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from datetime import date, datetime, timedelta, timezone
-from typing import Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Async helper (Streamlit runs synchronously; LocalStore is async)
+# Async helper (Streamlit runs synchronously; store access is async)
 # ---------------------------------------------------------------------------
 
 def _run_async(coro):
@@ -39,23 +32,37 @@ def _run_async(coro):
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def render_trade_journal(local_store) -> None:
-    """Render the Trade Journal panel.
+def _filter_rows(rows: list[dict[str, Any]], *, start_dt: str | None, end_dt: str | None) -> list[dict[str, Any]]:
+    filtered = rows
+    if start_dt:
+        filtered = [r for r in filtered if str(r.get("created_at") or "") >= start_dt]
+    if end_dt:
+        filtered = [r for r in filtered if str(r.get("created_at") or "") <= end_dt]
+    return filtered
 
-    Parameters
-    ----------
-    local_store:
-        A connected ``LocalStore`` instance.
-    """
+
+def _build_display_rows(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return [
+        {
+            "Created": str(r.get("created_at") or "")[:19].replace("T", " "),
+            "Title": str(r.get("title") or ""),
+            "Tags": ", ".join(str(tag) for tag in (r.get("tags") or [])),
+            "Body": str(r.get("body") or "")[:160],
+        }
+        for r in rows
+    ]
+
+def render_trade_journal(store) -> None:
+    """Render the shared Postgres-backed journal notes panel."""
+    import pandas as pd
     import streamlit as st
 
     st.subheader("📓 Trade Journal")
 
-    if local_store is None:
-        st.warning("Trade journal unavailable — LocalStore not connected.")
+    if store is None:
+        st.warning("Trade journal unavailable — Postgres store not connected.")
         return
 
-    # ── Filters ──────────────────────────────────────────────────────────────
     with st.expander("🔍 Filters", expanded=False):
         col1, col2, col3 = st.columns(3)
 
@@ -68,143 +75,55 @@ def render_trade_journal(local_store) -> None:
                 "Last 90 days": (today - timedelta(days=90), today),
                 "All time": (None, None),
             }
-            selected_range = st.selectbox(
-                "Date range",
-                list(date_options.keys()),
-                index=1,  # Default: Last 7 days
-                key="tj_date_range",
-            )
+            selected_range = st.selectbox("Date range", list(date_options.keys()), index=1, key="tj_date_range")
             start_date, end_date = date_options[selected_range]
 
         with col2:
-            instrument_filter = st.text_input(
-                "Symbol / Underlying",
-                value="",
-                placeholder="e.g. SPX, AAPL, /ES",
-                key="tj_instrument",
-            )
+            search = st.text_input("Search", value="", placeholder="Title or body", key="tj_instrument")
 
         with col3:
-            regime_filter = st.selectbox(
-                "Regime",
-                ["All", "low_volatility", "neutral_volatility", "high_volatility", "crisis_mode"],
-                index=0,
-                key="tj_regime",
-            )
+            tag = st.text_input("Tag", value="", placeholder="hedge, review", key="tj_regime")
 
-    # ── Build query params ────────────────────────────────────────────────────
     start_dt = (
-        datetime(start_date.year, start_date.month, start_date.day,
-                 tzinfo=timezone.utc).isoformat()
+        datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc).isoformat()
         if start_date else None
     )
     end_dt = (
-        datetime(end_date.year, end_date.month, end_date.day,
-                 23, 59, 59, tzinfo=timezone.utc).isoformat()
+        datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59, tzinfo=timezone.utc).isoformat()
         if end_date else None
     )
-    instrument = instrument_filter.strip() or None
-    regime = regime_filter if regime_filter != "All" else None
 
-    # ── Fetch rows ────────────────────────────────────────────────────────────
     with st.spinner("Loading journal…"):
-        rows = _run_async(
-            local_store.query_journal(
-                start_dt=start_dt,
-                end_dt=end_dt,
-                instrument=instrument,
-                regime=regime,
-                limit=500,
-            )
-        ) or []
+        rows = _run_async(store.list_journal_notes(search=search.strip() or None, tag=tag.strip() or None, limit=500)) or []
 
+    rows = _filter_rows(rows, start_dt=start_dt, end_dt=end_dt)
     if not rows:
-        st.info("No fills match the current filters.")
+        st.info("No journal notes match the current filters.")
         return
 
-    # ── Render summary metrics ─────────────────────────────────────────────────
-    total_fills = len(rows)
-    total_pnl = sum(
-        r.get("net_debit_credit") or 0.0 for r in rows
-        if r.get("net_debit_credit") is not None
-    )
+    tagged_count = sum(1 for r in rows if r.get("tags"))
+    avg_body_len = sum(len(str(r.get("body") or "")) for r in rows) / max(len(rows), 1)
     m1, m2, m3 = st.columns(3)
-    m1.metric("Total Fills", total_fills)
-    m2.metric("Net Credit/Debit", f"${total_pnl:+,.2f}")
-    m3.metric(
-        "Avg VIX at Fill",
-        f"{sum(r.get('vix_at_fill') or 0 for r in rows if r.get('vix_at_fill')) / max(sum(1 for r in rows if r.get('vix_at_fill')), 1):.1f}",
-    )
+    m1.metric("Total Notes", len(rows))
+    m2.metric("Tagged Notes", tagged_count)
+    m3.metric("Avg Note Length", f"{avg_body_len:.0f} chars")
 
-    # ── Table columns (T043) ──────────────────────────────────────────────────
-    import pandas as pd
+    display_rows = _build_display_rows(rows)
+    st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
 
-    display_rows = []
-    for r in rows:
-        # Parse legs_json for a human-readable summary
-        try:
-            legs = json.loads(r.get("legs_json") or "[]")
-            legs_summary = " / ".join(
-                f"{lg.get('action','?')} {lg.get('quantity','?')}× {lg.get('symbol','?')}"
-                for lg in (legs if isinstance(legs, list) else [])
-            ) or "—"
-        except Exception:
-            legs_summary = "—"
-
-        display_rows.append({
-            "Timestamp": r.get("created_at", "")[:19].replace("T", " "),
-            "Underlying": r.get("underlying", ""),
-            "Strategy": r.get("strategy_tag") or "—",
-            "Status": r.get("status", ""),
-            "Net Cr/Dr": (
-                f"${r['net_debit_credit']:+,.2f}"
-                if r.get("net_debit_credit") is not None else "—"
-            ),
-            "VIX": (
-                f"{r['vix_at_fill']:.1f}"
-                if r.get("vix_at_fill") is not None else "—"
-            ),
-            "Regime": r.get("regime") or "—",
-            "Rationale": (r.get("user_rationale") or "")[:60],
-            "Legs": legs_summary,
-        })
-
-    df = pd.DataFrame(display_rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    # ── Row detail expander ───────────────────────────────────────────────────
     with st.expander("🔍 Row detail (select row index)", expanded=False):
-        row_idx = st.number_input(
-            "Row #", min_value=0, max_value=max(len(rows) - 1, 0), value=0, step=1,
-            key="tj_row_detail_idx",
-        )
+        row_idx = st.number_input("Row #", min_value=0, max_value=max(len(rows) - 1, 0), value=0, step=1, key="tj_row_detail_idx")
         raw = rows[row_idx]
-        col_l, col_r = st.columns(2)
-        with col_l:
-            st.markdown("**Pre-trade Greeks:**")
-            try:
-                st.json(json.loads(raw.get("pre_greeks_json") or "{}"))
-            except Exception:
-                st.text(raw.get("pre_greeks_json"))
-        with col_r:
-            st.markdown("**Post-trade Greeks:**")
-            try:
-                st.json(json.loads(raw.get("post_greeks_json") or "{}"))
-            except Exception:
-                st.text(raw.get("post_greeks_json"))
-        st.markdown(f"**Broker Order ID:** `{raw.get('broker_order_id') or '—'}`")
-        if raw.get("ai_suggestion_id"):
-            st.markdown(f"**AI Suggestion ID:** `{raw['ai_suggestion_id']}`")
-        if raw.get("ai_rationale"):
-            st.markdown(f"**AI Rationale:** {raw['ai_rationale']}")
+        st.markdown(f"**Title:** {raw.get('title') or '—'}")
+        st.markdown(f"**Tags:** {', '.join(raw.get('tags') or []) or '—'}")
+        st.markdown("**Body:**")
+        st.write(raw.get("body") or "")
 
-    # ── Export CSV (T045) ─────────────────────────────────────────────────────
-    csv_data = local_store.export_csv(rows)
-    if csv_data:
-        st.download_button(
-            label="⬇ Export CSV",
-            data=csv_data,
-            file_name=f"trade_journal_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv",
-            help="Download all filtered fills as a CSV file",
-        )
+    csv_data = pd.DataFrame(display_rows).to_csv(index=False)
+    st.download_button(
+        label="⬇ Export CSV",
+        data=csv_data,
+        file_name=f"journal_notes_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        help="Download all filtered journal notes as a CSV file",
+    )

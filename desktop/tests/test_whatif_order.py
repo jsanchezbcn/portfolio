@@ -413,5 +413,55 @@ class TestWhatIfNullHandling:
         assert result["equity_with_loan_change"] == 0.0
 
 
+class TestOrderQuantityNormalization:
+    """Ensure qty drives contract count, not per-contract limit price scaling."""
+
+    def test_normalize_order_size_same_qty(self, ib_engine):
+        total_qty, ratios = ib_engine._normalize_order_size([
+            {"qty": 5},
+            {"qty": 5},
+        ])
+        assert total_qty == 5
+        assert ratios == [1, 1]
+
+    @pytest.mark.asyncio
+    async def test_whatif_combo_uses_total_quantity_and_unit_ratios(self, ib_engine):
+        call_450 = SimpleNamespace(
+            conId=111111111,
+            symbol="SPY",
+            secType="OPT",
+            exchange="CBOE",
+            currency="USD",
+            strike=450.0,
+            right="C",
+            lastTradeDateOrContractMonth="20260418",
+        )
+        call_460 = SimpleNamespace(
+            conId=222222222,
+            symbol="SPY",
+            secType="OPT",
+            exchange="CBOE",
+            currency="USD",
+            strike=460.0,
+            right="C",
+            lastTradeDateOrContractMonth="20260418",
+        )
+        ib_engine._ib.qualifyContractsAsync = AsyncMock(return_value=[call_450, call_460])
+        ib_engine._ib.whatIfOrderAsync = AsyncMock(return_value=MockOrderState())
+
+        legs = [
+            {"symbol": "SPY", "action": "BUY", "qty": 5, "strike": 450.0, "right": "C", "expiry": "20260418"},
+            {"symbol": "SPY", "action": "SELL", "qty": 5, "strike": 460.0, "right": "C", "expiry": "20260418"},
+        ]
+        result = await ib_engine.whatif_order(legs)
+
+        assert result["status"] == "success"
+        contract_arg, order_arg = ib_engine._ib.whatIfOrderAsync.call_args[0]
+        assert order_arg.totalQuantity == 5
+        assert len(contract_arg.comboLegs) == 2
+        assert contract_arg.comboLegs[0].ratio == 1
+        assert contract_arg.comboLegs[1].ratio == 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

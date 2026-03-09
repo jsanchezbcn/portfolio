@@ -148,9 +148,9 @@ def _trigger_suggestion_refresh(
     def _run_suggest() -> None:
         try:
             from agents.llm_risk_auditor import LLMRiskAuditor
-            from database.local_store import LocalStore
+            from database.business_store import PostgresBusinessStore
 
-            store = LocalStore()
+            store = PostgresBusinessStore()
             auditor = LLMRiskAuditor(db=store)
             result = asyncio.run(
                 auditor.suggest_trades(
@@ -213,7 +213,7 @@ def _legs_to_summary(legs: list[Any]) -> str:
         action = getattr(leg, "action", None)
         symbol = getattr(leg, "symbol", "?")
         qty = getattr(leg, "quantity", 1)
-        action_str = action.value if hasattr(action, "value") else str(action)
+        action_str = getattr(action, "value", str(action))
         parts.append(f"{action_str} {qty}x {symbol}")
     suffix = f" +{len(legs) - 2} more" if len(legs) > 2 else ""
     return ", ".join(parts) + suffix

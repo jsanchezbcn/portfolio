@@ -116,7 +116,8 @@ no extra text.
 Available execution/planning tools in the host app (do not invent new tools):
     - get_bid_ask_for_legs(legs): returns live bid/ask/mid for specific legs (can be slow: ~2-10s)
     - get_chain(symbol, expiry, strikes_each_side): returns options chain around ATM (can be slow: ~5-15s)
-    - whatif_order(legs): margin/risk simulation for a candidate trade (can be very slow: up to ~90s)
+        - whatif_order(legs): IBKR margin simulation for a candidate trade (can be very slow: up to ~90s)
+            Required leg schema: {symbol, action, qty, sec_type, exchange, expiry, strike, right}
 
 Latency guidance:
     - Prefer chain + bid/ask data first for liquidity screening.
@@ -137,9 +138,11 @@ class LLMRiskAuditor:
         self,
         *,
         db: Any,
+        regime_detector: Any | None = None,
         interval_seconds: int = 300,
     ) -> None:
         self.db = db
+        self.regime_detector = regime_detector
         self.interval_seconds = interval_seconds
         self._scheduler: AsyncIOScheduler | None = None
         self._model = _default_risk_model()
@@ -424,7 +427,13 @@ with the keys described in the system prompt.
                 system=_SUGGEST_SYSTEM_PROMPT,
                 timeout=45.0,
             )
-            parsed = self._parse_suggestions(raw)
+            parsed = self._rank_and_filter_suggestions(
+                self._parse_suggestions(raw),
+                breach=breach,
+                theta_budget=theta_budget,
+                active_expiry=active_expiry,
+                underlying=underlying,
+            )
             if parsed:
                 return parsed
             logger.warning("suggest_trades: empty/invalid LLM output, using deterministic fallback suggestions")
@@ -466,7 +475,11 @@ with the keys described in the system prompt.
         try:
             # 1. Get underlying price
             snap = await ib_engine.get_market_snapshot(underlying)
-            underlying_price = snap.get("last") or snap.get("close") or 0.0
+            underlying_price = float(
+                getattr(snap, "last", None)
+                or getattr(snap, "close", None)
+                or 0.0
+            )
             if not underlying_price:
                 return ""
             
@@ -474,20 +487,32 @@ with the keys described in the system prompt.
             atm_strike = round(underlying_price / 25) * 25
             
             # 3. Fetch options chain (±3 strikes around ATM)
-            # Convert active_expiry YYYYMMDD -> YYYY-MM-DD
             if len(active_expiry) == 8:
-                expiry_iso = f"{active_expiry[:4]}-{active_expiry[4:6]}-{active_expiry[6:8]}"
+                expiry_date = _date(int(active_expiry[:4]), int(active_expiry[4:6]), int(active_expiry[6:8]))
             else:
                 return ""
             
             chain = await ib_engine.get_chain(
                 underlying=underlying,
-                expiry=expiry_iso,
-                strikes_each_side=3,
+                expiry=expiry_date,
+                max_strikes=14,
             )
-            if not chain or not chain.get("rows"):
+            if not chain:
                 return ""
             
+            grouped: dict[float, dict[str, Any]] = {}
+            for row in chain:
+                strike = float(getattr(row, "strike", 0.0) or 0.0)
+                if strike <= 0:
+                    continue
+                entry = grouped.setdefault(strike, {"C": None, "P": None})
+                right = str(getattr(row, "right", "") or "").upper()
+                if right in ("C", "P"):
+                    entry[right] = row
+
+            closest_strikes = sorted(grouped.keys(), key=lambda strike: abs(strike - atm_strike))[:7]
+            closest_strikes.sort()
+
             # 4. Build bid/ask table
             lines = [
                 f"\\n## Live Market Data (Expiry {active_expiry})",
@@ -498,14 +523,15 @@ with the keys described in the system prompt.
                 "-------|----------|----------|----------|---------|---------|--------",
             ]
             
-            for row in chain.get("rows", [])[:7]:  # Limit to 7 strikes
-                strike = row.get("strike", 0)
-                call_bid = row.get("call_bid") or 0.0
-                call_ask = row.get("call_ask") or 0.0
-                call_mid = row.get("call_mid") or 0.0
-                put_bid = row.get("put_bid") or 0.0
-                put_ask = row.get("put_ask") or 0.0
-                put_mid = row.get("put_mid") or 0.0
+            for strike in closest_strikes:
+                call = grouped[strike].get("C")
+                put = grouped[strike].get("P")
+                call_bid = float(getattr(call, "bid", 0.0) or 0.0)
+                call_ask = float(getattr(call, "ask", 0.0) or 0.0)
+                call_mid = float(getattr(call, "last", 0.0) or 0.0) or ((call_bid + call_ask) / 2.0 if call_bid and call_ask else 0.0)
+                put_bid = float(getattr(put, "bid", 0.0) or 0.0)
+                put_ask = float(getattr(put, "ask", 0.0) or 0.0)
+                put_mid = float(getattr(put, "last", 0.0) or 0.0) or ((put_bid + put_ask) / 2.0 if put_bid and put_ask else 0.0)
                 
                 lines.append(
                     f"{strike:>6.0f} | {call_bid:>8.2f} | {call_ask:>8.2f} | "
@@ -534,6 +560,13 @@ with the keys described in the system prompt.
         market_data_context: str = "",
     ) -> str:
         g = portfolio_greeks
+        heuristics = LLMRiskAuditor._build_trade_selection_heuristics(
+            portfolio_greeks=portfolio_greeks,
+            breach=breach,
+            theta_budget=theta_budget,
+            active_expiry=active_expiry,
+            underlying=underlying,
+        )
         breach_section = (
             f"Breach Type:    {breach.breach_type}\n"
             f"Threshold:      {breach.threshold_value}\n"
@@ -567,10 +600,13 @@ with the keys described in the system prompt.
             f"{breach_section}\n"
             f"## Constraints\n"
             f"Theta Budget (max to spend): {theta_budget:.2f}\n\n"
+            f"## Execution Heuristics\n"
+            f"{heuristics}\n\n"
             f"## Available Tools (host app)\n"
             f"- get_bid_ask_for_legs: live bid/ask/mid for candidate legs (slow: ~2-10s)\n"
             f"- get_chain: broader options chain around ATM for expiry (slow: ~5-15s)\n"
-            f"- whatif_order: margin/risk simulation for final candidates (very slow: up to ~90s)\n"
+            f"- whatif_order: IBKR margin/risk simulation for final candidates (very slow: up to ~90s)\n"
+            f"  Required legs format: {{symbol, action, qty, sec_type, exchange, expiry, strike, right}}\n"
             f"Use slow tools only when they materially improve trade quality.\n\n"
             f"Respond ONLY with a JSON array of exactly 3 suggestion objects "
             f"as described in the system prompt. Each leg MUST include symbol, "
@@ -655,6 +691,95 @@ with the keys described in the system prompt.
         except Exception as exc:
             logger.warning("suggest_trades: parse error — %s", exc)
             return []
+
+    @staticmethod
+    def _build_trade_selection_heuristics(
+        *,
+        portfolio_greeks: PortfolioGreeks,
+        breach: Optional[RiskBreach],
+        theta_budget: float,
+        active_expiry: str,
+        underlying: str,
+    ) -> str:
+        target = str(getattr(breach, "breach_type", "") or "").lower()
+        delta = float(portfolio_greeks.spx_delta or 0.0)
+        gamma = float(portfolio_greeks.gamma or 0.0)
+        theta = float(portfolio_greeks.theta or 0.0)
+        vega = float(portfolio_greeks.vega or 0.0)
+        product = "ES" if abs(delta) >= 20 else (underlying if underlying in ("ES", "MES") else "MES")
+        guidance = [
+            f"Use {product} as the default product unless a finer adjustment requires MES.",
+            f"Keep expiry on {active_expiry or 'the nearest active expiry'} unless a longer-dated hedge is clearly safer.",
+            f"Do not exceed theta spend of {theta_budget:.2f}; prefer negative theta_cost values when possible.",
+        ]
+
+        if "delta" in target or abs(delta) >= 80:
+            if delta > 0:
+                guidance.append("Portfolio delta is too long; prefer trades with negative projected_delta_change, such as short calls or long puts.")
+            else:
+                guidance.append("Portfolio delta is too short; prefer trades with positive projected_delta_change, such as short puts or long calls.")
+        if "gamma" in target or abs(gamma) >= 0.1:
+            guidance.append("If gamma risk is elevated, avoid adding near-dated short gamma unless the structure is clearly defined-risk and liquid.")
+        if "vega" in target or abs(vega) >= 2500:
+            if vega < 0:
+                guidance.append("Portfolio is short vega; avoid blindly selling more premium. Favor trades that reduce short-vol concentration or add some long optionality.")
+            else:
+                guidance.append("Portfolio is long vega; prefer short-premium or lower-vega structures if spreads are tight.")
+        if theta < 0:
+            guidance.append("Current theta is negative, so avoid paying theta unless it clearly resolves the primary breach.")
+
+        return "\n".join(f"- {line}" for line in guidance)
+
+    @staticmethod
+    def _rank_and_filter_suggestions(
+        suggestions: list[AITradeSuggestion],
+        *,
+        breach: Optional[RiskBreach],
+        theta_budget: float,
+        active_expiry: str,
+        underlying: str,
+    ) -> list[AITradeSuggestion]:
+        if not suggestions:
+            return []
+
+        target = str(getattr(breach, "breach_type", "") or "").lower()
+        preferred_symbols = {underlying.upper(), "ES", "MES"}
+        expiry_compact = active_expiry.replace("-", "") if active_expiry else ""
+        ranked: list[tuple[float, AITradeSuggestion]] = []
+
+        for suggestion in suggestions:
+            if not suggestion.legs:
+                continue
+            if any((leg.symbol or "").upper() not in preferred_symbols for leg in suggestion.legs):
+                continue
+            if theta_budget > 0 and suggestion.projected_theta_cost > (theta_budget * 1.25):
+                continue
+
+            score = 0.0
+            if expiry_compact and all(
+                leg.expiration and leg.expiration.strftime("%Y%m%d") == expiry_compact
+                for leg in suggestion.legs
+            ):
+                score += 3.0
+            if any((leg.symbol or "").upper() == underlying.upper() for leg in suggestion.legs):
+                score += 1.5
+            if suggestion.projected_theta_cost <= theta_budget:
+                score += 1.0
+            if suggestion.projected_theta_cost <= 0:
+                score += 1.0
+            if "delta" in target:
+                if breach and float(getattr(breach, "actual_value", 0.0) or 0.0) > float(getattr(breach, "threshold_value", 0.0) or 0.0):
+                    if suggestion.projected_delta_change < 0:
+                        score += 4.0
+                elif suggestion.projected_delta_change > 0:
+                    score += 4.0
+            rationale = (suggestion.rationale or "").lower()
+            if "spread" in rationale or "liquid" in rationale or "execution" in rationale:
+                score += 0.5
+            ranked.append((score, suggestion))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [suggestion for _score, suggestion in ranked[:3]]
 
     @staticmethod
     def _fallback_suggestions(

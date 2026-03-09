@@ -94,28 +94,50 @@ class TestPositionsTableModel:
     def test_data_delta(self, qapp):
         m = PositionsTableModel()
         m.set_data([_pos_row(delta=-0.35)])
-        idx = m.index(1, 11)  # row 1 = position row
+        idx = m.index(1, 13)  # row 1 = position row, col 13 = Delta
         assert "-0.35" in m.data(idx)
 
     def test_data_iv_percentage(self, qapp):
         m = PositionsTableModel()
         m.set_data([_pos_row(iv=0.18)])
-        idx = m.index(1, 15)  # row 1 = position row
+        idx = m.index(1, 17)  # row 1 = position row, col 17 = IV
         assert "18.0%" in m.data(idx)
 
     def test_data_none_values(self, qapp):
         m = PositionsTableModel()
         m.set_data([_pos_row(iv=None, delta=None, strike=None)])
-        assert m.data(m.index(1, 15)) == ""  # IV — row 1 is position
-        assert m.data(m.index(1, 11)) == ""  # Delta
-        assert m.data(m.index(1, 8)) == ""   # Strike
+        assert m.data(m.index(1, 17)) == ""  # IV — row 1 is position
+        assert m.data(m.index(1, 13)) == ""  # Delta
+        assert m.data(m.index(1, 9)) == ""   # Strike
+
+    def test_expiry_day_shows_weekday(self, qapp):
+        """Column 12 (Expiry Day) should show day of week for option expirations."""
+        from datetime import date
+        m = PositionsTableModel()
+        # March 20, 2026 is a Friday
+        m.set_data([_pos_row(expiry=date(2026, 3, 20))])
+        idx = m.index(1, 12)  # row 1 = position row, col 12 = Expiry Day
+        assert m.data(idx) == "Fri"
+        
+        # Test with different day - March 16, 2026 is a Monday
+        m.set_data([_pos_row(expiry=date(2026, 3, 16))])
+        idx = m.index(1, 12)
+        assert m.data(idx) == "Mon"
+
+    def test_expiry_day_empty_when_no_expiry(self, qapp):
+        """Expiry Day column should be empty for non-option positions."""
+        m = PositionsTableModel()
+        m.set_data([_pos_row(expiry=None, sec_type="STK")])
+        # Stocks have no group header, so stock position is at row 0
+        idx = m.index(0, 12)  # row 0 = stock position, col 12 = Expiry Day
+        assert m.data(idx) == ""
 
     def test_estimated_greeks_rows_use_italic_font(self, qapp):
         from PySide6.QtGui import QFont
 
         m = PositionsTableModel()
         m.set_data([_pos_row(greeks_source="estimated_bsm")])
-        font = m.data(m.index(1, 11), Qt.ItemDataRole.FontRole)
+        font = m.data(m.index(1, 13), Qt.ItemDataRole.FontRole)  # col 13 = Delta
         assert isinstance(font, QFont)
         assert font.italic()
 
@@ -176,11 +198,11 @@ class TestPositionsTableModel:
         ])
         header = m.index(0, 0)  # group row
         assert m.is_group_row(0)
-        # col 11 = delta, col 13 = theta, col 14 = vega, col 16 = spx_delta
-        assert "-7.00" in m.data(m.index(0, 11))   # delta sum = -7
-        assert "-7.00" in m.data(m.index(0, 13))   # theta sum = -7
-        assert "+28.00" in m.data(m.index(0, 14))  # vega sum = 28
-        assert "-350.00" in m.data(m.index(0, 16)) # spx_delta sum = -350
+        # col 13 = delta, col 15 = theta, col 16 = vega, col 18 = spx_delta
+        assert "-7.00" in m.data(m.index(0, 13))   # delta sum = -7
+        assert "-7.00" in m.data(m.index(0, 15))   # theta sum = -7
+        assert "+28.00" in m.data(m.index(0, 16))  # vega sum = 28
+        assert "-350.00" in m.data(m.index(0, 18)) # spx_delta sum = -350
 
     def test_group_header_background_role(self, qapp):
         """Group rows return a QBrush for BackgroundRole."""
@@ -310,3 +332,24 @@ class TestChainTableModel:
         m = ChainTableModel()
         assert m.headerData(0, Qt.Orientation.Horizontal) == "Bid"
         assert m.headerData(8, Qt.Orientation.Horizontal) == "Strike"
+
+    def test_underlying_highlights_nearest_strike_row(self, qapp):
+        m = ChainTableModel()
+        m.set_data([
+            _chain_row(5500.0, "C"),
+            _chain_row(5500.0, "P"),
+            _chain_row(5600.0, "C"),
+            _chain_row(5600.0, "P"),
+        ])
+        m.set_underlying_price(5587.0)
+
+        strike_idx = m.index(1, 8)
+        assert m.data(strike_idx, Qt.ItemDataRole.BackgroundRole) is not None
+        assert m.data(strike_idx, Qt.ItemDataRole.ForegroundRole) is not None
+
+    def test_set_underlying_price_emits_repaint_for_existing_rows(self, qapp, qtbot):
+        m = ChainTableModel()
+        m.set_data([_chain_row(5500.0, "C"), _chain_row(5500.0, "P")])
+
+        with qtbot.waitSignal(m.dataChanged, timeout=1000):
+            m.set_underlying_price(5501.0)

@@ -73,6 +73,16 @@ class TestChainTabLayout:
         qtbot.addWidget(tab)
         assert tab._cmb_expiry is not None
 
+    def test_has_sd_range_combo(self, qtbot, mock_engine):
+        tab = ChainTab(mock_engine)
+        qtbot.addWidget(tab)
+        assert tab._cmb_sd_range.currentText() in {"±1σ", "±2σ", "±3σ"}
+
+    def test_stream_refresh_interval_is_5_seconds(self, qtbot, mock_engine):
+        tab = ChainTab(mock_engine)
+        qtbot.addWidget(tab)
+        assert tab._stream_timer.interval() == 5_000
+
     def test_table_starts_empty(self, qtbot, mock_engine):
         tab = ChainTab(mock_engine)
         qtbot.addWidget(tab)
@@ -220,8 +230,8 @@ class TestChainTabData:
         assert tab._model.rowCount() == 0
 
 
-class TestChainTabLegCart:
-    """Test single-click bid/ask leg-cart and leg_clicked signal."""
+class TestChainTabLegClicks:
+    """Test single-click bid/ask direct leg staging signal."""
 
     def _load(self, tab, mock_engine):
         mock_engine.chain_ready.emit(_sample_chain_rows())
@@ -290,16 +300,14 @@ class TestChainTabLegCart:
             idx = tab._model.index(0, 8)   # Strike column — no action
             tab._on_click(idx)
 
-    def test_click_adds_to_cart(self, qtbot, mock_engine):
+    def test_click_does_not_use_cart_state(self, qtbot, mock_engine):
         tab = ChainTab(mock_engine)
         qtbot.addWidget(tab)
         self._load(tab, mock_engine)
 
-        assert len(tab._cart) == 0
         tab._on_click(tab._model.index(0, 1))  # BUY Call
-        assert len(tab._cart) == 1
         tab._on_click(tab._model.index(0, 16))  # SELL Put
-        assert len(tab._cart) == 2
+        assert not hasattr(tab, "_cart")
 
     def test_status_label_updated_after_click(self, qtbot, mock_engine):
         tab = ChainTab(mock_engine)
@@ -318,7 +326,7 @@ class TestChainTabLegCart:
         self._load(tab, mock_engine)
 
         with qtbot.assertNotEmitted(tab.chain_row_selected):
-            idx = tab._model.index(0, 0)  # Call Bid — should be cart only
+            idx = tab._model.index(0, 0)  # Call Bid — click-to-stage only
             tab._on_double_click(idx)
 
     def test_double_click_on_strike_col_emits_chain_row_selected(self, qtbot, mock_engine):
@@ -330,35 +338,6 @@ class TestChainTabLegCart:
         with qtbot.waitSignal(tab.chain_row_selected, timeout=1000):
             idx = tab._model.index(0, 3)  # Last col — triggers normal order entry
             tab._on_double_click(idx)
-
-    # ── cart send ──────────────────────────────────────────────────────
-
-    def test_cart_send_emits_leg_cart_ready(self, qtbot, mock_engine):
-        tab = ChainTab(mock_engine)
-        qtbot.addWidget(tab)
-        self._load(tab, mock_engine)
-
-        tab._on_click(tab._model.index(0, 1))   # BUY Call 5500
-        tab._on_click(tab._model.index(0, 16))  # SELL Put 5500
-
-        with qtbot.waitSignal(tab.leg_cart_ready, timeout=1000) as blocker:
-            tab._on_cart_send()
-
-        legs = blocker.args[0]
-        assert len(legs) == 2
-        actions = {lg["action"] for lg in legs}
-        assert actions == {"BUY", "SELL"}
-
-    def test_cart_cleared_after_send(self, qtbot, mock_engine):
-        tab = ChainTab(mock_engine)
-        qtbot.addWidget(tab)
-        self._load(tab, mock_engine)
-
-        tab._on_click(tab._model.index(0, 1))
-        tab._on_cart_send()
-
-        assert len(tab._cart) == 0
-
 
 class TestChainTabCallPutLabels:
     """Verify CALL / PUT visual labels are present."""

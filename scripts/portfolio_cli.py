@@ -7,6 +7,7 @@ Sub-commands
   greeks    Full Greeks pipeline with per-position table + diagnostic JSON.
   positions List all positions (raw or normalized).
   summary   Portfolio totals (delta, theta, vega, gamma, SPX delta).
+    metrics   Comprehensive portfolio metrics snapshot.
   spx-price Test every SPX price source in priority order.
   snapshot  Hit IBKR market-data snapshot for arbitrary conids.
   account   IBKR account summary (NLV, buying power, margin).
@@ -21,6 +22,7 @@ Quick examples
   python scripts/portfolio_cli.py greeks --account U2052408 --ibkr-only --json
   python scripts/portfolio_cli.py positions --account U2052408 --asset-class FOP
   python scripts/portfolio_cli.py summary --account U2052408
+    python scripts/portfolio_cli.py metrics --account U2052408 --json
   python scripts/portfolio_cli.py spx-price --verbose
   python scripts/portfolio_cli.py snapshot --conids 649180695,853842073
   python scripts/portfolio_cli.py account --account U2052408
@@ -126,6 +128,12 @@ def _build_parser() -> argparse.ArgumentParser:
     s.add_argument("--account", required=True)
     s.add_argument("--ibkr-only", action="store_true")
     s.add_argument("--json", dest="as_json", action="store_true")
+
+    # ── metrics ──────────────────────────────────────────────────────────────
+    m = sub.add_parser("metrics", help="Comprehensive portfolio metrics snapshot")
+    m.add_argument("--account", required=True)
+    m.add_argument("--ibkr-only", action="store_true")
+    m.add_argument("--json", dest="as_json", action="store_true")
 
     # ── spx-price ────────────────────────────────────────────────────────────
     sp = sub.add_parser("spx-price", help="Test SPX price sources in priority order")
@@ -502,6 +510,51 @@ def cmd_summary(args: argparse.Namespace) -> None:
         _print_kv(k, f"{v:.4f}" if isinstance(v, float) else v)
 
 
+def cmd_metrics(args: argparse.Namespace) -> None:
+    positions, adapter = asyncio.run(_run_pipeline(args.account, getattr(args, "ibkr_only", False)))
+    pt = PortfolioTools()
+    summary = pt.get_portfolio_summary(positions)
+    gamma_by_dte = {k: float(v) for k, v in pt.get_gamma_risk_by_dte(positions).items()}
+    source_counts = dict(Counter(getattr(p, "greeks_source", "none") for p in positions))
+
+    data = {
+        "account": args.account,
+        "spx_price": float((getattr(adapter, "last_greeks_status", {}) or {}).get("spx_price") or 0.0),
+        "position_count": len(positions),
+        "option_count": sum(1 for p in positions if p.instrument_type == InstrumentType.OPTION),
+        "future_count": sum(1 for p in positions if p.instrument_type == InstrumentType.FUTURE),
+        "equity_count": sum(1 for p in positions if p.instrument_type == InstrumentType.EQUITY),
+        "total_delta": float(summary.get("total_delta", 0.0)),
+        "total_gamma": float(summary.get("total_gamma", 0.0)),
+        "total_theta": float(summary.get("total_theta", 0.0)),
+        "total_vega": float(summary.get("total_vega", 0.0)),
+        "total_spx_delta": float(summary.get("total_spx_delta", 0.0)),
+        "theta_vega_ratio": float(summary.get("theta_vega_ratio", 0.0)),
+        "theta_vega_zone": summary.get("theta_vega_zone"),
+        "gamma_by_dte": gamma_by_dte,
+        "greeks_source_breakdown": source_counts,
+    }
+
+    if getattr(args, "as_json", False):
+        print(json.dumps(data, indent=2, default=str))
+        return
+
+    print(f"[{_now_utc()}]  metrics — {args.account}")
+    print(_hr(60))
+    for key in (
+        "position_count", "option_count", "future_count", "equity_count",
+        "spx_price", "total_delta", "total_gamma", "total_theta", "total_vega",
+        "total_spx_delta", "theta_vega_ratio", "theta_vega_zone",
+    ):
+        value = data[key]
+        if isinstance(value, float):
+            _print_kv(key, f"{value:.4f}")
+        else:
+            _print_kv(key, value)
+    _print_kv("gamma_by_dte", data["gamma_by_dte"])
+    _print_kv("greeks_source_breakdown", data["greeks_source_breakdown"])
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Command: spx-price
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -812,6 +865,7 @@ _COMMANDS = {
     "greeks":    cmd_greeks,
     "positions": cmd_positions,
     "summary":   cmd_summary,
+    "metrics":   cmd_metrics,
     "spx-price": cmd_spx_price,
     "snapshot":  cmd_snapshot,
     "account":   cmd_account,

@@ -12,13 +12,14 @@ Layout:
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 from datetime import date
 from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QComboBox, QTableView, QHeaderView, QAbstractItemView,
-    QTableWidget, QTableWidgetItem, QGroupBox,
 )
 from PySide6.QtCore import Qt, Signal, Slot, QModelIndex, QTimer
 
@@ -26,6 +27,8 @@ from desktop.models.table_models import ChainTableModel
 
 if TYPE_CHECKING:
     from desktop.engine.ib_engine import IBEngine, ChainRow
+
+logger = logging.getLogger(__name__)
 
 # Column indices in the chain matrix
 _COL_CALL_BID = 0
@@ -43,20 +46,19 @@ class ChainTab(QWidget):
     chain_row_selected = Signal(object)   # ChainRow
     # Emitted on single-click of a bid/ask cell — direct add to order entry
     leg_clicked        = Signal(object, str)  # (ChainRow, action: "BUY"|"SELL")
-    # Emitted when user clicks Send Combo — sends all accumulated cart legs
-    leg_cart_ready     = Signal(list)
 
     def __init__(self, engine: IBEngine, parent=None):
         super().__init__(parent)
         self._engine = engine
         self._last_chain_params: tuple | None = None  # (underlying, expiry, sec_type, exchange)
-        self._cart: list[tuple] = []  # list of (ChainRow, action_str)
         self._loading_expiries = False
+        self._full_chain_rows: list = []
+        self._underlying_price: float | None = None
         self._setup_ui()
         self._connect_signals()
         # ── Live price refresh timer (visible strikes only) ──
         self._stream_timer = QTimer(self)
-        self._stream_timer.setInterval(60_000)  # 60s streaming refresh
+        self._stream_timer.setInterval(5_000)  # 5s streaming refresh
         self._stream_timer.timeout.connect(self._on_stream_tick)
 
     def _setup_ui(self) -> None:
@@ -88,6 +90,12 @@ class ChainTab(QWidget):
         self._cmb_expiry.setEditable(True)
         self._cmb_expiry.setMinimumWidth(100)
         toolbar.addWidget(self._cmb_expiry)
+
+        toolbar.addWidget(QLabel("Range:"))
+        self._cmb_sd_range = QComboBox()
+        self._cmb_sd_range.addItems(["±1σ", "±2σ", "±3σ"])
+        self._cmb_sd_range.setCurrentIndex(1)
+        toolbar.addWidget(self._cmb_sd_range)
 
         self._btn_fetch = QPushButton("🔄 Fetch Chain")
         self._btn_fetch.setFixedHeight(30)
@@ -140,40 +148,18 @@ class ChainTab(QWidget):
             "background:#8b1a1a;color:white;font-weight:bold;"
             "padding:2px 8px;border-radius:3px;"
         )
-        header_bar.addWidget(lbl_calls, stretch=1)
-        header_bar.addWidget(lbl_puts, stretch=1)
+        lbl_strike = QLabel("STRIKE")
+        lbl_strike.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_strike.setStyleSheet(
+            "background:#8b0000;color:white;font-weight:bold;"
+            "padding:2px 8px;border-radius:3px;"
+        )
+        header_bar.addWidget(lbl_calls, stretch=8)
+        header_bar.addWidget(lbl_strike, stretch=1)
+        header_bar.addWidget(lbl_puts, stretch=8)
         layout.addLayout(header_bar)
 
         layout.addWidget(self._table, stretch=1)
-
-        # ── Leg Cart ──────────────────────────────────────────────────────
-        cart_box = QGroupBox("Leg Cart  (click Bid to SELL / Ask to BUY in table above)")
-        cart_box.setMaximumHeight(140)
-        cart_v = QVBoxLayout(cart_box)
-
-        self._tbl_cart = QTableWidget(0, 5)
-        self._tbl_cart.setHorizontalHeaderLabels(["Action", "Symbol", "Strike", "Right", "Expiry"])
-        self._tbl_cart.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self._tbl_cart.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self._tbl_cart.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self._tbl_cart.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self._tbl_cart.setMaximumHeight(80)
-        cart_v.addWidget(self._tbl_cart)
-
-        cart_btn_row = QHBoxLayout()
-        self._btn_cart_remove = QPushButton("🗑 Remove")
-        self._btn_cart_remove.setEnabled(False)
-        cart_btn_row.addWidget(self._btn_cart_remove)
-        self._btn_cart_clear = QPushButton("🧹 Clear")
-        self._btn_cart_clear.setEnabled(False)
-        cart_btn_row.addWidget(self._btn_cart_clear)
-        cart_btn_row.addStretch()
-        self._btn_cart_send = QPushButton("📋 Send Combo to Order Entry")
-        self._btn_cart_send.setStyleSheet("background:#3498db;color:white;padding:5px;")
-        self._btn_cart_send.setEnabled(False)
-        cart_btn_row.addWidget(self._btn_cart_send)
-        cart_v.addLayout(cart_btn_row)
-        layout.addWidget(cart_box)
 
         # Start with action buttons disabled until connected
         self._btn_fetch.setEnabled(False)
@@ -191,10 +177,7 @@ class ChainTab(QWidget):
         self._cmb_sec_type.currentTextChanged.connect(self._on_sec_type_changed)
         self._cmb_underlying.currentTextChanged.connect(self._on_underlying_changed)
         self._cmb_expiry.currentTextChanged.connect(self._on_expiry_changed)
-        # Cart buttons
-        self._btn_cart_remove.clicked.connect(self._on_cart_remove)
-        self._btn_cart_clear.clicked.connect(self._on_cart_clear)
-        self._btn_cart_send.clicked.connect(self._on_cart_send)
+        self._cmb_sd_range.currentTextChanged.connect(self._on_sd_range_changed)
 
     @Slot(list)
     def _on_positions_loaded(self, _rows: list) -> None:
@@ -271,16 +254,42 @@ class ChainTab(QWidget):
             # (e.g. weekly ES series: EW1, E1D, E2D that reqSecDefOptParams misses)
             pos_expiries = self._engine.get_position_expiries(underlying)
             all_expiries = sorted(set(expiries) | set(pos_expiries))
+            
+            # Format with DTE: "20260320 (11 days)"
+            today = date.today()
+            formatted_expiries = []
+            for exp_str in all_expiries:
+                try:
+                    exp_date = date(int(exp_str[:4]), int(exp_str[4:6]), int(exp_str[6:8]))
+                    dte = (exp_date - today).days
+                    formatted_expiries.append(f"{exp_str} ({dte} days)")
+                except (ValueError, IndexError):
+                    formatted_expiries.append(exp_str)
+            
             try:
                 self._loading_expiries = True
                 self._cmb_expiry.blockSignals(True)
                 self._cmb_expiry.clear()
-                self._cmb_expiry.addItems(all_expiries[:30])  # limit to 30 nearest
-                if all_expiries:
+                # Show ALL available expirations with DTE (no limit) — user can scroll if needed
+                self._cmb_expiry.addItems(formatted_expiries)
+                
+                # Show data source indicator
+                source_indicator = ""
+                if hasattr(self._engine, '_last_expiry_source'):
+                    if self._engine._last_expiry_source == "database":
+                        source_indicator = " [CACHED]"
+                    elif self._engine._last_expiry_source == "memory":
+                        source_indicator = " [MEMORY]"
+                
+                logger.debug("Loaded %d expirations for %s%s: %s", len(all_expiries), underlying, source_indicator,
+                           ", ".join(all_expiries[:10]) + ("..." if len(all_expiries) > 10 else ""))
+                if formatted_expiries:
                     self._cmb_expiry.setCurrentIndex(0)
                 self._cmb_expiry.blockSignals(False)
-                if all_expiries:
-                    self._on_expiry_changed(self._cmb_expiry.currentText())
+                if formatted_expiries:
+                    # Extract the raw expiry string (before the space) for the changed handler
+                    raw_expiry = formatted_expiries[0].split()[0] if formatted_expiries else ""
+                    self._on_expiry_changed(raw_expiry)
             except RuntimeError:
                 return  # Widget deleted during shutdown
             finally:
@@ -322,10 +331,39 @@ class ChainTab(QWidget):
             self._last_chain_params = (underlying, expiry, sec_type, exchange)
 
             rows = await self._engine.get_chain(
-                underlying, expiry=expiry, sec_type=sec_type, exchange=exchange,
+                underlying, expiry=expiry, sec_type=sec_type, exchange=exchange, max_strikes=200,
             )
+
+            # Fetch underlying price FIRST (before filtering) and set on model IMMEDIATELY
+            self._underlying_price = self._engine.last_price(underlying)
+            if self._underlying_price is None:
+                try:
+                    snap = await self._engine.get_market_snapshot(underlying, sec_type="FUT" if sec_type == "FOP" else "STK", exchange=exchange)
+                    if snap:
+                        self._underlying_price = snap.last or snap.close or snap.bid or snap.ask
+                except Exception as fetch_exc:
+                    logger.warning("Failed to fetch market snapshot for %s: %s", underlying, fetch_exc)
+                    self._underlying_price = None
+            
+            # Log underlying price fetch for diagnostics
+            if self._underlying_price is not None:
+                logger.info("Underlying price fetched: %s = %.2f", underlying, self._underlying_price)
+            else:
+                logger.warning("Failed to fetch underlying price for %s (ATM highlighting disabled)", underlying)
+            
+            # Set underlying price on model IMMEDIATELY before filtering
+            self._model.set_underlying_price(self._underlying_price)
+            
             try:
-                self._lbl_status.setText(f"✅ {len(rows)} contracts")
+                # Add cache indicator if using database-cached expirations
+                cache_indicator = ""
+                if hasattr(self._engine, '_last_expiry_source') and self._engine._last_expiry_source == "database":
+                    cache_indicator = " [CACHED DATA]"
+                
+                if self._underlying_price is not None:
+                    self._lbl_status.setText(f"✅ {len(rows)} contracts · Underlying {underlying}: {self._underlying_price:,.2f}{cache_indicator}")
+                else:
+                    self._lbl_status.setText(f"✅ {len(rows)} contracts{cache_indicator}")
                 # Start live price refresh when chain is loaded
                 if rows and not self._stream_timer.isActive():
                     self._stream_timer.start()
@@ -334,6 +372,7 @@ class ChainTab(QWidget):
         except Exception as exc:
             try:
                 self._lbl_status.setText(f"❌ {exc}")
+                logger.error("_async_fetch failed: %s", exc, exc_info=True)
             except RuntimeError:
                 return  # Widget deleted during shutdown
         finally:
@@ -344,12 +383,79 @@ class ChainTab(QWidget):
 
     @Slot(list)
     def _on_chain_ready(self, rows: list) -> None:
-        current_expiry = self._cmb_expiry.currentText().strip()
+        self._full_chain_rows = list(rows)
+        self._apply_chain_filters()
+
+    def _selected_sigma_band(self) -> int:
+        text = self._cmb_sd_range.currentText().strip()
+        return 1 if text.startswith("±1") else 2 if text.startswith("±2") else 3
+
+    def _apply_chain_filters(self) -> None:
+        # Extract raw expiry (strip DTE if present)
+        current_expiry_raw = self._cmb_expiry.currentText().strip().split()[0] if self._cmb_expiry.currentText() else ""
+        rows = list(self._full_chain_rows)
         filtered_rows = [
             row for row in rows
-            if not current_expiry or str(getattr(row, "expiry", "")).startswith(current_expiry)
+            if not current_expiry_raw or str(getattr(row, "expiry", "")).startswith(current_expiry_raw)
         ]
+
+        sigma_band = self._selected_sigma_band()
+        expiry_text = current_expiry_raw
+        if filtered_rows and self._underlying_price and expiry_text and len(expiry_text) >= 8:
+            try:
+                expiry_date = date(int(expiry_text[:4]), int(expiry_text[4:6]), int(expiry_text[6:8]))
+                dte = max(1, (expiry_date - date.today()).days)
+                atm_iv = self._estimate_atm_iv(filtered_rows, float(self._underlying_price))
+                if atm_iv and atm_iv > 0:
+                    one_sigma_move = float(self._underlying_price) * float(atm_iv) * math.sqrt(dte / 365.0)
+                    move = one_sigma_move * float(sigma_band)
+                    low = float(self._underlying_price) - move
+                    high = float(self._underlying_price) + move
+                    filtered_rows = [r for r in filtered_rows if low <= float(getattr(r, "strike", 0.0)) <= high]
+                    logger.debug("Applied ±%dσ filter: %.0f-%.0f (underlying=%.2f, IV=%.2f%%, DTE=%d)", 
+                               sigma_band, low, high, self._underlying_price, atm_iv * 100, dte)
+            except Exception as exc:
+                logger.warning("_apply_chain_filters failed: %s", exc)
+
+        # Model already has underlying_price set in _async_fetch, just update data
         self._model.set_data(filtered_rows)
+        
+        # Auto-scroll to center the underlying price row
+        self._scroll_to_underlying()
+
+    def _scroll_to_underlying(self) -> None:
+        """Scroll the table to center on the nearest underlying strike row."""
+        if self._model._underlying_row_idx is None:
+            return
+        
+        underlying_row = self._model._underlying_row_idx
+        row_height = self._table.rowHeight(underlying_row) if underlying_row < self._model.rowCount() else 30
+        
+        # Calculate scroll position to center the underlying row in the view
+        # Get the viewport height and scroll to place the row approximately in the middle
+        viewport_height = self._table.viewport().height()
+        rows_to_center = viewport_height // (2 * row_height)
+        
+        # Scroll to a row that places the underlying row roughly in the middle
+        target_row = max(0, underlying_row - rows_to_center)
+        index = self._model.index(target_row, 0)
+        self._table.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtTop)
+        
+        logger.debug("Scrolled chain table to underlying row %d (strike at idx %d)", target_row, underlying_row)
+
+    def _estimate_atm_iv(self, rows: list, under_price: float) -> float | None:
+        iv_samples: list[float] = []
+        try:
+            sorted_rows = sorted(rows, key=lambda r: abs(float(getattr(r, "strike", 0.0)) - under_price))
+        except Exception:
+            sorted_rows = rows
+        for row in sorted_rows[:12]:
+            iv = getattr(row, "iv", None)
+            if isinstance(iv, (int, float)) and iv > 0 and iv < 5:
+                iv_samples.append(float(iv))
+        if not iv_samples:
+            return None
+        return sum(iv_samples) / len(iv_samples)
 
     @Slot()
     def _on_stream_tick(self) -> None:
@@ -379,8 +485,9 @@ class ChainTab(QWidget):
                 if current_rows:
                     updated = self._engine.read_chain_from_live_tickers(current_rows)
                     if updated:
+                        self._full_chain_rows = list(updated)
                         try:
-                            self._model.set_data(updated)
+                            self._apply_chain_filters()
                         except RuntimeError:
                             pass  # Widget deleted
             else:
@@ -401,6 +508,7 @@ class ChainTab(QWidget):
             self._engine.cancel_chain_streaming()
         except Exception:
             pass
+        self._full_chain_rows = []
         self._model.set_data([])
         self._lbl_status.setText(status)
 
@@ -452,76 +560,16 @@ class ChainTab(QWidget):
             self._lbl_status.setText("⚠ No option data for this strike/side")
             return
 
-        # 1) Emit immediately — order entry appends this leg right away
+        # Emit immediately — order entry appends this leg right away
         self.leg_clicked.emit(chain_row, action)
-
-        # 2) Also accumulate in cart for combo building
-        self._cart.append((chain_row, action))
-        self._update_cart()
         side_label = "Call" if right == "C" else "Put"
         self._lbl_status.setText(
-            f"✅ {action} {side_label} {chain_row.strike:.0f} → Order Entry  "
-            f"({len(self._cart)} leg(s) staged)"
+            f"✅ {action} {side_label} {chain_row.strike:.0f} → Order Entry"
         )
 
-    def _update_cart(self) -> None:
-        """Refresh the cart table widget."""
-        self._tbl_cart.setRowCount(len(self._cart))
-        for i, (cr, action) in enumerate(self._cart):
-            cells = [
-                action,
-                cr.underlying,
-                f"{cr.strike:.0f}",
-                {"C": "Call", "P": "Put"}.get(cr.right, cr.right),
-                (cr.expiry or "")[:8],
-            ]
-            for col, text in enumerate(cells):
-                item = QTableWidgetItem(text)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if col == 0:
-                    item.setForeground(Qt.GlobalColor.green if action == "BUY" else Qt.GlobalColor.red)
-                self._tbl_cart.setItem(i, col, item)
-        has = bool(self._cart)
-        self._btn_cart_remove.setEnabled(has)
-        self._btn_cart_clear.setEnabled(has)
-        self._btn_cart_send.setEnabled(has)
-
-    @Slot()
-    def _on_cart_remove(self) -> None:
-        row = self._tbl_cart.currentRow()
-        if 0 <= row < len(self._cart):
-            self._cart.pop(row)
-            self._update_cart()
-
-    @Slot()
-    def _on_cart_clear(self) -> None:
-        self._cart.clear()
-        self._update_cart()
-
-    @Slot()
-    def _on_cart_send(self) -> None:
-        """Convert cart entries to leg dicts and emit leg_cart_ready."""
-        legs: list[dict] = []
-        for cr, action in self._cart:
-            sec_type = "FOP" if cr.underlying in ("ES","MES","NQ","MNQ","RTY","YM","MYM","M2K") else "OPT"
-            exchange = "CME" if sec_type == "FOP" else "SMART"
-            expiry = (cr.expiry or "")[:8]
-            legs.append({
-                "symbol": cr.underlying,
-                "sec_type": sec_type,
-                "exchange": exchange,
-                "action": action,
-                "qty": 1,
-                "strike": cr.strike,
-                "right": cr.right,
-                "expiry": expiry,
-                "conid": cr.conid or 0,
-            })
-        if legs:
-            self.leg_cart_ready.emit(legs)
-            # Clear cart after sending
-            self._cart.clear()
-            self._update_cart()
+    @Slot(str)
+    def _on_sd_range_changed(self, _text: str) -> None:
+        self._apply_chain_filters()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)

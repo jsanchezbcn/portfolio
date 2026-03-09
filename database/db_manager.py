@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 from dataclasses import dataclass, asdict
@@ -8,6 +9,8 @@ from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 import asyncpg
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -887,3 +890,101 @@ class DBManager:
             return int(result.split()[-1])
         except (IndexError, ValueError):
             return 0
+
+    # ── Greeks cache — offline fallback for when market is closed ────────────────
+
+    async def get_cached_greeks(self, account_id: str) -> dict[int, dict[str, float]]:
+        """Retrieve the most recent Greeks for all options from cache.
+        
+        Returns: { conId: {delta, gamma, theta, vega, iv}, ... }
+        """
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        
+        query = """
+        SELECT DISTINCT ON (conid) conid, delta, gamma, theta, vega, iv, fetched_at
+        FROM option_chain_cache
+        WHERE fetched_at >= NOW() - INTERVAL '1 week'
+        ORDER BY conid, fetched_at DESC;
+        """
+        
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(query)
+            
+            result: dict[int, dict[str, float]] = {}
+            for row in rows:
+                conid = row["conid"]
+                if conid and row["delta"] is not None:
+                    result[conid] = {
+                        "delta": float(row["delta"]),
+                        "gamma": float(row["gamma"]) if row["gamma"] is not None else None,
+                        "theta": float(row["theta"]) if row["theta"] is not None else None,
+                        "vega": float(row["vega"]) if row["vega"] is not None else None,
+                        "iv": float(row["iv"]) if row["iv"] is not None else None,
+                    }
+            return result
+        except Exception as exc:
+            logger.debug("Failed to retrieve cached Greeks: %s", exc)
+            return {}
+
+    async def store_cached_greeks(
+        self,
+        underlying: str,
+        expiry: date,
+        strike: float,
+        option_right: str,
+        conid: int | None = None,
+        bid: float | None = None,
+        ask: float | None = None,
+        last: float | None = None,
+        volume: int | None = None,
+        open_interest: int | None = None,
+        iv: float | None = None,
+        delta: float | None = None,
+        gamma: float | None = None,
+        theta: float | None = None,
+        vega: float | None = None,
+    ) -> None:
+        """Store Greeks and chain data in the option_chain_cache table for offline fallback.
+        
+        Uses UPSERT to replace existing cache entries for the same option.
+        """
+        await self.connect()
+        if self._pool is None:
+            raise RuntimeError("DB pool is not initialized")
+        
+        query = """
+        INSERT INTO option_chain_cache (
+            underlying, expiry, strike, option_right, conid,
+            bid, ask, last, volume, open_interest,
+            iv, delta, gamma, theta, vega, fetched_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
+        ON CONFLICT (underlying, expiry, strike, option_right)
+        DO UPDATE SET
+            conid = EXCLUDED.conid,
+            bid = EXCLUDED.bid,
+            ask = EXCLUDED.ask,
+            last = EXCLUDED.last,
+            volume = EXCLUDED.volume,
+            open_interest = EXCLUDED.open_interest,
+            iv = EXCLUDED.iv,
+            delta = EXCLUDED.delta,
+            gamma = EXCLUDED.gamma,
+            theta = EXCLUDED.theta,
+            vega = EXCLUDED.vega,
+            fetched_at = NOW();
+        """
+        
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    query,
+                    underlying, expiry, strike, option_right, conid,
+                    bid, ask, last, volume, open_interest,
+                    iv, delta, gamma, theta, vega
+                )
+        except Exception as exc:
+            logger.debug("Failed to store cached Greeks for %s %s %.0f %s: %s", 
+                        underlying, expiry, strike, option_right, exc)

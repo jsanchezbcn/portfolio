@@ -25,6 +25,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from math import gcd
 from pathlib import Path
 from typing import Any, Optional
 
@@ -220,9 +221,12 @@ class IBEngine(QObject):
         self._greeks_engine = GreeksEngine(risk_free_rate=float(os.getenv("IB_LOCAL_GREEKS_RISK_FREE_RATE", "0.01")))
         self._load_beta_config()
         # ── Option chain caches (keyed by "underlying|expiry|sec_type|exchange") ──
-        # TTL: 86400s (1 day).  Cleared on reconnect.
-        self._chain_cache:  dict[str, tuple[float, list]] = {}   # key → (ts, ChainRow list)
-        self._expiry_cache: dict[str, tuple[float, list]] = {}   # key → (ts, expiry strings)
+        # _expiry_cache: TTL 604800s (1 week) for available expirations.  Cleared on reconnect.
+        # _strike_skeleton_cache: TTL 604800s (1 week) for strike contract specs w/o live prices.
+        # _chain_cache: TTL 3600s (1 hour) for full chain with live prices. Cleared on reconnect.
+        self._expiry_cache: dict[str, tuple[float, list]] = {}   # key → (ts, [expiry strings])
+        self._strike_skeleton_cache: dict[str, tuple[float, list]] = {}   # key → (ts, [ChainRow skeletons])
+        self._chain_cache:  dict[str, tuple[float, list]] = {}   # key → (ts, [ChainRow w/ prices])
         # ── Streaming subscriptions for live chain prices ──
         # conid → ib_async Ticker; cancelled when chain tab hidden / symbol changes
         self._chain_tickers: dict[int, Any] = {}
@@ -240,6 +244,9 @@ class IBEngine(QObject):
         # fail to get live data (e.g. stock options, pre/post market) still
         # show sensible values rather than going blank.
         self._greeks_cache: dict[int, dict] = {}
+        
+        # ── Track last data source for UI status indicators ──
+        self._last_expiry_source: str = "unknown"  # "live", "memory", "database", or "unknown"
 
         # Wire ib_async event callbacks
         self._ib.connectedEvent += self._on_ib_connected
@@ -317,6 +324,8 @@ class IBEngine(QObject):
             self._chain_cache.clear()
         if hasattr(self, "_expiry_cache"):
             self._expiry_cache.clear()
+        if hasattr(self, "_strike_skeleton_cache"):
+            self._strike_skeleton_cache.clear()
         if self._db_ok:
             try:
                 await self._db.close()
@@ -393,6 +402,44 @@ class IBEngine(QObject):
             if not qualified or not qualified[0].conId:
                 raise ValueError(f"Cannot qualify contract: {symbol} {sec_type} {exchange}")
             return qualified[0]
+
+    async def _get_active_fop_underlyings(self, symbol: str, exchange: str, limit: int = 2) -> list[Contract]:
+        """Return the next active futures underlyings for a root like ES or MES.
+
+        Futures options are segmented by the underlying future month, so querying
+        only the front contract hides expiries on the next contract month.
+        """
+        details = await self._ib.reqContractDetailsAsync(Future(symbol=symbol, exchange=exchange, currency="USD"))
+        if not details:
+            raise ValueError(f"No contract details for {symbol} FUT {exchange}")
+
+        today = date.today()
+        ordered = sorted(
+            details,
+            key=lambda d: (
+                self._parse_expiry(getattr(getattr(d, "contract", None), "lastTradeDateOrContractMonth", None)) or date.max,
+                str(getattr(getattr(d, "contract", None), "lastTradeDateOrContractMonth", "") or ""),
+            ),
+        )
+
+        result: list[Contract] = []
+        seen_conids: set[int] = set()
+        for detail in ordered:
+            contract = getattr(detail, "contract", None)
+            if not contract:
+                continue
+            conid = int(getattr(contract, "conId", 0) or 0)
+            if conid <= 0 or conid in seen_conids:
+                continue
+            expiry = self._parse_expiry(getattr(contract, "lastTradeDateOrContractMonth", None))
+            if expiry is not None and expiry < today:
+                continue
+            seen_conids.add(conid)
+            result.append(contract)
+            if len(result) >= limit:
+                break
+
+        return result
 
     # ── positions ─────────────────────────────────────────────────────────
 
@@ -490,6 +537,28 @@ class IBEngine(QObject):
             for start in range(0, len(missing_positions), retry_batch_size):
                 retry_batch = missing_positions[start:start + retry_batch_size]
                 option_greeks_by_conid.update(await collect_batch(retry_batch, retry_wait_s))
+            remaining_missing_positions = [
+                p for p in missing_positions
+                if not any((option_greeks_by_conid.get(p.contract.conId, {}) or {}).get(k) is not None for k in ("delta", "gamma", "theta", "vega", "iv"))
+            ]
+            resolved_after_retry = len(missing_positions) - len(remaining_missing_positions)
+            logger.info(
+                "Greeks retry complete: resolved %d/%d previously-missing option positions",
+                resolved_after_retry,
+                len(missing_positions),
+            )
+            if remaining_missing_positions:
+                sample = ", ".join(
+                    f"{getattr(p.contract, 'symbol', '?')} {getattr(p.contract, 'lastTradeDateOrContractMonth', '')} "
+                    f"{float(getattr(p.contract, 'strike', 0.0) or 0.0):.1f} {getattr(p.contract, 'right', '')}"
+                    for p in remaining_missing_positions[:12]
+                )
+                logger.warning(
+                    "Greeks still missing after retry for %d positions: %s%s",
+                    len(remaining_missing_positions),
+                    sample,
+                    " …" if len(remaining_missing_positions) > 12 else "",
+                )
 
         # ── Step 3: Build PositionRow with PnL + Greeks
         for pos in ib_positions:
@@ -549,8 +618,6 @@ class IBEngine(QObject):
                     multiplier=1.0,
                     spx_proxy_price=spx_proxy_price,
                 ) if ref_price > 0 else None
-                # For stocks the meaningful delta IS the SPX-weighted beta delta
-                # (not the raw share count which is useless for cross-asset comparison)
                 delta = spx_delta
             elif c.secType == "FUT":
                 # Futures have delta=1 per contract; SPX delta = qty × SPX-multiplier.
@@ -915,33 +982,67 @@ class IBEngine(QObject):
         """Return sorted list of available expiry strings (YYYYMMDD) for a symbol."""
         cache_key = f"expiries|{underlying}|{sec_type}|{exchange}"
         now = _time_mod.time()
+        
+        # Check in-memory cache first (fastest)
         if cache_key in self._expiry_cache:
             ts, cached = self._expiry_cache[cache_key]
-            if now - ts < 86400:  # 1-day TTL
-                logger.debug("expiry cache hit for %s", underlying)
+            if now - ts < 604800:  # 1-week TTL (604800s)
+                logger.debug("expiry cache hit (memory) for %s %s (age=%.0fs/604800s)", underlying, sec_type, now - ts)
+                self._last_expiry_source = "memory"
                 return cached
-        und_contract = await self._qualify_underlying(underlying, sec_type, exchange)
-
-        # For FOP, futFopExchange must be set (e.g. "CME"); for stock options leave empty
-        fut_fop_exchange = exchange if sec_type == "FOP" else ""
+        
+        # Check database cache (offline fallback)
+        if self._db_ok:
+            try:
+                db_cached = await self._db.get_cached_expirations(underlying, sec_type, exchange)
+                if db_cached:
+                    # Store in memory cache too for faster subsequent access
+                    self._expiry_cache[cache_key] = (now, db_cached)
+                    self._last_expiry_source = "database"
+                    return db_cached
+            except Exception as exc:
+                logger.debug("Failed to load cached expirations from database: %s", exc)
+        
+        # Fetch from IB. For FOP, query the next two active futures underlyings
+        # so later expiries on the next contract month remain visible.
+        if sec_type == "FOP":
+            underlying_contracts = await self._get_active_fop_underlyings(underlying, exchange, limit=2)
+        else:
+            underlying_contracts = [await self._qualify_underlying(underlying, sec_type, exchange)]
 
         chains: list[Any] = []
-        try:
-            chains = await asyncio.wait_for(
-                self._ib.reqSecDefOptParamsAsync(
-                    und_contract.symbol, fut_fop_exchange, und_contract.secType, und_contract.conId or 0,
-                ),
-                timeout=15,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("get_available_expiries timed out for %s (secDef)", underlying)
+        for und_contract in underlying_contracts:
+            fut_fop_exchange = exchange if sec_type == "FOP" else ""
+            try:
+                fetched = await asyncio.wait_for(
+                    self._ib.reqSecDefOptParamsAsync(
+                        und_contract.symbol, fut_fop_exchange, und_contract.secType, und_contract.conId or 0,
+                    ),
+                    timeout=15,
+                )
+                chains.extend(fetched or [])
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "get_available_expiries timed out for %s %s (secDef)",
+                    underlying,
+                    getattr(und_contract, "lastTradeDateOrContractMonth", ""),
+                )
 
         if not chains and sec_type == "FOP":
             fallback = await self._fallback_fop_expiries_from_contract_details(underlying, exchange)
             if fallback:
+                # Store fallback in caches
+                self._expiry_cache[cache_key] = (now, fallback)
+                if self._db_ok:
+                    try:
+                        await self._db.store_cached_expirations(underlying, fallback, sec_type, exchange)
+                    except Exception as exc:
+                        logger.debug("Failed to store fallback expirations in database: %s", exc)
+                self._last_expiry_source = "live"
                 return fallback
 
         if not chains:
+            self._last_expiry_source = "live"
             return []
 
         # Merge expirations from ALL returned chain defs (IB may return multiple
@@ -953,7 +1054,25 @@ class IBEngine(QObject):
                 if e >= today_str:
                     all_expirations.add(e)
         result = sorted(all_expirations)
-        self._expiry_cache[cache_key] = (_time_mod.time(), result)
+        active_future_months = ", ".join(
+            str(getattr(c, "lastTradeDateOrContractMonth", "") or "?")
+            for c in underlying_contracts
+        )
+        logger.info(
+            "expiry cache miss: fetched %d expirations for %s %s across futures [%s] (all_expirations=%s)",
+            len(result), underlying, sec_type, active_future_months or "none",
+            ", ".join(result[:10]) if result else "none",
+        )
+        
+        # Store in both caches
+        self._expiry_cache[cache_key] = (now, result)
+        if self._db_ok:
+            try:
+                await self._db.store_cached_expirations(underlying, result, sec_type, exchange)
+            except Exception as exc:
+                logger.debug("Failed to store expirations in database: %s", exc)
+        
+        self._last_expiry_source = "live"
         return result
 
     def get_position_expiries(self, underlying: str) -> list[str]:
@@ -1000,7 +1119,11 @@ class IBEngine(QObject):
         For futures options (ES, MES) use sec_type='FOP', exchange='CME'.
         For equity options (SPY, QQQ) use sec_type='OPT', exchange='SMART'.
         max_strikes limits strikes to the N nearest around ATM (default 40).
-        force_refresh=True bypasses the 1-day cache (used for streaming tick updates).
+        force_refresh=True bypasses caches (used for streaming tick updates).
+        
+        Caching strategy:
+        - Skeleton cache (1-week TTL): Contract specs w/o live prices (fast load)
+        - Live price cache (1-hour TTL): Full chain w/ bid/ask/greeks (for streaming)
         """
         expiry_key = expiry.strftime("%Y%m%d") if expiry else "nearest"
         self._active_chain_request = {
@@ -1012,49 +1135,89 @@ class IBEngine(QObject):
         }
         cache_key  = f"{underlying}|{expiry_key}|{sec_type}|{exchange}"
         now = _time_mod.time()
+        
+        # Check live price cache (1-hour TTL) first — if not expired, use it
         if not force_refresh and cache_key in self._chain_cache:
             ts, cached_rows = self._chain_cache[cache_key]
-            if now - ts < 86400:  # 1-day TTL
-                logger.debug("chain cache hit for %s %s", underlying, expiry_key)
+            age_s = now - ts
+            if age_s < 3600:  # 1-hour TTL for live prices
+                logger.info("chain live cache hit for %s %s (age=%.0fs/3600s)", underlying, expiry_key, age_s)
                 self.chain_ready.emit(cached_rows)
                 return cached_rows
+        
+        # Check skeleton cache (1-week TTL) — can return immediately if available
+        skeleton_key = f"skeleton|{cache_key}"
+        if not force_refresh and skeleton_key in self._strike_skeleton_cache:
+            ts, skeleton_rows = self._strike_skeleton_cache[skeleton_key]
+            age_s = now - ts
+            if age_s < 604800:  # 1-week TTL for strike skeletons (conId+strike specs stable)
+                logger.info("chain skeleton cache hit for %s %s (age=%.0fs, refreshing prices...)", 
+                           underlying, expiry_key, age_s)
+                # Use skeleton immediately; can optionally refresh prices in background
+                self.chain_ready.emit(skeleton_rows)
+                # TODO: optionally refresh prices in background for next fetch
         # Cancel any stale live-streaming subscriptions before fetching a new chain
         self.cancel_chain_streaming()
-        # Resolve the underlying contract for ATM price lookup
-        und_contract = await self._qualify_underlying(underlying, sec_type, exchange)
+        if sec_type == "FOP":
+            underlying_contracts = await self._get_active_fop_underlyings(underlying, exchange, limit=2)
+        else:
+            underlying_contracts = [await self._qualify_underlying(underlying, sec_type, exchange)]
 
-        # For FOP, futFopExchange must be set (e.g. "CME"); for stock options leave empty
-        fut_fop_exchange = exchange if sec_type == "FOP" else ""
+        chain_entries: list[tuple[Contract, Any]] = []
+        for und_contract in underlying_contracts:
+            fut_fop_exchange = exchange if sec_type == "FOP" else ""
+            try:
+                chains = await asyncio.wait_for(
+                    self._ib.reqSecDefOptParamsAsync(
+                        und_contract.symbol, fut_fop_exchange, und_contract.secType, und_contract.conId or 0,
+                    ),
+                    timeout=15,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "get_chain reqSecDefOptParams timed out for %s %s (market may be closed)",
+                    underlying,
+                    getattr(und_contract, "lastTradeDateOrContractMonth", ""),
+                )
+                continue
 
-        try:
-            chains = await asyncio.wait_for(
-                self._ib.reqSecDefOptParamsAsync(
-                    und_contract.symbol, fut_fop_exchange, und_contract.secType, und_contract.conId or 0,
-                ),
-                timeout=15,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("get_chain reqSecDefOptParams timed out for %s (market may be closed)", underlying)
+            for cd in (chains or []):
+                chain_entries.append((und_contract, cd))
+
+        if not chain_entries:
             return []
-
-        if not chains:
-            return []
-
-        # Pick the chain matching exchange and closest expiry
-        chain_def = chains[0]
-        for cd in chains:
-            if cd.exchange == exchange:
-                chain_def = cd
-                break
 
         expiry_str = ""
         if expiry:
             expiry_str = expiry.strftime("%Y%m%d")
-        elif chain_def.expirations:
-            # Pick nearest expiry in the future
-            today_str = date.today().strftime("%Y%m%d")
-            future_exps = [e for e in sorted(chain_def.expirations) if e >= today_str]
-            expiry_str = future_exps[0] if future_exps else chain_def.expirations[-1]
+
+        today_str = date.today().strftime("%Y%m%d")
+        selected_entry: tuple[Contract, Any] | None = None
+        if expiry_str:
+            for und_contract, cd in chain_entries:
+                if cd.exchange == exchange and expiry_str in (cd.expirations or []):
+                    selected_entry = (und_contract, cd)
+                    break
+            if selected_entry is None:
+                for und_contract, cd in chain_entries:
+                    if expiry_str in (cd.expirations or []):
+                        selected_entry = (und_contract, cd)
+                        break
+        else:
+            future_candidates = []
+            for und_contract, cd in chain_entries:
+                valid = [e for e in sorted(cd.expirations or []) if e >= today_str]
+                if valid:
+                    future_candidates.append((valid[0], und_contract, cd))
+            if future_candidates:
+                future_candidates.sort(key=lambda item: item[0])
+                expiry_str, und_contract, chain_def = future_candidates[0]
+                selected_entry = (und_contract, chain_def)
+
+        if selected_entry is None:
+            selected_entry = chain_entries[0]
+
+        und_contract, chain_def = selected_entry
 
         if not expiry_str:
             logger.warning("get_chain: no expiry resolved for %s", underlying)
@@ -1193,8 +1356,53 @@ class IBEngine(QObject):
             if c.conId:
                 self._chain_tickers[c.conId] = (c, t)
 
-        # Write to 1-day cache before emitting
+        # Cache both the skeleton (1-week) and live prices (1-hour)
+        skeleton_key = f"skeleton|{cache_key}"
+        self._strike_skeleton_cache[skeleton_key] = (_time_mod.time(), result)
         self._chain_cache[cache_key] = (_time_mod.time(), result)
+        logger.info("chain cache stored: %d strikes for %s %s (skeleton+prices)", 
+                   len(result), underlying, expiry_key)
+        
+        # Store Greeks in database for offline fallback (when market is closed)
+        if self._db_ok:
+            try:
+                for row in result:
+                    c = row.underlying if isinstance(row, ChainRow) else row[0]  # underlying
+                    e = row.expiry if isinstance(row, ChainRow) else row[1]  # expiry
+                    s = row.strike if isinstance(row, ChainRow) else row[2]  # strike
+                    r = row.right if isinstance(row, ChainRow) else row[3]  # right
+                    cn = row.conid if isinstance(row, ChainRow) else row[4]  # conid
+                    b = row.bid if isinstance(row, ChainRow) else row[5]  # bid
+                    a = row.ask if isinstance(row, ChainRow) else row[6]  # ask
+                    l = row.last if isinstance(row, ChainRow) else row[7]  # last
+                    v = row.volume if isinstance(row, ChainRow) else (row[8] if len(row) > 8 else None)  # volume
+                    oi = row.open_interest if isinstance(row, ChainRow) else (row[9] if len(row) > 9 else None)  # open_interest
+                    iv = row.iv if isinstance(row, ChainRow) else (row[10] if len(row) > 10 else None)  # iv
+                    d = row.delta if isinstance(row, ChainRow) else (row[11] if len(row) > 11 else None)  # delta
+                    g = row.gamma if isinstance(row, ChainRow) else (row[12] if len(row) > 12 else None)  # gamma
+                    th = row.theta if isinstance(row, ChainRow) else (row[13] if len(row) > 13 else None)  # theta
+                    ve = row.vega if isinstance(row, ChainRow) else (row[14] if len(row) > 14 else None)  # vega
+                    
+                    asyncio.create_task(self._db.store_cached_greeks(
+                        underlying=c,
+                        expiry=e,
+                        strike=float(s) if s else None,
+                        option_right=r,
+                        conid=cn,
+                        bid=float(b) if b else None,
+                        ask=float(a) if a else None,
+                        last=float(l) if l else None,
+                        volume=int(v) if v else None,
+                        open_interest=int(oi) if oi else None,
+                        iv=float(iv) if iv else None,
+                        delta=float(d) if d else None,
+                        gamma=float(g) if g else None,
+                        theta=float(th) if th else None,
+                        vega=float(ve) if ve else None,
+                    ))
+            except Exception as exc:
+                logger.debug("Failed to store Greeks in database: %s", exc)
+        
         self.chain_ready.emit(result)
         return result
 
@@ -1437,15 +1645,23 @@ class IBEngine(QObject):
 
         return prepared
 
-    async def _resolve_contracts(self, legs: list[dict]) -> list:
+    async def _resolve_contracts(self, legs: list[dict], *, strict: bool = False) -> list:
         """Build contracts for legs, using chain cache and qualifyContractsAsync as fallback.
 
         1. Pre-fill conIds from the chain cache for any leg missing one.
         2. If all conIds are found skip qualifyContractsAsync entirely.
         3. Otherwise qualify only the contracts still missing conIds.
+        
+        Detailed logging tracks each resolution step to diagnose contract qualification issues.
         """
         prepared_legs = [await self._prepare_leg_for_resolution(lg) for lg in legs]
         contracts = [self._leg_to_contract(lg) for lg in prepared_legs]
+        
+        # -- Log input legs for diagnostics --
+        log_legs = [f"{lg.get('symbol')} {lg.get('expiry')} {lg.get('strike')} {lg.get('right')}" 
+                    for lg in prepared_legs]
+        logger.debug("_resolve_contracts: input legs: %s (strict=%s)", ", ".join(log_legs), strict)
+        
         # -- Stage 1: fill conIds from leg dict itself (chain click-to-trade)
         # -- Stage 2: chain cache lookup
         # -- Stage 3: positions snapshot lookup
@@ -1457,17 +1673,33 @@ class IBEngine(QObject):
             exp  = str(lg.get("expiry", ""))
             strk = float(lg.get("strike") or 0)
             rght = str(lg.get("right", ""))
+            
             # chain cache first
             cid = self._lookup_conid_from_chain(sym, exp, strk, rght)
-            # positions snapshot as second fallback
-            if not cid:
-                cid = self._lookup_conid_from_positions(sym, exp, strk, rght)
             if cid > 0:
                 c.conId = cid
                 contracts[i] = c
+                logger.debug("_resolve_contracts: chain cache match for %s %.2f %s -> conId=%d", 
+                            sym, strk, rght, cid)
+                continue
+                
+            # positions snapshot as second fallback
+            cid = self._lookup_conid_from_positions(sym, exp, strk, rght)
+            if cid > 0:
+                c.conId = cid
+                contracts[i] = c
+                logger.debug("_resolve_contracts: positions cache match for %s %.2f %s -> conId=%d", 
+                            sym, strk, rght, cid)
+                continue
+            
+            logger.debug("_resolve_contracts: no cache hit for %s %s %.2f %s (will try qualifyAsync)", 
+                        sym, exp, strk, rght)
 
         all_have_conid = all(getattr(c, "conId", 0) > 0 for c in contracts)
         if not all_have_conid:
+            missing_count = sum(1 for c in contracts if getattr(c, "conId", 0) <= 0)
+            logger.debug("_resolve_contracts: %d/%d contracts missing conId, calling qualifyContractsAsync", 
+                        missing_count, len(contracts))
             try:
                 qualified = await self._ib.qualifyContractsAsync(*contracts)
                 # Merge back: keep qualified where conId came back; keep original elsewhere
@@ -1475,30 +1707,115 @@ class IBEngine(QObject):
                 for orig, qual in zip(contracts, qualified if qualified else []):
                     if qual and getattr(qual, "conId", 0) > 0:
                         resolved.append(qual)
+                        logger.debug("_resolve_contracts: qualified %s -> conId=%d", 
+                                   getattr(qual, "symbol", "?"), getattr(qual, "conId", 0))
                     elif getattr(orig, "conId", 0) > 0:
                         resolved.append(orig)  # chain/position lookup already gave us conId
-                    # else: truly unresolvable — omit
+                    else:
+                        logger.warning("_resolve_contracts: failed to resolve %s %s", 
+                                     getattr(orig, "symbol", "?"), 
+                                     getattr(orig, "lastTradeDateOrContractMonth", "?"))
+                        # omit truly unresolvable
                 contracts = resolved
             except Exception as exc:
-                logger.warning("qualifyContractsAsync failed: %s", exc)
+                logger.warning("qualifyContractsAsync failed: %s; falling back to unqualified contracts", exc)
                 contracts = [c for c in contracts if c is not None]
         else:
             contracts = [c for c in contracts if c is not None]
+            logger.debug("_resolve_contracts: all %d contracts had conIds, skipped qualifyAsync", len(contracts))
 
-        # Last-resort: if we ended up with fewer contracts than legs, use original
-        # unqualified contracts so IB can attempt validation on its end
-        if len(contracts) < len(prepared_legs):
-            resolved_count = len(contracts)
-            missing_legs = prepared_legs[resolved_count:]
-            missing_symbols = [f"{lg.get('symbol')} {lg.get('expiry')} {lg.get('strike')} {lg.get('right')}" for lg in missing_legs]
-            logger.warning(
-                "_resolve_contracts: only %d/%d legs resolved — "
-                "unresolved: %s — using unqualified contracts as fallback",
-                resolved_count, len(prepared_legs), ", ".join(missing_symbols),
+        def _leg_key(leg: dict) -> tuple[str, str, float, str]:
+            return (
+                str(leg.get("symbol") or "").upper(),
+                str(leg.get("expiry") or "").replace("-", "")[:8],
+                round(float(leg.get("strike") or 0.0), 4),
+                str(leg.get("right") or "").upper(),
             )
-            contracts += [self._leg_to_contract(lg) for lg in missing_legs]
 
+        def _contract_key(contract) -> tuple[str, str, float, str]:
+            return (
+                str(getattr(contract, "symbol", "") or "").upper(),
+                str(getattr(contract, "lastTradeDateOrContractMonth", "") or "").replace("-", "")[:8],
+                round(float(getattr(contract, "strike", 0.0) or 0.0), 4),
+                str(getattr(contract, "right", "") or "").upper(),
+            )
+
+        resolved_keys = {_contract_key(c) for c in contracts if c is not None}
+        missing_legs = [lg for lg in prepared_legs if _leg_key(lg) not in resolved_keys]
+
+        # Strict mode: attempt reqContractDetails fallback for each missing leg.
+        if strict and missing_legs:
+            logger.debug("_resolve_contracts strict mode: attempting reqContractDetails fallback for %d legs", 
+                        len(missing_legs))
+            strict_resolved: list = []
+            still_missing: list[dict] = []
+            for leg in missing_legs:
+                resolved = await self._resolve_contract_via_details(leg)
+                if resolved is not None and getattr(resolved, "conId", 0) > 0:
+                    strict_resolved.append(resolved)
+                    logger.debug("_resolve_contracts: strict fallback resolved %s -> conId=%d", 
+                               getattr(resolved, "symbol", "?"), getattr(resolved, "conId", 0))
+                else:
+                    still_missing.append(leg)
+
+            contracts.extend(strict_resolved)
+            missing_legs = still_missing
+
+        # Non-strict mode keeps legacy fallback so IB can still attempt validation.
+        if missing_legs:
+            missing_symbols = [f"{lg.get('symbol')} {lg.get('expiry')} {lg.get('strike')} {lg.get('right')}" 
+                             for lg in missing_legs]
+            logger.warning(
+                "_resolve_contracts: only %d/%d legs resolved — unresolved: %s%s",
+                len(contracts), len(prepared_legs), ", ".join(missing_symbols),
+                " — using unqualified contracts as fallback" if not strict else "",
+            )
+            if not strict:
+                contracts += [self._leg_to_contract(lg) for lg in missing_legs]
+
+        logger.debug("_resolve_contracts: final result %d/%d contracts with conIds > 0", 
+                    sum(1 for c in contracts if getattr(c, "conId", 0) > 0), len(contracts))
         return contracts
+
+    async def _resolve_contract_via_details(self, leg: dict[str, Any]):
+        """Resolve one option/fop leg via reqContractDetails as a strict fallback."""
+        try:
+            lookup_leg = dict(leg)
+            lookup_leg["conid"] = 0
+            contract = self._leg_to_contract(lookup_leg)
+            if getattr(contract, "secType", "") == "FOP":
+                if hasattr(contract, "tradingClass"):
+                    contract.tradingClass = ""
+                if hasattr(contract, "multiplier"):
+                    contract.multiplier = ""
+
+            details = await asyncio.wait_for(self._ib.reqContractDetailsAsync(contract), timeout=10)
+            if not details:
+                return None
+
+            exp_target = str(leg.get("expiry") or "").replace("-", "")[:8]
+            right_target = str(leg.get("right") or "").upper()
+            strike_target = float(leg.get("strike") or 0.0)
+
+            fallback = None
+            for d in details:
+                dc = getattr(d, "contract", None)
+                if dc is None or getattr(dc, "conId", 0) <= 0:
+                    continue
+                fallback = dc
+                dc_exp = str(getattr(dc, "lastTradeDateOrContractMonth", "") or "").replace("-", "")[:8]
+                dc_right = str(getattr(dc, "right", "") or "").upper()
+                dc_strike = float(getattr(dc, "strike", 0.0) or 0.0)
+                if exp_target and dc_exp and not dc_exp.startswith(exp_target):
+                    continue
+                if right_target and dc_right and dc_right != right_target:
+                    continue
+                if strike_target and abs(dc_strike - strike_target) > 0.01:
+                    continue
+                return dc
+            return fallback
+        except Exception:
+            return None
 
     # ── order placement ───────────────────────────────────────────────────
 
@@ -1533,6 +1850,7 @@ class IBEngine(QObject):
 
         try:
             contracts = await self._resolve_contracts(legs)
+            total_quantity, combo_ratios = self._normalize_order_size(legs)
 
             if len(contracts) != len(legs):
                 raise ValueError(
@@ -1544,13 +1862,13 @@ class IBEngine(QObject):
             if order_type == "LIMIT" and limit_price is not None:
                 ib_order = LimitOrder(
                     action=legs[0]["action"],
-                    totalQuantity=int(legs[0].get("qty", 1)),
+                    totalQuantity=total_quantity,
                     lmtPrice=limit_price,
                 )
             else:
                 ib_order = MarketOrder(
                     action=legs[0]["action"],
-                    totalQuantity=int(legs[0].get("qty", 1)),
+                    totalQuantity=total_quantity,
                 )
 
             # For combo orders, add combo legs
@@ -1562,10 +1880,10 @@ class IBEngine(QObject):
                 bag.exchange = contracts[0].exchange or "SMART"
                 bag.currency = "USD"
                 bag.comboLegs = []
-                for i, (c, lg) in enumerate(zip(contracts, legs)):
+                for c, lg, ratio in zip(contracts, legs, combo_ratios):
                     cl = ComboLeg()
                     cl.conId = c.conId
-                    cl.ratio = int(lg.get("qty", 1))
+                    cl.ratio = ratio
                     cl.action = lg["action"]
                     cl.exchange = c.exchange or "SMART"
                     bag.comboLegs.append(cl)
@@ -1628,7 +1946,7 @@ class IBEngine(QObject):
         Uses IB's whatIfOrderAsync() method to properly simulate margin impact.
         Returns margin deltas (init_margin_change, maint_margin_change).
         """
-        contracts = await self._resolve_contracts(legs)
+        contracts = await self._resolve_contracts(legs, strict=True)
         qualified_count = sum(1 for c in contracts if getattr(c, "conId", 0) > 0)
 
         if qualified_count == 0:
@@ -1636,16 +1954,18 @@ class IBEngine(QObject):
         if qualified_count != len(legs):
             return {"error": f"Only {qualified_count}/{len(legs)} leg(s) qualified", "status": "error"}
 
+        total_quantity, combo_ratios = self._normalize_order_size(legs)
+
         if order_type == "LIMIT" and limit_price is not None:
             ib_order = LimitOrder(
                 action=legs[0]["action"],
-                totalQuantity=int(legs[0].get("qty", 1)),
+                totalQuantity=total_quantity,
                 lmtPrice=limit_price,
             )
         else:
             ib_order = MarketOrder(
                 action=legs[0]["action"],
-                totalQuantity=int(legs[0].get("qty", 1)),
+                totalQuantity=total_quantity,
             )
 
         if len(contracts) > 1:
@@ -1656,10 +1976,10 @@ class IBEngine(QObject):
             bag.exchange = getattr(contracts[0], "exchange", None) or "SMART"
             bag.currency = "USD"
             bag.comboLegs = []
-            for c, lg in zip(contracts, legs):
+            for c, lg, ratio in zip(contracts, legs, combo_ratios):
                 cl = ComboLeg()
                 cl.conId = c.conId
-                cl.ratio = int(lg.get("qty", 1))
+                cl.ratio = ratio
                 cl.action = lg["action"]
                 cl.exchange = getattr(c, "exchange", None) or "SMART"
                 bag.comboLegs.append(cl)
@@ -1948,8 +2268,18 @@ class IBEngine(QObject):
             return val
         if not isinstance(val, str):
             val = str(val)
+
+        raw = val.strip()
+        if not raw:
+            return None
+
+        digits = "".join(ch for ch in raw if ch.isdigit())
         try:
-            return date(int(val[:4]), int(val[4:6]), int(val[6:8]))
+            if len(digits) >= 8:
+                return date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+            if len(digits) == 6:
+                return date(int(digits[:4]), int(digits[4:6]), 1)
+            return None
         except (ValueError, IndexError, TypeError):
             return None
 
@@ -1961,6 +2291,32 @@ class IBEngine(QObject):
         elif actions == {"SELL"}:
             return "SELL"
         return "COMBO"
+
+    @staticmethod
+    def _normalize_order_size(legs: list[dict]) -> tuple[int, list[int]]:
+        """Convert leg qtys into IB order quantity + combo leg ratios.
+
+        Example:
+        - [{qty: 5}, {qty: 5}] -> total_quantity=5, ratios=[1, 1]
+        - [{qty: 2}, {qty: 1}] -> total_quantity=1, ratios=[2, 1]
+        """
+        if not legs:
+            return 1, []
+
+        qtys: list[int] = []
+        for leg in legs:
+            try:
+                qtys.append(max(1, int(float(leg.get("qty", 1)))))
+            except Exception:
+                qtys.append(1)
+
+        total_quantity = qtys[0]
+        for qty in qtys[1:]:
+            total_quantity = gcd(total_quantity, qty)
+        total_quantity = max(1, total_quantity)
+
+        ratios = [max(1, qty // total_quantity) for qty in qtys]
+        return total_quantity, ratios
 
     async def _wait_for_fill(self, trade: Trade, timeout: float = 30.0) -> dict[str, Any]:
         """Poll trade status until filled or timeout."""

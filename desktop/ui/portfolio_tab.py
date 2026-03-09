@@ -12,13 +12,17 @@ Two view modes:
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTableView, QHeaderView, QGroupBox, QSplitter,
     QButtonGroup, QRadioButton, QFrame, QComboBox, QCheckBox,
+    QFileDialog,
 )
 from PySide6.QtCore import Qt, Slot, Signal, QPoint
 
@@ -82,6 +86,11 @@ class PortfolioTab(QWidget):
         self._btn_refresh = QPushButton("🔄 Refresh Positions")
         self._btn_refresh.setFixedHeight(32)
         toolbar.addWidget(self._btn_refresh)
+
+        self._btn_export_csv = QPushButton("💾 Export CSV")
+        self._btn_export_json = QPushButton("💾 Export JSON")
+        toolbar.addWidget(self._btn_export_csv)
+        toolbar.addWidget(self._btn_export_json)
 
         # View toggle (Raw | Trades)
         sep = QFrame()
@@ -157,8 +166,9 @@ class PortfolioTab(QWidget):
 
     def set_compact_mode(self, enabled: bool) -> None:
         self._compact_mode = bool(enabled)
-        hidden_columns = {2, 4, 8, 9, 10, 11, 16} if self._compact_mode else set()
-        for col in range(self._table.model().columnCount() if self._table.model() else 18):
+        # Hidden in compact: Underlying(2), AvgCost(4), UndPrice(8), Strike(9), Right(10), Expiry(11), ExpiryDay(12), IV(17)
+        hidden_columns = {2, 4, 8, 9, 10, 11, 12, 17} if self._compact_mode else set()
+        for col in range(self._table.model().columnCount() if self._table.model() else 19):
             self._table.setColumnHidden(col, col in hidden_columns)
 
 
@@ -174,6 +184,8 @@ class PortfolioTab(QWidget):
 
     def _connect_signals(self) -> None:
         self._btn_refresh.clicked.connect(self._on_refresh)
+        self._btn_export_csv.clicked.connect(self._on_export_csv)
+        self._btn_export_json.clicked.connect(self._on_export_json)
         self._engine.positions_updated.connect(self._on_positions_updated)
         self._engine.account_updated.connect(self._on_account_updated)
         self._view_group.idToggled.connect(self._on_view_toggled)
@@ -211,6 +223,200 @@ class PortfolioTab(QWidget):
             self._lbl_status.setText("✅ Updated")
         except Exception as exc:
             self._lbl_status.setText(f"❌ {exc}")
+
+    @Slot()
+    def _on_export_csv(self) -> None:
+        file_path = self._choose_export_path("csv")
+        if not file_path:
+            self._lbl_status.setText("Export cancelled")
+            return
+        loop = asyncio.get_event_loop()
+        loop.create_task(self._async_export("csv", file_path))
+
+    @Slot()
+    def _on_export_json(self) -> None:
+        file_path = self._choose_export_path("json")
+        if not file_path:
+            self._lbl_status.setText("Export cancelled")
+            return
+        loop = asyncio.get_event_loop()
+        loop.create_task(self._async_export("json", file_path))
+
+    async def _async_export(self, fmt: str, file_path: str) -> None:
+        fmt_l = (fmt or "").lower().strip()
+        if fmt_l not in {"csv", "json"}:
+            self._lbl_status.setText("❌ Unsupported export format")
+            return
+
+        self._lbl_status.setText(f"Exporting {fmt_l.upper()}…")
+
+        if not self._raw_positions:
+            try:
+                await self._engine.refresh_positions()
+            except Exception:
+                pass
+
+        if not self._raw_positions:
+            self._lbl_status.setText("⚠️ No portfolio positions to export")
+            return
+
+        try:
+            rows = await self._build_export_records(fetch_missing_quotes=True)
+            if fmt_l == "json":
+                payload = {
+                    "exported_at": datetime.now(timezone.utc).isoformat(),
+                    "account_id": getattr(self._engine, "account_id", ""),
+                    "positions": rows,
+                }
+                self._write_json(file_path, payload)
+            else:
+                self._write_csv(file_path, rows)
+            self._lbl_status.setText(f"✅ Exported {len(rows)} rows")
+        except Exception as exc:
+            self._lbl_status.setText(f"❌ Export failed: {exc}")
+
+    def _choose_export_path(self, fmt: str) -> str:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suffix = "json" if fmt == "json" else "csv"
+        default_name = f"portfolio_export_{ts}.{suffix}"
+        if fmt == "json":
+            filter_text = "JSON Files (*.json);;All Files (*)"
+        else:
+            filter_text = "CSV Files (*.csv);;All Files (*)"
+        selected, _ = QFileDialog.getSaveFileName(self, f"Export Portfolio ({fmt.upper()})", default_name, filter_text)
+        return selected
+
+    async def _build_export_records(self, *, fetch_missing_quotes: bool) -> list[dict[str, object]]:
+        rows = list(self._raw_positions)
+        if fetch_missing_quotes:
+            await self._fetch_missing_symbol_snapshots(rows)
+        return self._serialize_positions_for_export(rows)
+
+    async def _fetch_missing_symbol_snapshots(self, rows: list) -> None:
+        tasks: list[asyncio.Task] = []
+        for row in rows:
+            sec_type = str(getattr(row, "sec_type", "") or "").upper()
+            if sec_type not in {"STK", "FUT", "IND"}:
+                continue
+            symbol = str(getattr(row, "symbol", "") or "").upper()
+            if not symbol:
+                continue
+            cached = self._engine.last_market_snapshot(symbol)
+            if cached and (cached.get("bid") is not None or cached.get("ask") is not None):
+                continue
+            exchange = "CME" if sec_type == "FUT" else ("CBOE" if sec_type == "IND" else "SMART")
+            tasks.append(asyncio.create_task(self._engine.get_market_snapshot(symbol, sec_type=sec_type, exchange=exchange)))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _build_chain_quote_index(self) -> dict[tuple[str, str, float, str], tuple[float | None, float | None]]:
+        index: dict[tuple[str, str, float, str], tuple[float | None, float | None]] = {}
+        for chain_row in list(self._engine.chain_snapshot() or []):
+            underlying = str(getattr(chain_row, "underlying", "") or "").upper()
+            expiry = str(getattr(chain_row, "expiry", "") or "").replace("-", "")
+            strike = getattr(chain_row, "strike", None)
+            right = str(getattr(chain_row, "right", "") or "").upper()
+            if not underlying or not expiry or strike is None or right not in {"C", "P"}:
+                continue
+            bid = getattr(chain_row, "bid", None)
+            ask = getattr(chain_row, "ask", None)
+            try:
+                strike_f = float(strike)
+            except (TypeError, ValueError):
+                continue
+            index[(underlying, expiry, strike_f, right)] = (bid, ask)
+        return index
+
+    def _serialize_positions_for_export(self, rows: list) -> list[dict[str, object]]:
+        chain_quotes = self._build_chain_quote_index()
+        export_rows: list[dict[str, object]] = []
+        as_of = datetime.now(timezone.utc).isoformat()
+
+        for row in rows:
+            symbol = str(getattr(row, "symbol", "") or "")
+            sec_type = str(getattr(row, "sec_type", "") or "")
+            underlying = str(getattr(row, "underlying", "") or "")
+            expiry = str(getattr(row, "expiry", "") or "")
+            strike = getattr(row, "strike", None)
+            right = str(getattr(row, "right", "") or "")
+
+            bid: float | None = None
+            ask: float | None = None
+            bid_ask_source = "none"
+
+            sec_type_u = sec_type.upper()
+            if sec_type_u in {"OPT", "FOP"}:
+                key_underlying = (underlying or symbol).upper()
+                key_expiry = expiry.replace("-", "")
+                key_right = right.upper()
+                try:
+                    key_strike = float(strike) if strike is not None else None
+                except (TypeError, ValueError):
+                    key_strike = None
+                if key_underlying and key_expiry and key_right in {"C", "P"} and key_strike is not None:
+                    quote = chain_quotes.get((key_underlying, key_expiry, key_strike, key_right))
+                    if quote:
+                        bid, ask = quote
+                        bid_ask_source = "chain_snapshot"
+            else:
+                snapshot = self._engine.last_market_snapshot(symbol)
+                if snapshot:
+                    bid = snapshot.get("bid")
+                    ask = snapshot.get("ask")
+                    if bid is not None or ask is not None:
+                        bid_ask_source = "market_snapshot"
+
+            mid = ((float(bid) + float(ask)) / 2.0) if (bid is not None and ask is not None) else (bid or ask)
+            spread = (float(ask) - float(bid)) if (bid is not None and ask is not None) else None
+
+            export_rows.append(
+                {
+                    "as_of": as_of,
+                    "symbol": symbol,
+                    "sec_type": sec_type,
+                    "underlying": underlying,
+                    "expiry": expiry,
+                    "right": right,
+                    "strike": strike,
+                    "quantity": getattr(row, "quantity", None),
+                    "avg_cost": getattr(row, "avg_cost", None),
+                    "market_price": getattr(row, "market_price", None),
+                    "market_value": getattr(row, "market_value", None),
+                    "unrealized_pnl": getattr(row, "unrealized_pnl", None),
+                    "realized_pnl": getattr(row, "realized_pnl", None),
+                    "delta": getattr(row, "delta", None),
+                    "gamma": getattr(row, "gamma", None),
+                    "theta": getattr(row, "theta", None),
+                    "vega": getattr(row, "vega", None),
+                    "iv": getattr(row, "iv", None),
+                    "spx_delta": getattr(row, "spx_delta", None),
+                    "underlying_price": getattr(row, "underlying_price", None),
+                    "greeks_source": getattr(row, "greeks_source", None),
+                    "bid": bid,
+                    "ask": ask,
+                    "mid": mid,
+                    "spread": spread,
+                    "bid_ask_source": bid_ask_source,
+                    "bid_ask_available": (bid is not None or ask is not None),
+                }
+            )
+        return export_rows
+
+    @staticmethod
+    def _write_json(file_path: str, payload: dict[str, object]) -> None:
+        Path(file_path).write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+    @staticmethod
+    def _write_csv(file_path: str, rows: list[dict[str, object]]) -> None:
+        if not rows:
+            Path(file_path).write_text("", encoding="utf-8")
+            return
+        fieldnames = list(rows[0].keys())
+        with Path(file_path).open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
 
     @Slot(list)
     def _on_positions_updated(self, rows: list) -> None:

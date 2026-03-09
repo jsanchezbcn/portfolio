@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections import defaultdict
+from datetime import date
 from typing import Any
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
@@ -18,12 +19,12 @@ from PySide6.QtGui import QBrush, QColor, QFont
 _POS_HEADERS = [
     "Symbol", "Type", "Underlying", "Qty", "Avg Cost",
     "Mkt Price", "Mkt Value", "Unrealized PnL", "Und Price",
-    "Strike", "Right", "Expiry",
+    "Strike", "Right", "Expiry", "Expiry Day",
     "Δ Delta", "Γ Gamma", "Θ Theta", "V Vega", "IV",
     "SPX Δ",
 ]
 # Column indices for the Greeks (used in group row rendering)
-_COL_DELTA, _COL_GAMMA, _COL_THETA, _COL_VEGA, _COL_IV, _COL_SPX = 12, 13, 14, 15, 16, 17
+_COL_DELTA, _COL_GAMMA, _COL_THETA, _COL_VEGA, _COL_IV, _COL_SPX = 13, 14, 15, 16, 17, 18
 
 # Background colour used for expiry-group header rows
 _GROUP_BG  = QColor(30, 50, 80)    # dark blue
@@ -239,12 +240,27 @@ class PositionsTableModel(QAbstractTableModel):
             case 9: return f"{row.strike:,.0f}" if row.strike else ""
             case 10: return row.right or ""
             case 11: return row.expiry or ""
-            case 12: return f"{row.delta:+.4f}" if row.delta is not None else ""
-            case 13: return f"{row.gamma:+.4f}" if row.gamma is not None else ""
-            case 14: return f"{row.theta:+.2f}" if row.theta is not None else ""
-            case 15: return f"{row.vega:+.2f}" if row.vega is not None else ""
-            case 16: return f"{row.iv:.1%}" if row.iv is not None else ""
-            case 17: return f"{row.spx_delta:+.2f}" if row.spx_delta is not None else ""
+            case 12:
+                # Expiry Day - show day of week (Mon, Tue, Wed, etc.)
+                if row.expiry:
+                    try:
+                        # expiry can be a date object or string in YYYY-MM-DD format
+                        if isinstance(row.expiry, date):
+                            exp_date = row.expiry
+                        else:
+                            exp_date = date.fromisoformat(str(row.expiry))
+                        # weekday() returns 0=Mon, 1=Tue, ..., 6=Sun
+                        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                        return day_names[exp_date.weekday()]
+                    except (ValueError, AttributeError, TypeError):
+                        return ""
+                return ""
+            case 13: return f"{row.delta:+.4f}" if row.delta is not None else ""
+            case 14: return f"{row.gamma:+.4f}" if row.gamma is not None else ""
+            case 15: return f"{row.theta:+.2f}" if row.theta is not None else ""
+            case 16: return f"{row.vega:+.2f}" if row.vega is not None else ""
+            case 17: return f"{row.iv:.1%}" if row.iv is not None else ""
+            case 18: return f"{row.spx_delta:+.2f}" if row.spx_delta is not None else ""
             case _: return ""
 
 
@@ -266,6 +282,33 @@ class ChainTableModel(QAbstractTableModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._rows: list[tuple] = []  # (ChainRow|None, float, ChainRow|None)
+        self._underlying_price: float | None = None
+        self._underlying_row_idx: int | None = None
+
+    def set_underlying_price(self, price: float | None) -> None:
+        self._underlying_price = float(price) if isinstance(price, (int, float)) else None
+        self._recompute_underlying_row_idx()
+        if self.rowCount() > 0 and self.columnCount() > 0:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(self.rowCount() - 1, self.columnCount() - 1),
+                [
+                    Qt.ItemDataRole.BackgroundRole,
+                    Qt.ItemDataRole.ForegroundRole,
+                    Qt.ItemDataRole.FontRole,
+                    Qt.ItemDataRole.ToolTipRole,
+                ],
+            )
+
+    def _recompute_underlying_row_idx(self) -> None:
+        if self._underlying_price is None or not self._rows:
+            self._underlying_row_idx = None
+            return
+        underlying_price = float(self._underlying_price)
+        self._underlying_row_idx = min(
+            range(len(self._rows)),
+            key=lambda idx: abs(float(self._rows[idx][1]) - underlying_price),
+        )
 
     def set_data(self, chain_rows: list) -> None:
         """Organize flat ChainRow list into call/put pairs per strike."""
@@ -283,6 +326,7 @@ class ChainTableModel(QAbstractTableModel):
             (by_strike[s]["C"], s, by_strike[s]["P"])
             for s in sorted(by_strike.keys())
         ]
+        self._recompute_underlying_row_idx()
         self.endResetModel()
 
     def rowCount(self, parent=QModelIndex()) -> int:
@@ -297,12 +341,31 @@ class ChainTableModel(QAbstractTableModel):
         return None
 
     def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
+        if not index.isValid():
             return None
         call, strike, put = self._rows[index.row()]
         col = index.column()
         n_call = len(_CHAIN_CALL_HEADERS)
         n_center = len(_CHAIN_CENTER)
+
+        is_underlying_row = self._underlying_row_idx is not None and index.row() == self._underlying_row_idx
+
+        if role == Qt.ItemDataRole.BackgroundRole and is_underlying_row:
+            return QBrush(QColor(120, 20, 20, 110))
+
+        if role == Qt.ItemDataRole.ForegroundRole and col == n_call and is_underlying_row:
+            return QBrush(QColor(255, 90, 90))
+
+        if role == Qt.ItemDataRole.FontRole and col == n_call and is_underlying_row:
+            font = QFont()
+            font.setBold(True)
+            return font
+
+        if role == Qt.ItemDataRole.ToolTipRole and is_underlying_row and self._underlying_price is not None:
+            return f"Underlying: {self._underlying_price:,.2f} · nearest strike: {strike:,.0f}"
+
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
 
         if col < n_call:
             return self._format_chain_cell(call, col, is_call=True)

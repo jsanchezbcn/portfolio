@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import date
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -14,8 +16,8 @@ async def test_get_available_expiries_uses_secdef_chain():
     engine = IBEngine()
     engine._ib = MagicMock()
 
-    engine._qualify_underlying = AsyncMock(
-        return_value=SimpleNamespace(symbol="ES", secType="FUT", conId=123)
+    engine._get_active_fop_underlyings = AsyncMock(
+        return_value=[SimpleNamespace(symbol="ES", secType="FUT", conId=123, lastTradeDateOrContractMonth="20260320")]
     )
 
     chain = SimpleNamespace(exchange="CME", expirations=["20270116", "20270320"])
@@ -31,8 +33,8 @@ async def test_get_available_expiries_falls_back_to_contract_details_on_timeout(
     engine = IBEngine()
     engine._ib = MagicMock()
 
-    engine._qualify_underlying = AsyncMock(
-        return_value=SimpleNamespace(symbol="ES", secType="FUT", conId=123)
+    engine._get_active_fop_underlyings = AsyncMock(
+        return_value=[SimpleNamespace(symbol="ES", secType="FUT", conId=123, lastTradeDateOrContractMonth="20260320")]
     )
 
     engine._ib.reqSecDefOptParamsAsync = AsyncMock(side_effect=asyncio.TimeoutError())
@@ -46,6 +48,83 @@ async def test_get_available_expiries_falls_back_to_contract_details_on_timeout(
     expiries = await engine.get_available_expiries("ES", sec_type="FOP", exchange="CME")
 
     assert expiries == ["20270116", "20270219"]
+
+
+@pytest.mark.asyncio
+async def test_get_available_expiries_combines_next_two_futures_months():
+    engine = IBEngine()
+    engine._ib = MagicMock()
+
+    front = SimpleNamespace(symbol="ES", secType="FUT", conId=101, lastTradeDateOrContractMonth="20260320")
+    next_month = SimpleNamespace(symbol="ES", secType="FUT", conId=202, lastTradeDateOrContractMonth="20260619")
+    engine._get_active_fop_underlyings = AsyncMock(return_value=[front, next_month])
+
+    async def _secdef(symbol, fut_fop_exchange, sec_type, conid):
+        if conid == 101:
+            return [SimpleNamespace(exchange="CME", expirations=["20260309", "20260320"])]
+        if conid == 202:
+            return [SimpleNamespace(exchange="CME", expirations=["20260430", "20260529", "20260619"])]
+        return []
+
+    engine._ib.reqSecDefOptParamsAsync = AsyncMock(side_effect=_secdef)
+
+    expiries = await engine.get_available_expiries("ES", sec_type="FOP", exchange="CME")
+
+    assert expiries == ["20260309", "20260320", "20260430", "20260529", "20260619"]
+
+
+@pytest.mark.asyncio
+async def test_get_chain_uses_future_month_that_contains_selected_expiry():
+    engine = IBEngine()
+    engine._ib = MagicMock()
+    engine.cancel_chain_streaming = MagicMock()
+
+    front = SimpleNamespace(symbol="ES", secType="FUT", conId=101, lastTradeDateOrContractMonth="20260320")
+    next_month = SimpleNamespace(symbol="ES", secType="FUT", conId=202, lastTradeDateOrContractMonth="20260619")
+    engine._get_active_fop_underlyings = AsyncMock(return_value=[front, next_month])
+
+    async def _secdef(symbol, fut_fop_exchange, sec_type, conid):
+        if conid == 101:
+            return [SimpleNamespace(exchange="CME", expirations=["20260320"], strikes=[6700.0])]
+        if conid == 202:
+            return [SimpleNamespace(exchange="CME", expirations=["20260430"], strikes=[6800.0])]
+        return []
+
+    engine._ib.reqSecDefOptParamsAsync = AsyncMock(side_effect=_secdef)
+    engine._ib.qualifyContractsAsync = AsyncMock(
+        side_effect=lambda *contracts: [
+            SimpleNamespace(
+                conId=index + 1,
+                symbol=c.symbol,
+                lastTradeDateOrContractMonth=c.lastTradeDateOrContractMonth,
+                strike=c.strike,
+                right=c.right,
+                exchange=c.exchange,
+            )
+            for index, c in enumerate(contracts)
+        ]
+    )
+    engine._ib.reqMktData = MagicMock(
+        return_value=SimpleNamespace(
+            last=6793.75,
+            close=6793.75,
+            bid=10.0,
+            ask=11.0,
+            volume=1,
+            openInterest=2,
+        )
+    )
+
+    rows = await engine.get_chain(
+        "ES",
+        expiry=date(2026, 4, 30),
+        sec_type="FOP",
+        exchange="CME",
+        max_strikes=1,
+    )
+
+    assert rows
+    assert all(row.expiry == "20260430" for row in rows)
 
 
 @pytest.mark.asyncio
@@ -96,7 +175,7 @@ async def test_fallback_fop_contracts_for_expiry_returns_contracts():
         exchange="CME",
         expiry_str="20260320",
         max_strikes=10,
-        und_contract=SimpleNamespace(conId=0),
+        und_contract=cast(Any, SimpleNamespace(conId=0)),
     )
 
     assert len(contracts) == 3

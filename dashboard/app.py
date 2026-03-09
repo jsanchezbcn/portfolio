@@ -72,11 +72,11 @@ def _snapshot_loop(
     Threading (not asyncio) survives Streamlit reruns.
     Errors are logged but never crash the thread.
     """
-    from database.local_store import LocalStore
+    from database.business_store import PostgresBusinessStore
     from models.order import AccountSnapshot
     from agent_tools.market_data_tools import MarketDataTools as _MDT
 
-    store = LocalStore()
+    store = PostgresBusinessStore()
     logger = logging.getLogger(__name__ + ".snapshot_loop")
 
     while True:
@@ -918,7 +918,7 @@ def _capture_snapshot_from_summary(
     adapter: Any,
 ) -> None:
     try:
-        from database.local_store import LocalStore
+        from database.business_store import PostgresBusinessStore
         from models.order import AccountSnapshot
 
         net_liq = None
@@ -955,7 +955,7 @@ def _capture_snapshot_from_summary(
             spx_price=spx_price,
             regime=getattr(regime, "name", str(regime)),
         )
-        _run_async(LocalStore().capture_snapshot(snap))
+        _run_async(PostgresBusinessStore().capture_snapshot(snap))
     except Exception as exc:
         LOGGER.debug("Foreground snapshot capture skipped: %s", exc)
 
@@ -980,26 +980,17 @@ def _get_available_models() -> list[dict]:
 
 @st.cache_data(ttl=60)
 def _fetch_market_intel_cached() -> list[dict]:
-    """Fetch recent market_intel rows from the DB (cached 60 s).
-
-    Tries PostgreSQL (DBManager) first; falls back to local SQLite (LocalStore).
-    """
+    """Fetch recent market_intel rows from the shared Postgres store (cached 60 s)."""
     import concurrent.futures
 
     async def _fetch():
         try:
-            from database.db_manager import DBManager
-            db = DBManager()
+            from database.business_store import PostgresBusinessStore
+            db = PostgresBusinessStore()
             await db.connect()
             return await db.get_recent_market_intel(limit=20)
         except Exception as exc:
-            LOGGER.debug("PostgreSQL market_intel unavailable (%s), using LocalStore", exc)
-        try:
-            from database.local_store import LocalStore
-            db = LocalStore()
-            return await db.get_recent_market_intel(limit=20)
-        except Exception as exc2:
-            LOGGER.debug("LocalStore market_intel also failed: %s", exc2)
+            LOGGER.debug("Postgres market_intel unavailable: %s", exc)
             return []
 
     try:
@@ -1039,24 +1030,15 @@ def _fetch_llm_intel_cached(source: str, symbol: str | None = None) -> dict | No
     import concurrent.futures
 
     async def _fetch():
-        row = None
         try:
-            from database.db_manager import DBManager
-            db = DBManager()
+            from database.business_store import PostgresBusinessStore
+            db = PostgresBusinessStore()
             await db.connect()
             rows = await db.get_market_intel_by_source(source, symbol=symbol, limit=1)
-            row = rows[0] if rows else None
+            return rows[0] if rows else None
         except Exception as exc:
-            LOGGER.debug("PostgreSQL llm_intel unavailable (%s), using LocalStore", exc)
-        if row is None:
-            try:
-                from database.local_store import LocalStore
-                db = LocalStore()
-                rows = await db.get_market_intel_by_source(source, symbol=symbol, limit=1)
-                row = rows[0] if rows else None
-            except Exception as exc2:
-                LOGGER.debug("LocalStore llm_intel also failed: %s", exc2)
-        return row
+            LOGGER.debug("Postgres llm_intel unavailable (source=%s): %s", source, exc)
+            return None
 
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -1735,7 +1717,7 @@ def render_portfolio_content() -> None:
     summary = portfolio_tools.get_portfolio_summary(positions)
     violations = portfolio_tools.check_risk_limits(summary, regime)
 
-    # Persist live summary into LocalStore on UI refresh cadence so charts/DB stay current.
+    # Persist live summary into the shared Postgres store on UI refresh cadence.
     _now_ts = time.time()
     _last_snapshot_ui_ts = float(st.session_state.get("_snapshot_ui_capture_ts", 0.0) or 0.0)
     if (_now_ts - _last_snapshot_ui_ts) >= float(max(5, PORTFOLIO_REFRESH_SECONDS)):
@@ -1862,10 +1844,10 @@ def render_portfolio_content() -> None:
     # ── Build ExecutionEngine once (available to fragment + sections 3-7) ─────
     try:
         from core.execution import ExecutionEngine
-        from database.local_store import LocalStore as _LS
+        from database.business_store import PostgresBusinessStore as _PBS
         _exec_engine = ExecutionEngine(
             ibkr_gateway_client=adapter.client,
-            local_store=_LS(),
+            local_store=_PBS(),
             beta_weighter=adapter._beta_weighter,
         )
     except Exception as _ee_exc:
@@ -2170,8 +2152,8 @@ def render_portfolio_content() -> None:
     # Trade Journal
     try:
         from dashboard.components.trade_journal_view import render_trade_journal
-        from database.local_store import LocalStore as _LSJ
-        render_trade_journal(_LSJ())
+        from database.business_store import PostgresBusinessStore as _PBSJ
+        render_trade_journal(_PBSJ())
     except Exception as _tj_exc:
         LOGGER.warning("Trade journal panel failed: %s", _tj_exc)
 
@@ -2313,8 +2295,8 @@ def render_portfolio_content() -> None:
     # Historical Charts
     try:
         from dashboard.components.historical_charts import render_historical_charts
-        from database.local_store import LocalStore as _LSH
-        render_historical_charts(_LSH())
+        from database.business_store import PostgresBusinessStore as _PBSH
+        render_historical_charts(_PBSH())
     except Exception as _hc_exc:
         LOGGER.warning("Historical charts failed: %s", _hc_exc)
 
