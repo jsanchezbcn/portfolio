@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from math import gcd
@@ -36,6 +37,7 @@ from PySide6.QtCore import QObject, Signal
 
 from desktop.db.database import Database
 from desktop.engine.greeks_engine import GreeksEngine
+from desktop.models.strategy_reconstructor import StrategyGroup, StrategyReconstructor
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +89,7 @@ class PositionRow:
     spx_delta: float | None
     greeks_source: str | None = None
     underlying_price: float | None = None
+    combo_description: str | None = None
 
 
 @dataclass
@@ -211,6 +214,7 @@ class IBEngine(QObject):
         self._manual_disconnect_requested = False
         self._reconnect_task: asyncio.Task | None = None
         self._reconnect_lock = asyncio.Lock()
+        self._refresh_positions_lock = asyncio.Lock()
         self._watchdog_max_attempts = max(1, int(os.getenv("IB_RECONNECT_MAX_ATTEMPTS", "5")))
         self._watchdog_backoff_cap = max(5, int(os.getenv("IB_RECONNECT_BACKOFF_CAP_SECONDS", "120")))
         self._resolve_warning_ttl = max(5.0, float(os.getenv("IB_RESOLVE_WARNING_TTL_SECONDS", "60")))
@@ -219,6 +223,8 @@ class IBEngine(QObject):
         self._beta_default = 1.0
         self._symbol_betas: dict[str, float] = {}
         self._greeks_engine = GreeksEngine(risk_free_rate=float(os.getenv("IB_LOCAL_GREEKS_RISK_FREE_RATE", "0.01")))
+        # IMPORTANT: default to IBKR greeks only. Local BSM estimation is opt-in.
+        self._enable_local_greeks = os.getenv("IB_ENABLE_LOCAL_GREEKS", "0").strip().lower() in {"1", "true", "yes", "on"}
         self._load_beta_config()
         # ── Option chain caches (keyed by "underlying|expiry|sec_type|exchange") ──
         # _expiry_cache: TTL 604800s (1 week) for available expirations.  Cleared on reconnect.
@@ -233,6 +239,7 @@ class IBEngine(QObject):
         # ── Positions snapshot (refreshed on every portfolio update) ──
         # Used to supplement chain expiry picker with expiries from live positions
         self._positions_snapshot: list = []
+        self._strategy_snapshot: list[StrategyGroup] = []
         # ── Latest account summary + market snapshots for agent workers ──
         self._last_account_summary = None
         self._market_snapshots: dict[str, dict] = {}
@@ -244,6 +251,14 @@ class IBEngine(QObject):
         # fail to get live data (e.g. stock options, pre/post market) still
         # show sensible values rather than going blank.
         self._greeks_cache: dict[int, dict] = {}
+        # Additional signature-keyed cache for cases where conId is missing/unstable.
+        self._greeks_cache_by_contract: dict[tuple[str, str, float, str, str], dict[str, float | None]] = {}
+        # Monotonic timestamp of the last *live* option greek fetch cycle.
+        # Used to avoid re-requesting all option greeks too frequently.
+        self._last_live_greeks_refresh_monotonic: float | None = None
+        # Track active option greek streaming subscriptions so they can be
+        # force-cancelled on disconnect/reconnect and never accumulate.
+        self._greek_tickers: dict[int, Any] = {}
         
         # ── Track last data source for UI status indicators ──
         self._last_expiry_source: str = "unknown"  # "live", "memory", "database", or "unknown"
@@ -265,14 +280,6 @@ class IBEngine(QObject):
             await self._db.connect()
             self._db_ok = True
             logger.info("Database connected")
-            # Load last known Greeks from database for after-hours display
-            try:
-                cached_greeks = await self._db.get_cached_greeks(self._account_id or "U2052408")
-                self._greeks_cache.update(cached_greeks)
-                if cached_greeks:
-                    logger.info("Loaded %d cached Greeks from database", len(cached_greeks))
-            except Exception as exc:
-                logger.debug("Failed to load cached Greeks: %s", exc)
         except Exception as exc:
             self._db_ok = False
             logger.warning("Database unavailable (continuing without): %s", exc)
@@ -282,16 +289,10 @@ class IBEngine(QObject):
         accounts = self._ib.managedAccounts()
         self._account_id = accounts[0] if accounts else ""
         
-        # Reload Greeks cache with the correct account_id
-        if self._db_ok and self._account_id:
-            try:
-                cached_greeks = await self._db.get_cached_greeks(self._account_id)
-                self._greeks_cache.clear()
-                self._greeks_cache.update(cached_greeks)
-                if cached_greeks:
-                    logger.info("Loaded %d cached Greeks from database for account %s", len(cached_greeks), self._account_id)
-            except Exception as exc:
-                logger.debug("Failed to reload cached Greeks after account discovery: %s", exc)
+        # IBKR-only greeks mode: do not preload any DB greek cache for portfolio calculations.
+        self._greeks_cache.clear()
+        self._greeks_cache_by_contract.clear()
+        self._last_live_greeks_refresh_monotonic = None
         
         logger.info("IB connected — account %s", self._account_id)
         self.connection_state.emit("connected", f"Connected to {self._account_id}")
@@ -311,6 +312,7 @@ class IBEngine(QObject):
                 pass
         if hasattr(self, "_chain_tickers"):
             self._chain_tickers.clear()
+        self._cancel_greek_streaming()
         # ── Cancel any pending reqSecDefOptParams / reqContractDetails ───
         # ib_async tracks these internally; calling cancelSecDefOptParams is
         # not needed — just let the IB object handle cleanup on disconnect.
@@ -348,6 +350,10 @@ class IBEngine(QObject):
         """Return the latest cached positions list (may be empty before first refresh)."""
         return list(self._positions_snapshot)
 
+    def strategy_snapshot(self) -> list[StrategyGroup]:
+        """Return the latest reconstructed strategy groups."""
+        return list(self._strategy_snapshot)
+
     def account_snapshot(self) -> "AccountSummary | None":
         """Return the last fetched AccountSummary, or None if not yet available."""
         return getattr(self, "_last_account_summary", None)
@@ -376,12 +382,31 @@ class IBEngine(QObject):
             return cached
         snap = (getattr(self, "_market_snapshots", {}) or {}).get(sym)
         if snap:
-            p = snap.get("last") or snap.get("bid") or snap.get("close")
+            p = snap.get("last") or snap.get("bid") or snap.get("ask") or snap.get("close")
             if p and float(p) > 0:
                 return float(p)
         return None
 
     # ── helpers ───────────────────────────────────────────────────────────
+
+    def _register_greek_ticker(self, contract: Any, ticker: Any) -> None:
+        conid = int(getattr(contract, "conId", 0) or 0)
+        if conid > 0:
+            self._greek_tickers[conid] = (contract, ticker)
+
+    def _forget_greek_ticker(self, contract: Any) -> None:
+        conid = int(getattr(contract, "conId", 0) or 0)
+        if conid > 0:
+            self._greek_tickers.pop(conid, None)
+
+    def _cancel_greek_streaming(self) -> None:
+        """Cancel any active option-greek streaming subscriptions."""
+        for _conid, (contract, _ticker) in list(self._greek_tickers.items()):
+            try:
+                self._ib.cancelMktData(contract)
+            except Exception:
+                pass
+        self._greek_tickers.clear()
 
     async def _qualify_underlying(self, symbol: str, sec_type: str, exchange: str) -> Contract:
         """Resolve an underlying contract, handling ambiguous FUT via reqContractDetails."""
@@ -390,8 +415,22 @@ class IBEngine(QObject):
             details = await self._ib.reqContractDetailsAsync(und)
             if not details:
                 raise ValueError(f"No contract details for {symbol} FUT {exchange}")
-            details.sort(key=lambda d: d.contract.lastTradeDateOrContractMonth)
-            return details[0].contract
+            today = date.today()
+            ordered = sorted(
+                details,
+                key=lambda d: (
+                    self._parse_expiry(getattr(getattr(d, "contract", None), "lastTradeDateOrContractMonth", None)) or date.max,
+                    str(getattr(getattr(d, "contract", None), "lastTradeDateOrContractMonth", "") or ""),
+                ),
+            )
+            for d in ordered:
+                c = getattr(d, "contract", None)
+                if not c:
+                    continue
+                expiry = self._parse_expiry(getattr(c, "lastTradeDateOrContractMonth", None))
+                if expiry is None or expiry >= today:
+                    return c
+            return ordered[0].contract
         else:
             if symbol.upper() in ("SPX", "RUT", "VIX", "NDX"):
                 from ib_async import Index
@@ -448,318 +487,578 @@ class IBEngine(QObject):
 
         Uses reqPnLSingle for per-position P&L and reqMktData snapshots for Greeks.
         """
-        ib_positions = self._ib.positions()
-        rows: list[dict[str, Any]] = []
-        result: list[PositionRow] = []
-        spx_proxy_price = await self._spx_proxy_price_async()
+        async with self._refresh_positions_lock:
+            ib_positions = self._ib.positions()
+            rows: list[dict[str, Any]] = []
+            result: list[PositionRow] = []
+            spx_proxy_price = await self._spx_proxy_price_async()
+            if spx_proxy_price and float(spx_proxy_price) > 0:
+                self._last_spx_proxy_price = float(spx_proxy_price)
 
-        # Gather dynamic betas
-        unique_stocks = {p.contract.symbol for p in ib_positions if p.contract.secType in ("STK", "OPT", "FOP", "FUT")}
-        await asyncio.gather(*[self._fetch_dynamic_beta(s) for s in unique_stocks])
+            # Gather dynamic betas
+            unique_stocks = {p.contract.symbol for p in ib_positions if p.contract.secType in ("STK", "OPT", "FOP", "FUT")}
+            await asyncio.gather(*[self._fetch_dynamic_beta(s) for s in unique_stocks])
 
-        # ── Step 1: Request portfolio PnL to get unrealized/realized PnL per contract
-        portfolio_items = self._ib.portfolio(self._account_id) if self._account_id else []
-        pnl_by_conid: dict[int, dict] = {}
-        for item in portfolio_items:
-            pnl_by_conid[item.contract.conId] = {
-                "market_price": float(item.marketPrice),
-                "market_value": float(item.marketValue),
-                "unrealized_pnl": float(item.unrealizedPNL),
-                "realized_pnl": float(item.realizedPNL),
-                "avg_cost": float(item.averageCost),
-            }
+            # ── Step 1: Request portfolio PnL to get unrealized/realized PnL per contract
+            portfolio_items = self._ib.portfolio(self._account_id) if self._account_id else []
+            pnl_by_conid: dict[int, dict] = {}
+            for item in portfolio_items:
+                pnl_by_conid[item.contract.conId] = {
+                    "market_price": float(item.marketPrice),
+                    "market_value": float(item.marketValue),
+                    "unrealized_pnl": float(item.unrealizedPNL),
+                    "realized_pnl": float(item.realizedPNL),
+                    "avg_cost": float(item.averageCost),
+                }
 
-        # ── Step 1b: Fix missing exchange on ALL positions
-        for pos in ib_positions:
-            c = pos.contract
-            if not c.exchange:
-                c.exchange = self._infer_exchange(c)
+            # ── Step 1b: Fix missing exchange on ALL positions
+            for pos in ib_positions:
+                c = pos.contract
+                if not c.exchange:
+                    c.exchange = self._infer_exchange(c)
 
-        # ── Step 2: Request Greeks for option positions via batched streaming
-        option_positions = [
-            p for p in ib_positions
-            if p.contract.secType in ("OPT", "FOP")
-        ]
-        option_greeks_by_conid: dict[int, dict[str, float | None]] = {}
-        greeks_generic_ticks = os.getenv("IB_GREEKS_GENERIC_TICKS", "100,101,104,106")
-        batch_size = max(5, int(os.getenv("IB_GREEKS_BATCH_SIZE", "40")))
-        batch_wait_s = max(0.5, float(os.getenv("IB_GREEKS_BATCH_WAIT_SECONDS", "1.8")))
-        retry_batch_size = max(5, int(os.getenv("IB_GREEKS_RETRY_BATCH_SIZE", "20")))
-        retry_wait_s = max(0.5, float(os.getenv("IB_GREEKS_RETRY_WAIT_SECONDS", "1.2")))
-        retry_max_contracts = max(0, int(os.getenv("IB_GREEKS_RETRY_MAX_CONTRACTS", "120")))
+            # ── Step 2: Request Greeks for option positions via batched streaming
+            option_positions = [
+                p for p in ib_positions
+                if p.contract.secType in ("OPT", "FOP")
+            ]
+            option_greeks_by_conid: dict[int, dict[str, float | None]] = {}
 
-        async def collect_batch(batch_positions: list[Any], wait_s: float) -> dict[int, dict[str, float | None]]:
-            batch_greeks: dict[int, dict[str, float | None]] = {}
-            active_tickers: list[tuple[Any, Any]] = []
-            for batch_pos in batch_positions:
-                contract = batch_pos.contract
+            # Ensure we have underlying prices available for local BSM greek estimation.
+            option_underlyings: dict[str, str] = {}
+            for p in option_positions:
+                sym = str(getattr(p.contract, "symbol", "") or "").upper()
+                if not sym:
+                    continue
+                if getattr(p.contract, "secType", "") == "FOP":
+                    option_underlyings[sym] = "FUT"
+                else:
+                    option_underlyings.setdefault(sym, "STK")
+
+            async def _prefetch_underlying_price(sym: str, und_sec_type: str) -> None:
+                if self.last_price(sym):
+                    return
                 try:
-                    ticker = self._ib.reqMktData(
-                        contract,
-                        genericTickList=greeks_generic_ticks,
-                        snapshot=False,
-                        regulatorySnapshot=False,
+                    snap = await self.get_market_snapshot(
+                        sym,
+                        sec_type=und_sec_type,
+                        exchange="CME" if und_sec_type == "FUT" else "SMART",
                     )
-                    active_tickers.append((contract, ticker))
-                except Exception as exc:
-                    logger.debug("Greeks request failed for %s: %s", contract.localSymbol, exc)
-
-            if active_tickers:
-                await asyncio.sleep(wait_s)
-
-            for contract, ticker in active_tickers:
-                g = self._extract_option_greeks_from_ticker(ticker)
-                batch_greeks[contract.conId] = g
-                # Persist non-empty Greeks to the long-lived cache
-                if any(v is not None for v in (g.get("delta"), g.get("gamma"), g.get("theta"), g.get("vega"))):
-                    self._greeks_cache[contract.conId] = g
-                try:
-                    self._ib.cancelMktData(contract)
+                    best = snap.last or snap.bid or snap.ask or snap.close
+                    if best and best > 0:
+                        self._last_price_cache[sym] = float(best)
                 except Exception:
                     pass
 
-            return batch_greeks
+            if option_underlyings:
+                await asyncio.gather(*[
+                    _prefetch_underlying_price(sym, und_type)
+                    for sym, und_type in option_underlyings.items()
+                ])
 
-        for start in range(0, len(option_positions), batch_size):
-            batch = option_positions[start:start + batch_size]
-            option_greeks_by_conid.update(await collect_batch(batch, batch_wait_s))
-
-        # Retry only options with no populated greek fields (common when data arrives late).
-        missing_positions = [
-            p for p in option_positions
-            if not any((option_greeks_by_conid.get(p.contract.conId, {}) or {}).get(k) is not None for k in ("delta", "gamma", "theta", "vega", "iv"))
-        ]
-        if missing_positions:
-            missing_positions.sort(key=lambda p: abs(float(getattr(p, "position", 0.0))), reverse=True)
-            if retry_max_contracts > 0:
-                missing_positions = missing_positions[:retry_max_contracts]
-            logger.info("Retrying Greeks for %d/%d option positions", len(missing_positions), len(option_positions))
-            for start in range(0, len(missing_positions), retry_batch_size):
-                retry_batch = missing_positions[start:start + retry_batch_size]
-                option_greeks_by_conid.update(await collect_batch(retry_batch, retry_wait_s))
-            remaining_missing_positions = [
-                p for p in missing_positions
-                if not any((option_greeks_by_conid.get(p.contract.conId, {}) or {}).get(k) is not None for k in ("delta", "gamma", "theta", "vega", "iv"))
-            ]
-            resolved_after_retry = len(missing_positions) - len(remaining_missing_positions)
-            logger.info(
-                "Greeks retry complete: resolved %d/%d previously-missing option positions",
-                resolved_after_retry,
-                len(missing_positions),
-            )
-            if remaining_missing_positions:
-                sample = ", ".join(
-                    f"{getattr(p.contract, 'symbol', '?')} {getattr(p.contract, 'lastTradeDateOrContractMonth', '')} "
-                    f"{float(getattr(p.contract, 'strike', 0.0) or 0.0):.1f} {getattr(p.contract, 'right', '')}"
-                    for p in remaining_missing_positions[:12]
+            def _option_signature(contract: Any) -> tuple[str, str, float, str, str]:
+                expiry_raw = str(getattr(contract, "lastTradeDateOrContractMonth", "") or "").replace("-", "")[:8]
+                return (
+                    str(getattr(contract, "symbol", "") or "").upper(),
+                    expiry_raw,
+                    round(float(getattr(contract, "strike", 0.0) or 0.0), 4),
+                    str(getattr(contract, "right", "") or "").upper(),
+                    str(getattr(contract, "secType", "") or "").upper(),
                 )
-                logger.warning(
-                    "Greeks still missing after retry for %d positions: %s%s",
-                    len(remaining_missing_positions),
-                    sample,
-                    " …" if len(remaining_missing_positions) > 12 else "",
-                )
+            greeks_generic_ticks = os.getenv("IB_GREEKS_GENERIC_TICKS", "100,101,104,106")
+            batch_size = max(5, int(os.getenv("IB_GREEKS_BATCH_SIZE", "40")))
+            batch_wait_s = max(0.5, float(os.getenv("IB_GREEKS_BATCH_WAIT_SECONDS", "1.8")))
+            retry_batch_size = max(5, int(os.getenv("IB_GREEKS_RETRY_BATCH_SIZE", "20")))
+            retry_wait_s = max(0.5, float(os.getenv("IB_GREEKS_RETRY_WAIT_SECONDS", "1.2")))
+            retry_max_contracts = max(0, int(os.getenv("IB_GREEKS_RETRY_MAX_CONTRACTS", "0")))
+            greeks_refresh_seconds = max(10.0, float(os.getenv("IB_GREEKS_REFRESH_SECONDS", "60")))
 
-        # ── Step 3: Build PositionRow with PnL + Greeks
-        for pos in ib_positions:
-            c = pos.contract
-            pnl = pnl_by_conid.get(c.conId, {})
-            # Prefer live greeks; fall back to last known non-empty greeks when live is empty
-            live_g = option_greeks_by_conid.get(c.conId, {})
-            greeks_source: str | None = None
-            if not any(live_g.get(k) is not None for k in ("delta", "gamma", "theta", "vega")) and c.conId in self._greeks_cache:
-                ticker_greeks = {**self._greeks_cache[c.conId], **{k: v for k, v in live_g.items() if v is not None}}
-                greeks_source = "cached"
-            else:
-                ticker_greeks = live_g
-                if any(live_g.get(k) is not None for k in ("delta", "gamma", "theta", "vega")):
-                    greeks_source = "live"
-
-            if c.secType in ("OPT", "FOP"):
-                estimated = self._estimate_option_greeks(contract=c, ticker_greeks=ticker_greeks)
-                if estimated and not any(ticker_greeks.get(k) is not None for k in ("delta", "gamma", "theta", "vega")):
-                    ticker_greeks = {**ticker_greeks, **estimated}
-                    greeks_source = str(estimated.get("source") or "estimated_bsm")
-
-            mkt_price = pnl.get("market_price", 0.0)
-            mkt_value = pnl.get("market_value", 0.0)
-            upnl = pnl.get("unrealized_pnl", 0.0)
-            rpnl = pnl.get("realized_pnl", 0.0)
-
-            delta = ticker_greeks.get("delta")
-            gamma = ticker_greeks.get("gamma")
-            theta = ticker_greeks.get("theta")
-            vega = ticker_greeks.get("vega")
-            iv = ticker_greeks.get("iv")
-
-            if c.secType in ("OPT", "FOP"):
-                mult = float(c.multiplier or 1)
-                qty = float(pos.position)
-                if delta is not None:
-                    delta = delta * qty * mult
-                if gamma is not None:
-                    gamma = gamma * qty * mult
-                if theta is not None:
-                    theta = theta * qty * mult
-                if vega is not None:
-                    vega = vega * qty * mult
-
-            if c.secType == "STK":
-                ref_price = (
-                    float(mkt_price or 0.0)
-                    or float(pos.avgCost or 0.0)
-                    or float(getattr(c, "lastTradePrice", 0.0) or 0.0)
-                )
-                spx_delta = self._compute_spx_weighted_delta(
-                    symbol=c.symbol,
-                    quantity=float(pos.position),
-                    price=ref_price,
-                    underlying_delta=1.0,
-                    multiplier=1.0,
-                    spx_proxy_price=spx_proxy_price,
-                ) if ref_price > 0 else None
-                delta = spx_delta
-            elif c.secType == "FUT":
-                # Futures have delta=1 per contract; SPX delta = qty × SPX-multiplier.
-                # Use lookup table for index futures; unknown symbols get 0 (non-SPX).
-                qty = float(pos.position)
-                raw_mult = float(c.multiplier or 1)
-                spx_mult = _FUT_SPX_MULTIPLIERS.get(c.symbol, 0.0)
-                delta = qty * raw_mult   # dollar-delta: moves $raw_mult per index point
-                spx_delta = qty * spx_mult if spx_mult else None
-            elif c.secType in ("OPT", "FOP"):
-                und_price = ticker_greeks.get("undPrice")
-                raw_delta = ticker_greeks.get("delta")
-                qty = float(pos.position)
-                raw_mult = float(c.multiplier or 100)
-                # For index-correlated underlyings (ES, MES, SPX, SPXW …) the
-                # delta is already in SPX-equivalent units: Δ × qty × multiplier.
-                # DO NOT apply the beta×(price/spx_proxy) normalisation used for
-                # individual stocks — that would double-scale the index exposure.
-                _INDEX_UNDERLYINGS = {
-                    "ES", "MES", "NQ", "MNQ", "RTY", "M2K", "YM", "MYM",
-                    "SP", "SPX", "SPXW", "XSP", "NDX", "RUT",
+            async def collect_batch(batch_positions: list[Any], wait_s: float) -> dict[int, dict[str, float | None]]:
+                batch_greeks: dict[int, dict[str, float | None]] = {}
+                active_tickers: list[tuple[Any, Any]] = []
+                # IB position contracts are sometimes not fully qualified for greek snapshots.
+                # Qualify in batch first to improve modelGreeks availability.
+                contract_by_conid: dict[int, Any] = {
+                    int(getattr(p.contract, "conId", 0) or 0): p.contract for p in batch_positions
                 }
-                if c.symbol in _INDEX_UNDERLYINGS:
-                    spx_delta = delta  # delta already scaled by qty×mult above
-                elif und_price and raw_delta is not None:
+                qualified_by_conid: dict[int, Any] = {}
+                try:
+                    qualified = await asyncio.wait_for(
+                        self._ib.qualifyContractsAsync(*list(contract_by_conid.values())),
+                        timeout=12,
+                    )
+                    for qc in qualified or []:
+                        if qc is None:
+                            continue
+                        qid = int(getattr(qc, "conId", 0) or 0)
+                        if qid > 0:
+                            qualified_by_conid[qid] = qc
+                except Exception as exc:
+                    logger.debug("Greek contract qualification failed for batch: %s", exc)
+
+                for batch_pos in batch_positions:
+                    orig_contract = batch_pos.contract
+                    contract = qualified_by_conid.get(int(getattr(orig_contract, "conId", 0) or 0), orig_contract)
+                    try:
+                        # Use streaming subscriptions for options; modelGreeks are often more
+                        # reliable here than snapshot mode for IBKR option contracts.
+                        ticker = self._ib.reqMktData(
+                            contract,
+                            genericTickList=greeks_generic_ticks,
+                            snapshot=False,
+                            regulatorySnapshot=False,
+                        )
+                        self._register_greek_ticker(contract, ticker)
+                        active_tickers.append((contract, ticker))
+                    except Exception as exc:
+                        logger.debug("Greeks request failed for %s: %s", getattr(contract, "localSymbol", "?"), exc)
+
+                try:
+                    if active_tickers:
+                        await asyncio.sleep(wait_s)
+
+                    for contract, ticker in active_tickers:
+                        g = self._extract_option_greeks_from_ticker(ticker)
+                        batch_greeks[contract.conId] = g
+                        # Persist non-empty Greeks to the long-lived in-memory cache and to
+                        # option_chain_cache in the database for cross-session fallback.
+                        if any(v is not None for v in (g.get("delta"), g.get("gamma"), g.get("theta"), g.get("vega"))):
+                            self._greeks_cache[contract.conId] = g
+                            # Intentionally avoid writing greek values to DB option cache here.
+                            # Portfolio greek path is IBKR-live/in-memory only.
+                finally:
+                    for contract, _ticker in active_tickers:
+                        try:
+                            self._ib.cancelMktData(contract)
+                        except Exception:
+                            pass
+                        self._forget_greek_ticker(contract)
+
+                return batch_greeks
+
+            now_monotonic = _time_mod.monotonic()
+            last_live = self._last_live_greeks_refresh_monotonic
+            live_cycle_due = (
+                last_live is None
+                or (now_monotonic - last_live) >= greeks_refresh_seconds
+                or not self._greeks_cache_by_contract
+            )
+
+            if live_cycle_due:
+                for start in range(0, len(option_positions), batch_size):
+                    batch = option_positions[start:start + batch_size]
+                    option_greeks_by_conid.update(await collect_batch(batch, batch_wait_s))
+                self._last_live_greeks_refresh_monotonic = _time_mod.monotonic()
+            else:
+                logger.info(
+                    "Skipping live greek sweep; cache age %.1fs < %.1fs refresh interval",
+                    (now_monotonic - last_live) if last_live else 0.0,
+                    greeks_refresh_seconds,
+                )
+
+            # Retry only options with no populated greek fields (common when data arrives late).
+            def _has_any_greek_fields(payload: dict[str, Any] | None) -> bool:
+                if not payload:
+                    return False
+                return any(payload.get(k) is not None for k in ("delta", "gamma", "theta", "vega", "iv"))
+
+            def _can_estimate_locally(contract: Any, payload: dict[str, Any] | None) -> bool:
+                if not self._enable_local_greeks:
+                    return False
+                try:
+                    return self._estimate_option_greeks(contract=contract, ticker_greeks=payload or {}) is not None
+                except Exception:
+                    return False
+
+            missing_positions = [
+                p for p in option_positions
+                if not _has_any_greek_fields(option_greeks_by_conid.get(p.contract.conId, {}))
+                and not _has_any_greek_fields(self._greeks_cache.get(p.contract.conId, {}))
+                and not _can_estimate_locally(p.contract, option_greeks_by_conid.get(p.contract.conId, {}))
+            ]
+            if option_positions:
+                estimable_count = sum(
+                    1 for p in option_positions
+                    if _can_estimate_locally(p.contract, option_greeks_by_conid.get(p.contract.conId, {}))
+                )
+                cache_sig_count = sum(
+                    1 for p in option_positions
+                    if _has_any_greek_fields(self._greeks_cache_by_contract.get(_option_signature(p.contract), {}))
+                )
+                logger.info(
+                    "Greek diagnostics: options=%d estimable=%d signature_cache_hits=%d retry_candidates=%d mode=%s",
+                    len(option_positions),
+                    estimable_count,
+                    0,
+                    len(missing_positions),
+                    "ibkr_only" if not self._enable_local_greeks else "ibkr_plus_local",
+                )
+            if missing_positions and live_cycle_due:
+                missing_positions.sort(key=lambda p: abs(float(getattr(p, "position", 0.0))), reverse=True)
+                if retry_max_contracts > 0:
+                    missing_positions = missing_positions[:retry_max_contracts]
+                logger.info("Retrying Greeks for %d/%d option positions", len(missing_positions), len(option_positions))
+                for start in range(0, len(missing_positions), retry_batch_size):
+                    retry_batch = missing_positions[start:start + retry_batch_size]
+                    option_greeks_by_conid.update(await collect_batch(retry_batch, retry_wait_s))
+                remaining_missing_positions = [
+                    p for p in missing_positions
+                    if not _has_any_greek_fields(option_greeks_by_conid.get(p.contract.conId, {}))
+                    and not _has_any_greek_fields(self._greeks_cache.get(p.contract.conId, {}))
+                    and not _can_estimate_locally(p.contract, option_greeks_by_conid.get(p.contract.conId, {}))
+                ]
+                resolved_after_retry = len(missing_positions) - len(remaining_missing_positions)
+                logger.info(
+                    "Greeks retry complete: resolved %d/%d previously-missing option positions",
+                    resolved_after_retry,
+                    len(missing_positions),
+                )
+                if remaining_missing_positions:
+                    sample = ", ".join(
+                        f"{getattr(p.contract, 'symbol', '?')} {getattr(p.contract, 'lastTradeDateOrContractMonth', '')} "
+                        f"{float(getattr(p.contract, 'strike', 0.0) or 0.0):.1f} {getattr(p.contract, 'right', '')}"
+                        for p in remaining_missing_positions[:12]
+                    )
+                    logger.warning(
+                        "Greeks still missing after retry for %d positions: %s%s",
+                        len(remaining_missing_positions),
+                        sample,
+                        " …" if len(remaining_missing_positions) > 12 else "",
+                    )
+            elif missing_positions:
+                logger.info(
+                    "Deferring live greek retry for %d positions until refresh interval elapses",
+                    len(missing_positions),
+                )
+
+            # ── Step 3: Build PositionRow with PnL + Greeks
+            for pos in ib_positions:
+                c = pos.contract
+                pnl = pnl_by_conid.get(c.conId, {})
+                # Prefer live greeks; fall back to last known non-empty greeks when live is empty
+                live_g = option_greeks_by_conid.get(c.conId, {})
+                signature = _option_signature(c)
+                greeks_source: str | None = None
+                if not any(live_g.get(k) is not None for k in ("delta", "gamma", "theta", "vega")) and c.conId in self._greeks_cache:
+                    ticker_greeks = {**self._greeks_cache[c.conId], **{k: v for k, v in live_g.items() if v is not None}}
+                    greeks_source = "cached"
+                else:
+                    ticker_greeks = live_g
+                    if any(live_g.get(k) is not None for k in ("delta", "gamma", "theta", "vega")):
+                        greeks_source = "live"
+
+                if self._enable_local_greeks and c.secType in ("OPT", "FOP"):
+                    estimated = self._estimate_option_greeks(contract=c, ticker_greeks=ticker_greeks)
+                    if estimated and not any(ticker_greeks.get(k) is not None for k in ("delta", "gamma", "theta", "vega")):
+                        ticker_greeks = {**ticker_greeks, **estimated}
+                        greeks_source = str(estimated.get("source") or "estimated_bsm")
+
+                if c.secType in ("OPT", "FOP") and any(
+                    ticker_greeks.get(k) is not None for k in ("delta", "gamma", "theta", "vega", "iv")
+                ):
+                    self._greeks_cache[c.conId] = {
+                        "delta": ticker_greeks.get("delta"),
+                        "gamma": ticker_greeks.get("gamma"),
+                        "theta": ticker_greeks.get("theta"),
+                        "vega": ticker_greeks.get("vega"),
+                        "iv": ticker_greeks.get("iv"),
+                        "undPrice": ticker_greeks.get("undPrice"),
+                    }
+
+                mkt_price = pnl.get("market_price", 0.0)
+                mkt_value = pnl.get("market_value", 0.0)
+                upnl = pnl.get("unrealized_pnl", 0.0)
+                rpnl = pnl.get("realized_pnl", 0.0)
+
+                delta = ticker_greeks.get("delta")
+                gamma = ticker_greeks.get("gamma")
+                theta = ticker_greeks.get("theta")
+                vega = ticker_greeks.get("vega")
+                iv = ticker_greeks.get("iv")
+
+                if c.secType in ("OPT", "FOP"):
+                    mult = float(c.multiplier or 1)
+                    qty = float(pos.position)
+                    if delta is not None:
+                        delta = delta * qty * mult
+                    if gamma is not None:
+                        gamma = gamma * qty * mult
+                    if theta is not None:
+                        theta = theta * qty * mult
+                    if vega is not None:
+                        vega = vega * qty * mult
+
+                if c.secType == "STK":
+                    ref_price = (
+                        float(mkt_price or 0.0)
+                        or float(pos.avgCost or 0.0)
+                        or float(getattr(c, "lastTradePrice", 0.0) or 0.0)
+                    )
                     spx_delta = self._compute_spx_weighted_delta(
                         symbol=c.symbol,
-                        quantity=qty,
-                        price=und_price,
-                        underlying_delta=raw_delta,
-                        multiplier=raw_mult,
+                        quantity=float(pos.position),
+                        price=ref_price,
+                        underlying_delta=1.0,
+                        multiplier=1.0,
                         spx_proxy_price=spx_proxy_price,
-                    )
+                    ) if ref_price > 0 else None
+                    delta = spx_delta
+                elif c.secType == "FUT":
+                    # Futures have delta=1 per contract; SPX delta = qty × SPX-multiplier.
+                    # Use lookup table for index futures; unknown symbols get 0 (non-SPX).
+                    qty = float(pos.position)
+                    raw_mult = float(c.multiplier or 1)
+                    spx_mult = _FUT_SPX_MULTIPLIERS.get(c.symbol, 0.0)
+                    delta = qty * raw_mult
+                    spx_delta = qty * spx_mult if spx_mult else None
+                elif c.secType in ("OPT", "FOP"):
+                    und_price = ticker_greeks.get("undPrice")
+                    raw_delta = ticker_greeks.get("delta")
+                    qty = float(pos.position)
+                    raw_mult = float(c.multiplier or 100)
+                    _INDEX_UNDERLYINGS = {
+                        "ES", "MES", "NQ", "MNQ", "RTY", "M2K", "YM", "MYM",
+                        "SP", "SPX", "SPXW", "XSP", "NDX", "RUT",
+                    }
+                    if c.symbol in _INDEX_UNDERLYINGS:
+                        spx_delta = delta
+                    elif und_price and raw_delta is not None:
+                        spx_delta = self._compute_spx_weighted_delta(
+                            symbol=c.symbol,
+                            quantity=qty,
+                            price=und_price,
+                            underlying_delta=raw_delta,
+                            multiplier=raw_mult,
+                            spx_proxy_price=spx_proxy_price,
+                        )
+                    else:
+                        spx_delta = delta
                 else:
                     spx_delta = delta
-            else:
-                spx_delta = delta
 
-            # Capture underlying price for display
-            if c.secType in ("OPT", "FOP"):
-                und_price = ticker_greeks.get("undPrice")
-            elif c.secType == "STK":
-                und_price = mkt_price  # For stocks, underlying price = market price
-            elif c.secType == "FUT":
-                und_price = mkt_price  # For futures, show the contract price
-            else:
-                und_price = None
+                if c.secType in ("OPT", "FOP"):
+                    und_price = ticker_greeks.get("undPrice")
+                elif c.secType == "STK":
+                    und_price = mkt_price
+                elif c.secType == "FUT":
+                    und_price = mkt_price
+                else:
+                    und_price = None
 
-            row = {
-                "conid": c.conId,
-                "symbol": c.localSymbol or c.symbol,
-                "sec_type": c.secType,
-                "exchange": c.exchange,
-                "currency": c.currency,
-                "underlying": c.symbol if c.secType in ("OPT", "FOP") else None,
-                "strike": c.strike if c.secType in ("OPT", "FOP") else None,
-                "option_right": c.right if c.secType in ("OPT", "FOP") else None,
-                "expiry": self._parse_expiry(c.lastTradeDateOrContractMonth) if c.secType in ("OPT", "FOP", "FUT") else None,
-                "multiplier": float(c.multiplier or 1),
-                "quantity": float(pos.position),
-                "avg_cost": pnl.get("avg_cost", float(pos.avgCost)),
-                "market_price": mkt_price,
-                "market_value": mkt_value,
-                "unrealized_pnl": upnl,
-                "realized_pnl": rpnl,
+                row = {
+                    "conid": c.conId,
+                    "symbol": c.localSymbol or c.symbol,
+                    "sec_type": c.secType,
+                    "exchange": c.exchange,
+                    "currency": c.currency,
+                    "underlying": c.symbol if c.secType in ("OPT", "FOP", "BAG") else None,
+                    "strike": c.strike if c.secType in ("OPT", "FOP") else None,
+                    "option_right": c.right if c.secType in ("OPT", "FOP") else None,
+                    "expiry": self._parse_expiry(c.lastTradeDateOrContractMonth) if c.secType in ("OPT", "FOP", "FUT") else None,
+                    "multiplier": float(c.multiplier or 1),
+                    "combo_description": getattr(c, "comboLegsDescription", None),
+                    "quantity": float(pos.position),
+                    "avg_cost": pnl.get("avg_cost", float(pos.avgCost)),
+                    "market_price": mkt_price,
+                    "market_value": mkt_value,
+                    "unrealized_pnl": upnl,
+                    "realized_pnl": rpnl,
+                    "delta": delta,
+                    "gamma": gamma,
+                    "theta": theta,
+                    "vega": vega,
+                    "iv": iv,
+                    "spx_delta": spx_delta,
+                }
+                rows.append(row)
+
+                result.append(PositionRow(
+                    conid=c.conId,
+                    symbol=row["symbol"],
+                    sec_type=row["sec_type"],
+                    underlying=row["underlying"] or "",
+                    strike=row["strike"],
+                    right=row["option_right"],
+                    expiry=row["expiry"],
+                    quantity=row["quantity"],
+                    avg_cost=row["avg_cost"],
+                    market_price=mkt_price,
+                    market_value=mkt_value,
+                    unrealized_pnl=upnl,
+                    realized_pnl=rpnl,
+                    underlying_price=und_price,
+                    delta=delta,
+                    gamma=gamma,
+                    theta=theta,
+                    vega=vega,
+                    iv=iv,
+                    spx_delta=spx_delta,
+                    greeks_source=greeks_source,
+                    combo_description=row["combo_description"],
+                ))
+
+                # ── Populate last-price cache from position data ──────────────
+                if mkt_price and float(mkt_price) > 0:
+                    cache_sym = (c.localSymbol or c.symbol).upper()
+                    self._last_price_cache[cache_sym] = float(mkt_price)
+                    if c.secType in ("OPT", "FOP") and c.symbol:
+                        und_sym = c.symbol.upper()
+                        und_p = ticker_greeks.get("undPrice")
+                        if und_p and float(und_p) > 0:
+                            self._last_price_cache[und_sym] = float(und_p)
+
+            # Note: snapshot=True subscriptions auto-terminate after delivery.
+            # No need to call cancelMktData — doing so causes Error 300 "Can't find EId".
+
+            # ── Step 4: Compute aggregate risk summary
+            native_total_delta = sum(r.delta or 0 for r in result)
+            total_gamma = sum(r.gamma or 0 for r in result)
+            total_theta = sum(r.theta or 0 for r in result)
+            total_vega = sum(r.vega or 0 for r in result)
+            total_spx_delta = sum(r.spx_delta or 0 for r in result)
+            # Keep aggregate delta in SPX-equivalent units to avoid mixed-unit
+            # totals across stocks/equity options/index options.
+            total_delta = total_spx_delta
+            gross_exposure = sum(abs(r.market_value or 0) for r in result)
+            net_exposure = sum(r.market_value or 0 for r in result)
+            opts = sum(1 for r in result if r.sec_type in ("OPT", "FOP"))
+            stks = sum(1 for r in result if r.sec_type == "STK")
+
+            risk = PortfolioRiskSummary(
+                total_positions=len(result),
+                total_value=sum(r.market_value or 0 for r in result),
+                total_spx_delta=total_spx_delta,
+                total_delta=total_delta,
+                total_gamma=total_gamma,
+                total_theta=total_theta,
+                total_vega=total_vega,
+                theta_vega_ratio=total_theta / total_vega if total_vega != 0 else 0.0,
+                gross_exposure=gross_exposure,
+                net_exposure=net_exposure,
+                options_count=opts,
+                stocks_count=stks,
+            )
+            self.risk_updated.emit(risk)
+
+            # Persist
+            self._strategy_snapshot = StrategyReconstructor(account_id=self._account_id).reconstruct(result)
+            if self._db_ok:
+                try:
+                    await self._db.upsert_positions(self._account_id, rows)
+                    await self._db.replace_strategy_groups(self._account_id, self._strategy_snapshot)
+
+                    # ── Populate position/Greeks cache for LLM tools (60-second TTL) ──
+                    snapshot_id = str(uuid.uuid4())
+                    cache_positions = [
+                        {
+                            "conid": r.conid,
+                            "symbol": r.symbol,
+                            "sec_type": r.sec_type,
+                            "underlying": r.underlying or None,
+                            "expiry": r.expiry,
+                            "strike": r.strike,
+                            "option_right": r.right,
+                            "quantity": r.quantity,
+                            "market_price": r.market_price,
+                            "market_value": r.market_value,
+                            "unrealized_pnl": r.unrealized_pnl,
+                            "realized_pnl": r.realized_pnl,
+                            "underlying_price": r.underlying_price,
+                            "delta": r.delta,
+                            "gamma": r.gamma,
+                            "theta": r.theta,
+                            "vega": r.vega,
+                            "iv": r.iv,
+                            "spx_delta": r.spx_delta,
+                        }
+                        for r in result
+                    ]
+                    await self._db.cache_positions_snapshot(self._account_id, snapshot_id, cache_positions)
+                    await self._db.cache_portfolio_greeks(
+                        self._account_id,
+                        total_delta=total_delta,
+                        total_gamma=total_gamma,
+                        total_theta=total_theta,
+                        total_vega=total_vega,
+                        total_spx_delta=total_spx_delta,
+                        underlying_price=spx_proxy_price,
+                    )
+                    await self._db.cache_portfolio_metrics(
+                        self._account_id,
+                        self._build_portfolio_metrics_payload(risk),
+                    )
+                    await self._persist_portfolio_risk_snapshot(risk)
+                    if abs(native_total_delta - total_delta) > 1e-6:
+                        logger.debug(
+                            "Native delta %.4f differs from SPX-equivalent delta %.4f",
+                            native_total_delta,
+                            total_delta,
+                        )
+                    logger.debug("Cached %d positions + portfolio Greeks (snapshot_id=%s)", len(cache_positions), snapshot_id)
+                except Exception as exc:
+                    logger.warning("DB portfolio persistence failed: %s", exc)
+            self._positions_snapshot = result
+            self.positions_updated.emit(result)
+            return result
+
+    def _build_portfolio_metrics_payload(self, risk: PortfolioRiskSummary) -> dict[str, float | int | None]:
+        account = self._last_account_summary
+        return {
+            "total_positions": risk.total_positions,
+            "total_value": risk.total_value,
+            "total_spx_delta": risk.total_spx_delta,
+            "total_delta": risk.total_delta,
+            "total_gamma": risk.total_gamma,
+            "total_theta": risk.total_theta,
+            "total_vega": risk.total_vega,
+            "theta_vega_ratio": risk.theta_vega_ratio,
+            "gross_exposure": risk.gross_exposure,
+            "net_exposure": risk.net_exposure,
+            "options_count": risk.options_count,
+            "stocks_count": risk.stocks_count,
+            "nlv": getattr(account, "net_liquidation", None),
+            "buying_power": getattr(account, "buying_power", None),
+            "init_margin": getattr(account, "init_margin", None),
+            "maint_margin": getattr(account, "maint_margin", None),
+        }
+
+    def _latest_vix_value(self) -> float | None:
+        for symbol in ("VIX", "^VIX"):
+            price = self.last_price(symbol)
+            if price and price > 0:
+                return float(price)
+        return None
+
+    @staticmethod
+    def _infer_regime_from_vix(vix: float | None) -> str | None:
+        if vix is None:
+            return None
+        if vix >= 30:
+            return "high_vol"
+        if vix >= 20:
+            return "elevated"
+        return "normal"
+
+    async def _persist_portfolio_risk_snapshot(self, risk: PortfolioRiskSummary) -> None:
+        account = self._last_account_summary
+        if not account:
+            return
+        nlv = float(account.net_liquidation or 0.0)
+        init_margin = float(account.init_margin or 0.0)
+        vix = self._latest_vix_value()
+        await self._db.insert_risk_snapshot(
+            {
+                "account_id": self._account_id,
+                "spx_delta": risk.total_spx_delta,
+                "gamma": risk.total_gamma,
+                "theta": risk.total_theta,
+                "vega": risk.total_vega,
+                "vix": vix,
+                "regime": self._infer_regime_from_vix(vix),
+                "nlv": nlv,
+                "margin_used_pct": (init_margin / nlv) if nlv > 0 else None,
             }
-            rows.append(row)
-
-            result.append(PositionRow(
-                conid=c.conId,
-                symbol=row["symbol"],
-                sec_type=row["sec_type"],
-                underlying=row["underlying"] or "",
-                strike=row["strike"],
-                right=row["option_right"],
-                expiry=row["expiry"],
-                quantity=row["quantity"],
-                avg_cost=row["avg_cost"],
-                market_price=mkt_price,
-                market_value=mkt_value,
-                unrealized_pnl=upnl,
-                realized_pnl=rpnl,
-                underlying_price=und_price,
-                delta=delta,
-                gamma=gamma,
-                theta=theta,
-                vega=vega,
-                iv=iv,
-                spx_delta=spx_delta,
-                greeks_source=greeks_source,
-            ))
-
-            # ── Populate last-price cache from position data ──────────────
-            if mkt_price and float(mkt_price) > 0:
-                cache_sym = (c.localSymbol or c.symbol).upper()
-                self._last_price_cache[cache_sym] = float(mkt_price)
-                # Also cache the bare underlying symbol (e.g. "ES") for order entry
-                if c.secType in ("OPT", "FOP") and c.symbol:
-                    und_sym = c.symbol.upper()
-                    und_p = ticker_greeks.get("undPrice")
-                    if und_p and float(und_p) > 0:
-                        self._last_price_cache[und_sym] = float(und_p)
-
-        # Note: snapshot=True subscriptions auto-terminate after delivery.
-        # No need to call cancelMktData — doing so causes Error 300 "Can't find EId".
-
-        # ── Step 4: Compute aggregate risk summary
-        total_delta = sum(r.delta or 0 for r in result)
-        total_gamma = sum(r.gamma or 0 for r in result)
-        total_theta = sum(r.theta or 0 for r in result)
-        total_vega = sum(r.vega or 0 for r in result)
-        total_spx_delta = sum(r.spx_delta or 0 for r in result)
-        gross_exposure = sum(abs(r.market_value or 0) for r in result)
-        net_exposure = sum(r.market_value or 0 for r in result)
-        opts = sum(1 for r in result if r.sec_type in ("OPT", "FOP"))
-        stks = sum(1 for r in result if r.sec_type == "STK")
-
-        risk = PortfolioRiskSummary(
-            total_positions=len(result),
-            total_value=sum(r.market_value or 0 for r in result),
-            total_spx_delta=total_spx_delta,
-            total_delta=total_delta,
-            total_gamma=total_gamma,
-            total_theta=total_theta,
-            total_vega=total_vega,
-            theta_vega_ratio=total_theta / total_vega if total_vega != 0 else 0.0,
-            gross_exposure=gross_exposure,
-            net_exposure=net_exposure,
-            options_count=opts,
-            stocks_count=stks,
         )
-        self.risk_updated.emit(risk)
-
-        # Persist
-        if self._db_ok:
-            try:
-                await self._db.upsert_positions(self._account_id, rows)
-            except Exception as exc:
-                logger.warning("DB upsert_positions failed: %s", exc)
-        self._positions_snapshot = result
-        self.positions_updated.emit(result)
-        return result
 
     def _extract_option_greeks_from_ticker(self, ticker: Any) -> dict[str, float | None]:
         """Extract option Greeks from model/bid/ask/last greeks in priority order.
@@ -800,7 +1099,7 @@ class IBEngine(QObject):
             if iv is None:
                 iv = getattr(src, "impliedVolatility", None)
             if any(v is not None for v in (delta, gamma, theta, vega, iv)):
-                return {
+                payload = {
                     "delta": self._finite_or_none(delta),
                     "gamma": self._finite_or_none(gamma),
                     "theta": self._finite_or_none(theta),
@@ -808,19 +1107,105 @@ class IBEngine(QObject):
                     "iv": self._finite_or_none(iv),
                     "undPrice": und_price,
                 }
-        return {"delta": None, "gamma": None, "theta": None, "vega": None, "iv": None, "undPrice": und_price}
+                return self._sanitize_option_greeks(payload)
+        return self._sanitize_option_greeks({"delta": None, "gamma": None, "theta": None, "vega": None, "iv": None, "undPrice": und_price})
+
+    def _sanitize_option_greeks(self, payload: dict[str, float | None]) -> dict[str, float | None]:
+        """Clamp clearly-invalid IB greek payload values to None.
+
+        Keeps IBKR as source-of-truth but rejects occasional garbage/outlier ticks
+        that can explode aggregate risk metrics.
+        """
+        out = dict(payload)
+        d = self._finite_or_none(out.get("delta"))
+        g = self._finite_or_none(out.get("gamma"))
+        t = self._finite_or_none(out.get("theta"))
+        v = self._finite_or_none(out.get("vega"))
+        iv = self._finite_or_none(out.get("iv"))
+        up = self._finite_or_none(out.get("undPrice"))
+
+        out["delta"] = d if d is not None and -1.2 <= d <= 1.2 else None
+        out["gamma"] = g if g is not None and abs(g) <= 5.0 else None
+        out["theta"] = t if t is not None and abs(t) <= 10000.0 else None
+        out["vega"] = v if v is not None and abs(v) <= 10000.0 else None
+        out["iv"] = iv if iv is not None and 0.0 <= iv <= 10.0 else None
+        out["undPrice"] = up if up is not None and 0.0 < up < 10_000_000.0 else None
+        return out
+
+    def _interpolate_iv_from_chain(self, contract: Any) -> float | None:
+        """Estimate IV for a contract by finding the nearest cached strike in _greeks_cache_by_contract.
+
+        Searches same underlying, preferring same expiry, then nearest-strike neighbour.
+        Falls back to a conservative 0.20 default IV when the cache has no data for
+        that underlying at all (e.g. individual stocks never fetched via chain).
+        """
+        sym = str(getattr(contract, "symbol", "") or "").upper()
+        expiry = str(getattr(contract, "lastTradeDateOrContractMonth", "") or "").replace("-", "")[:8]
+        strike = float(getattr(contract, "strike", 0.0) or 0.0)
+
+        same_exp: list[tuple[float, float]] = []
+        any_exp: list[tuple[float, float]] = []
+        for (s, e, k, _r, _st), data in self._greeks_cache_by_contract.items():
+            if s != sym:
+                continue
+            iv_val = self._finite_or_none(data.get("iv"))
+            if not iv_val or iv_val <= 0:
+                continue
+            if e == expiry:
+                same_exp.append((abs(k - strike), iv_val))
+            else:
+                any_exp.append((abs(k - strike), iv_val))
+
+        candidates = same_exp or any_exp
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            return candidates[0][1]
+
+        # No chain data at all for this underlying — use a conservative default.
+        # 0.20 (20% annualised) is a reasonable fallback for both equity options
+        # and index-futures options; BSM will then produce delta/gamma/theta/vega
+        # rather than returning None for every illiquid/deep-OTM contract.
+        return 0.20
 
     def _estimate_option_greeks(self, *, contract: Any, ticker_greeks: dict[str, Any]) -> dict[str, float | str] | None:
-        """Estimate missing option Greeks from last known underlying price and IV."""
+        """Estimate missing option Greeks from last known underlying price and IV.
+
+        IV resolution order:
+          1. live ticker_greeks["iv"]
+          2. conId cache (_greeks_cache)
+          3. contract-signature cache (_greeks_cache_by_contract, populated from option_chain_cache)
+          4. nearest-strike interpolation across the same underlying
+          5. conservative 0.20 (20%) default when nothing else is available
+        """
         iv = self._finite_or_none(ticker_greeks.get("iv"))
+        # 1. conId cache
         if iv is None and getattr(contract, "conId", 0) in self._greeks_cache:
             iv = self._finite_or_none(self._greeks_cache[getattr(contract, "conId", 0)].get("iv"))
+        # 2. contract-signature cache (loaded from option_chain_cache on startup)
+        if iv is None:
+            sig = (
+                str(getattr(contract, "symbol", "") or "").upper(),
+                str(getattr(contract, "lastTradeDateOrContractMonth", "") or "").replace("-", "")[:8],
+                round(float(getattr(contract, "strike", 0.0) or 0.0), 4),
+                str(getattr(contract, "right", "") or "").upper(),
+                str(getattr(contract, "secType", "") or "").upper(),
+            )
+            cached_sig = self._greeks_cache_by_contract.get(sig)
+            if cached_sig:
+                iv = self._finite_or_none(cached_sig.get("iv"))
+        # 3. nearest-strike interpolation + default fallback
+        if iv is None or iv <= 0:
+            iv = self._interpolate_iv_from_chain(contract)
         if iv is None or iv <= 0:
             return None
 
         und_price = self._finite_or_none(ticker_greeks.get("undPrice"))
         if und_price is None or und_price <= 0:
             und_price = self.last_price(getattr(contract, "symbol", ""))
+        if und_price is None or und_price <= 0:
+            sym = str(getattr(contract, "symbol", "") or "").upper()
+            if sym in {"ES", "MES", "SPX", "SPXW", "XSP"}:
+                und_price = self._finite_or_none(getattr(self, "_last_spx_proxy_price", None))
         if und_price is None or und_price <= 0:
             return None
 
@@ -1126,6 +1511,7 @@ class IBEngine(QObject):
         - Live price cache (1-hour TTL): Full chain w/ bid/ask/greeks (for streaming)
         """
         expiry_key = expiry.strftime("%Y%m%d") if expiry else "nearest"
+        expiry_str = expiry_key if expiry else ""
         self._active_chain_request = {
             "underlying": underlying,
             "expiry": expiry,
@@ -1156,6 +1542,31 @@ class IBEngine(QObject):
                 # Use skeleton immediately; can optionally refresh prices in background
                 self.chain_ready.emit(skeleton_rows)
                 # TODO: optionally refresh prices in background for next fetch
+
+        if not force_refresh and expiry_str != "nearest":
+            cached_live_rows = await self._load_cached_chain_rows(
+                underlying=underlying,
+                expiry_str=expiry_str,
+                cache_key=cache_key,
+                max_age_seconds=3600,
+                live_cache=True,
+            )
+            if cached_live_rows:
+                logger.info("chain live cache hit (database) for %s %s", underlying, expiry_key)
+                self.chain_ready.emit(cached_live_rows)
+                return cached_live_rows
+
+            cached_skeleton_rows = await self._load_cached_chain_rows(
+                underlying=underlying,
+                expiry_str=expiry_str,
+                cache_key=cache_key,
+                max_age_seconds=604800,
+                live_cache=False,
+            )
+            if cached_skeleton_rows:
+                logger.info("chain skeleton cache hit (database) for %s %s", underlying, expiry_key)
+                self.chain_ready.emit(cached_skeleton_rows)
+                return cached_skeleton_rows
         # Cancel any stale live-streaming subscriptions before fetching a new chain
         self.cancel_chain_streaming()
         if sec_type == "FOP":
@@ -1186,10 +1597,6 @@ class IBEngine(QObject):
 
         if not chain_entries:
             return []
-
-        expiry_str = ""
-        if expiry:
-            expiry_str = expiry.strftime("%Y%m%d")
 
         today_str = date.today().strftime("%Y%m%d")
         selected_entry: tuple[Contract, Any] | None = None
@@ -1227,13 +1634,17 @@ class IBEngine(QObject):
         all_strikes = sorted(chain_def.strikes)
         if max_strikes and len(all_strikes) > max_strikes:
             # Use the qualified underlying's last price to center around ATM
-            atm_price = None
+            atm_price = self.last_price(underlying)
             if und_contract.conId:
                 try:
                     ticker = self._ib.reqMktData(und_contract, genericTickList="", snapshot=True, regulatorySnapshot=False)
                     await asyncio.sleep(1)
                     if ticker.last and ticker.last > 0:
                         atm_price = ticker.last
+                    elif ticker.bid and ticker.bid > 0:
+                        atm_price = ticker.bid
+                    elif ticker.ask and ticker.ask > 0:
+                        atm_price = ticker.ask
                     elif ticker.close and ticker.close > 0:
                         atm_price = ticker.close
                 except Exception:
@@ -1581,10 +1992,11 @@ class IBEngine(QObject):
             c = getattr(pos, "contract", None)
             if not c:
                 continue
+            local_symbol = str(getattr(c, "localSymbol", "") or "").upper().split()[0]
             # Normalise position contract expiry
             pos_exp = (c.lastTradeDateOrContractMonth or "").replace("-", "")[:8]
             if (
-                c.symbol.upper() == sym_up
+                (c.symbol.upper() == sym_up or local_symbol == sym_up)
                 and (c.right or "").upper() == right_up
                 and abs(float(c.strike or 0) - strike) < 0.01
                 and pos_exp == target_exp
@@ -1592,6 +2004,105 @@ class IBEngine(QObject):
             ):
                 return c.conId
         return 0
+
+    @staticmethod
+    def _weekly_fop_alias_root(symbol: str) -> tuple[str, str, str] | None:
+        sym_up = symbol.upper().strip()
+        if not sym_up:
+            return None
+        es_prefixes = ("EW", "E1", "E2", "E3", "E4", "E5", "E6", "EX")
+        mes_prefixes = ("MW", "M1", "M2", "M3", "M4", "M5", "M6", "MX")
+        if sym_up.startswith(es_prefixes):
+            return ("ES", "FOP", "CME")
+        if sym_up.startswith(mes_prefixes):
+            return ("MES", "FOP", "CME")
+        return None
+
+    def _normalize_leg_symbol_for_resolution(self, leg: dict[str, Any]) -> dict[str, Any]:
+        prepared = dict(leg)
+        raw_symbol = str(prepared.get("symbol") or "").upper().strip()
+        if not raw_symbol:
+            return prepared
+
+        for pos in (self._positions_snapshot or []):
+            contract = getattr(pos, "contract", None)
+            if contract is None:
+                continue
+            local_symbol = str(getattr(contract, "localSymbol", "") or "").upper().split()[0]
+            if local_symbol != raw_symbol:
+                continue
+            resolved_symbol = str(getattr(contract, "symbol", raw_symbol) or raw_symbol).upper()
+            resolved_sec_type = str(getattr(contract, "secType", prepared.get("sec_type") or "") or "").upper()
+            if resolved_symbol and resolved_symbol != raw_symbol:
+                prepared["symbol"] = resolved_symbol
+            if resolved_sec_type in {"OPT", "FOP"}:
+                prepared["sec_type"] = resolved_sec_type
+            if resolved_sec_type == "FOP" and not str(prepared.get("exchange") or "").strip():
+                prepared["exchange"] = getattr(contract, "exchange", "CME") or "CME"
+            return prepared
+
+        alias = self._weekly_fop_alias_root(raw_symbol)
+        if alias is None:
+            return prepared
+
+        resolved_symbol, resolved_sec_type, resolved_exchange = alias
+        prepared["symbol"] = resolved_symbol
+        prepared["sec_type"] = resolved_sec_type
+        if str(prepared.get("exchange") or "").upper().strip() in {"", "SMART"}:
+            prepared["exchange"] = resolved_exchange
+        return prepared
+
+    async def _load_cached_chain_rows(
+        self,
+        *,
+        underlying: str,
+        expiry_str: str,
+        cache_key: str,
+        max_age_seconds: float,
+        live_cache: bool,
+    ) -> list[ChainRow]:
+        if not self._db_ok or not expiry_str:
+            return []
+        try:
+            cached_rows = await self._db.get_cached_chain(
+                underlying,
+                expiry_str,
+                max_age_seconds=max_age_seconds,
+            )
+        except Exception as exc:
+            logger.debug("Failed loading cached chain rows for %s %s: %s", underlying, expiry_str, exc)
+            return []
+
+        if not cached_rows:
+            return []
+
+        rows = [
+            ChainRow(
+                underlying=str(row.get("underlying") or underlying),
+                expiry=(row.get("expiry").strftime("%Y%m%d") if hasattr(row.get("expiry"), "strftime") else str(row.get("expiry") or "").replace("-", "")[:8]),
+                strike=float(row.get("strike") or 0.0),
+                right=str(row.get("option_right") or "").upper(),
+                conid=int(row.get("conid") or 0),
+                bid=_safe_float(row.get("bid")),
+                ask=_safe_float(row.get("ask")),
+                last=_safe_float(row.get("last")),
+                volume=int(row.get("volume") or 0),
+                open_interest=int(row.get("open_interest") or 0),
+                iv=_safe_float(row.get("iv")),
+                delta=_safe_float(row.get("delta")),
+                gamma=_safe_float(row.get("gamma")),
+                theta=_safe_float(row.get("theta")),
+                vega=_safe_float(row.get("vega")),
+            )
+            for row in cached_rows
+        ]
+        if not rows:
+            return []
+
+        self._strike_skeleton_cache[f"skeleton|{cache_key}"] = (_time_mod.time(), rows)
+        if live_cache:
+            self._chain_cache[cache_key] = (_time_mod.time(), rows)
+        return rows
 
     def _lookup_conid_from_chain(self, symbol: str, expiry: str, strike: float, right: str) -> int:
         """Search all cached chain data for a matching contract's conId."""
@@ -1611,13 +2122,13 @@ class IBEngine(QObject):
 
     async def _prepare_leg_for_resolution(self, leg: dict[str, Any]) -> dict[str, Any]:
         """Normalize a leg before contract resolution, inferring missing expiry when possible."""
-        prepared = dict(leg)
+        prepared = self._normalize_leg_symbol_for_resolution(leg)
         expiry_raw = str(prepared.get("expiry") or "").replace("-", "").strip()
         if expiry_raw:
             prepared["expiry"] = expiry_raw
             return prepared
 
-        sec_type = str(prepared.get("sec_type") or "FOP").upper()
+        sec_type = str(prepared.get("sec_type") or self._infer_leg_sec_type(prepared)).upper()
         if sec_type not in ("FOP", "OPT"):
             return prepared
 
@@ -1695,35 +2206,6 @@ class IBEngine(QObject):
             logger.debug("_resolve_contracts: no cache hit for %s %s %.2f %s (will try qualifyAsync)", 
                         sym, exp, strk, rght)
 
-        all_have_conid = all(getattr(c, "conId", 0) > 0 for c in contracts)
-        if not all_have_conid:
-            missing_count = sum(1 for c in contracts if getattr(c, "conId", 0) <= 0)
-            logger.debug("_resolve_contracts: %d/%d contracts missing conId, calling qualifyContractsAsync", 
-                        missing_count, len(contracts))
-            try:
-                qualified = await self._ib.qualifyContractsAsync(*contracts)
-                # Merge back: keep qualified where conId came back; keep original elsewhere
-                resolved = []
-                for orig, qual in zip(contracts, qualified if qualified else []):
-                    if qual and getattr(qual, "conId", 0) > 0:
-                        resolved.append(qual)
-                        logger.debug("_resolve_contracts: qualified %s -> conId=%d", 
-                                   getattr(qual, "symbol", "?"), getattr(qual, "conId", 0))
-                    elif getattr(orig, "conId", 0) > 0:
-                        resolved.append(orig)  # chain/position lookup already gave us conId
-                    else:
-                        logger.warning("_resolve_contracts: failed to resolve %s %s", 
-                                     getattr(orig, "symbol", "?"), 
-                                     getattr(orig, "lastTradeDateOrContractMonth", "?"))
-                        # omit truly unresolvable
-                contracts = resolved
-            except Exception as exc:
-                logger.warning("qualifyContractsAsync failed: %s; falling back to unqualified contracts", exc)
-                contracts = [c for c in contracts if c is not None]
-        else:
-            contracts = [c for c in contracts if c is not None]
-            logger.debug("_resolve_contracts: all %d contracts had conIds, skipped qualifyAsync", len(contracts))
-
         def _leg_key(leg: dict) -> tuple[str, str, float, str]:
             return (
                 str(leg.get("symbol") or "").upper(),
@@ -1739,6 +2221,53 @@ class IBEngine(QObject):
                 round(float(getattr(contract, "strike", 0.0) or 0.0), 4),
                 str(getattr(contract, "right", "") or "").upper(),
             )
+
+        all_have_conid = all(getattr(c, "conId", 0) > 0 for c in contracts)
+        if not all_have_conid:
+            missing_count = sum(1 for c in contracts if getattr(c, "conId", 0) <= 0)
+            logger.debug("_resolve_contracts: %d/%d contracts missing conId, calling qualifyContractsAsync", 
+                        missing_count, len(contracts))
+            try:
+                unresolved_items = [(idx, c) for idx, c in enumerate(contracts) if getattr(c, "conId", 0) <= 0]
+                unresolved_contracts = [c for _, c in unresolved_items]
+                qualified = await self._ib.qualifyContractsAsync(*unresolved_contracts)
+                qualified_by_index: dict[int, Any] = {}
+                qualified_by_key: dict[tuple[str, str, float, str], Any] = {}
+
+                if qualified and len(qualified) == len(unresolved_items):
+                    for (idx, _orig), qual in zip(unresolved_items, qualified):
+                        if qual and getattr(qual, "conId", 0) > 0:
+                            qualified_by_index[idx] = qual
+                else:
+                    qualified_by_key = {
+                        _contract_key(qual): qual
+                        for qual in (qualified or [])
+                        if qual and getattr(qual, "conId", 0) > 0
+                    }
+
+                resolved = []
+                for idx, orig in enumerate(contracts):
+                    if getattr(orig, "conId", 0) > 0:
+                        resolved.append(orig)
+                        continue
+
+                    qual = qualified_by_index.get(idx) or qualified_by_key.get(_contract_key(orig))
+                    if qual is not None and getattr(qual, "conId", 0) > 0:
+                        resolved.append(qual)
+                        logger.debug("_resolve_contracts: qualified %s -> conId=%d", 
+                                   getattr(qual, "symbol", "?"), getattr(qual, "conId", 0))
+                    else:
+                        logger.warning("_resolve_contracts: failed to resolve %s %s", 
+                                     getattr(orig, "symbol", "?"), 
+                                     getattr(orig, "lastTradeDateOrContractMonth", "?"))
+                        # omit truly unresolvable
+                contracts = resolved
+            except Exception as exc:
+                logger.warning("qualifyContractsAsync failed: %s; falling back to unqualified contracts", exc)
+                contracts = [c for c in contracts if c is not None]
+        else:
+            contracts = [c for c in contracts if c is not None]
+            logger.debug("_resolve_contracts: all %d contracts had conIds, skipped qualifyAsync", len(contracts))
 
         resolved_keys = {_contract_key(c) for c in contracts if c is not None}
         missing_legs = [lg for lg in prepared_legs if _leg_key(lg) not in resolved_keys]
@@ -1946,15 +2475,64 @@ class IBEngine(QObject):
         Uses IB's whatIfOrderAsync() method to properly simulate margin impact.
         Returns margin deltas (init_margin_change, maint_margin_change).
         """
+        def format_leg(leg: dict[str, Any]) -> str:
+            action = str(leg.get("action") or "?").upper()
+            qty = leg.get("qty") or leg.get("quantity") or "?"
+            symbol = str(leg.get("symbol") or "?").upper()
+            sec_type = self._infer_leg_sec_type(leg)
+            expiry = str(leg.get("expiry") or "").strip()
+            strike = leg.get("strike")
+            right = str(leg.get("right") or "").upper()
+
+            descriptor = ""
+            if strike is not None:
+                descriptor = f"{float(strike):g}" if isinstance(strike, (int, float)) else str(strike)
+                if right:
+                    descriptor += right[:1]
+
+            parts = [action, str(qty), symbol]
+            if expiry:
+                parts.append(expiry)
+            if descriptor:
+                parts.append(descriptor)
+            parts.append(sec_type)
+            return " ".join(parts)
+
+        legs_summary = " | ".join(format_leg(leg) for leg in legs[:4])
+        if len(legs) > 4:
+            legs_summary += f" | … +{len(legs) - 4} more"
+
+        logger.info(
+            "WhatIf start: order_type=%s limit_price=%s legs=%s",
+            order_type,
+            limit_price,
+            legs_summary,
+        )
+
         contracts = await self._resolve_contracts(legs, strict=True)
         qualified_count = sum(1 for c in contracts if getattr(c, "conId", 0) > 0)
 
         if qualified_count == 0:
+            logger.warning("WhatIf qualification failed: 0/%d legs qualified | legs=%s", len(legs), legs_summary)
             return {"error": "No contracts qualified — check symbol, expiry, and strike", "status": "error"}
         if qualified_count != len(legs):
+            logger.warning(
+                "WhatIf qualification partial: %d/%d legs qualified | legs=%s",
+                qualified_count,
+                len(legs),
+                legs_summary,
+            )
             return {"error": f"Only {qualified_count}/{len(legs)} leg(s) qualified", "status": "error"}
 
         total_quantity, combo_ratios = self._normalize_order_size(legs)
+        logger.info(
+            "WhatIf qualified %d/%d legs | total_quantity=%s | combo_ratios=%s | legs=%s",
+            qualified_count,
+            len(legs),
+            total_quantity,
+            combo_ratios,
+            legs_summary,
+        )
 
         if order_type == "LIMIT" and limit_price is not None:
             ib_order = LimitOrder(
@@ -2002,8 +2580,9 @@ class IBEngine(QObject):
             equity_change = _safe_float(getattr(order_state, "equityWithLoanChange", None)) or 0.0
             
             logger.info(
-                "WhatIf margin impact: init_change=%s, maint_change=%s, equity_change=%s",
+                "WhatIf margin impact: init_change=%s, maint_change=%s, equity_change=%s | legs=%s",
                 init_change, maint_change, equity_change,
+                legs_summary,
             )
             
             return {
@@ -2014,15 +2593,16 @@ class IBEngine(QObject):
             }
         except asyncio.TimeoutError:
             logger.warning(
-                "WhatIf simulation timed out after %.0f seconds — IB Gateway may be slow or unavailable",
+                "WhatIf simulation timed out after %.0f seconds — IB Gateway may be slow or unavailable | legs=%s",
                 whatif_timeout,
+                legs_summary,
             )
             return {
                 "error": "WhatIf simulation timed out — IB Gateway may be slow or unavailable",
                 "status": "timeout",
             }
         except Exception as exc:
-            logger.error("WhatIf simulation failed: %s: %s", type(exc).__name__, exc)
+            logger.error("WhatIf simulation failed: %s: %s | legs=%s", type(exc).__name__, exc, legs_summary)
             return {
                 "error": f"WhatIf simulation failed: {exc}",
                 "status": "error",
@@ -2036,6 +2616,42 @@ class IBEngine(QObject):
 
         ticker = self._ib.reqMktData(contract, genericTickList="", snapshot=True, regulatorySnapshot=False)
         await asyncio.sleep(2)
+
+        def _best_price_from_ticker(t: Any) -> float | None:
+            return (
+                (t.last if getattr(t, "last", None) and t.last > 0 else None)
+                or (t.bid if getattr(t, "bid", None) and t.bid > 0 else None)
+                or (t.ask if getattr(t, "ask", None) and t.ask > 0 else None)
+                or (t.close if getattr(t, "close", None) and t.close > 0 else None)
+            )
+
+        # FUT snapshots can intermittently return empty on one contract; try nearby active
+        # month contracts before giving up so chain tab ATM can still center correctly.
+        if sec_type in ("FUT", "FOP") and _best_price_from_ticker(ticker) is None:
+            try:
+                details = await self._ib.reqContractDetailsAsync(Future(symbol=symbol, exchange=exchange, currency="USD"))
+                today = date.today()
+                ordered = sorted(
+                    details or [],
+                    key=lambda d: (
+                        self._parse_expiry(getattr(getattr(d, "contract", None), "lastTradeDateOrContractMonth", None)) or date.max,
+                        str(getattr(getattr(d, "contract", None), "lastTradeDateOrContractMonth", "") or ""),
+                    ),
+                )
+                for d in ordered[:5]:
+                    c = getattr(d, "contract", None)
+                    if not c:
+                        continue
+                    exp = self._parse_expiry(getattr(c, "lastTradeDateOrContractMonth", None))
+                    if exp is not None and exp < today:
+                        continue
+                    t2 = self._ib.reqMktData(c, genericTickList="", snapshot=True, regulatorySnapshot=False)
+                    await asyncio.sleep(0.7)
+                    if _best_price_from_ticker(t2) is not None:
+                        ticker = t2
+                        break
+            except Exception:
+                pass
 
         snap = MarketSnapshot(
             symbol=symbol,
@@ -2189,9 +2805,25 @@ class IBEngine(QObject):
 
     # ── helpers ───────────────────────────────────────────────────────────
 
+    def _infer_leg_sec_type(self, leg: dict[str, Any]) -> str:
+        explicit = str(leg.get("sec_type") or "").upper().strip()
+        if explicit:
+            return explicit
+
+        symbol = str(leg.get("symbol") or "").upper().strip()
+        has_option_fields = any(
+            leg.get(key) not in (None, "")
+            for key in ("strike", "right")
+        ) or bool(str(leg.get("expiry") or "").strip())
+        if has_option_fields:
+            if symbol in {"ES", "MES", "NQ", "MNQ", "RTY", "M2K", "YM", "MYM"}:
+                return "FOP"
+            return "OPT"
+        return "STK"
+
     def _leg_to_contract(self, leg: dict[str, Any]) -> Contract:
         """Convert a leg dict to an ib_async Contract."""
-        sec_type = leg.get("sec_type", "FOP")
+        sec_type = self._infer_leg_sec_type(leg)
         symbol = leg.get("symbol", "")
         exchange = leg.get("exchange", "")
 
@@ -2415,6 +3047,7 @@ class IBEngine(QObject):
 
     def _on_ib_disconnected(self) -> None:
         logger.warning("IB disconnected event")
+        self._cancel_greek_streaming()
         self.connection_state.emit("disconnected", "IB Gateway connection lost")
         self.disconnected.emit()
         if self._manual_disconnect_requested:

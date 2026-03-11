@@ -96,6 +96,66 @@ async def test_tool_get_positions(ai_risk_tab, mock_engine):
 
 
 @pytest.mark.asyncio
+async def test_tool_get_positions_prefers_live_snapshot_when_connected(ai_risk_tab, mock_engine):
+    mock_engine.is_connected = True
+    mock_engine.positions_snapshot = MagicMock(return_value=[
+        PositionRow(
+            conid=999,
+            symbol="MES",
+            sec_type="FOP",
+            underlying="MES",
+            strike=5700,
+            right="C",
+            expiry="20260320",
+            quantity=-1,
+            avg_cost=10.0,
+            market_price=11.0,
+            market_value=-1100.0,
+            unrealized_pnl=0.0,
+            realized_pnl=0.0,
+            delta=-5.0,
+            gamma=1.0,
+            theta=-20.0,
+            vega=300.0,
+            iv=0.2,
+            spx_delta=-5.0,
+        )
+    ])
+    mock_engine._db_ok = True
+    mock_engine._db = MagicMock()
+    mock_engine._db.get_cached_positions = AsyncMock(return_value=[{"symbol": "STALE"}])
+
+    result = await ai_risk_tab._tool_get_positions()
+
+    assert len(result) == 1
+    assert result[0]["symbol"] == "MES"
+    mock_engine._db.get_cached_positions.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tool_get_positions_uses_cached_db_snapshot(ai_risk_tab, mock_engine):
+    mock_engine._db_ok = True
+    mock_engine._db = MagicMock()
+    mock_engine._db.get_cached_positions = AsyncMock(return_value=[
+        {
+            "conid": 123,
+            "symbol": "AAPL",
+            "sec_type": "STK",
+            "quantity": 100,
+            "delta": 100.0,
+        }
+    ])
+    mock_engine.refresh_positions = AsyncMock()
+
+    result = await ai_risk_tab._tool_get_positions()
+
+    assert len(result) == 1
+    assert result[0]["symbol"] == "AAPL"
+    mock_engine._db.get_cached_positions.assert_awaited_once()
+    mock_engine.refresh_positions.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_tool_get_account(ai_risk_tab, mock_engine):
     """Test _tool_get_account returns account summary as dict."""
     mock_engine.refresh_account = AsyncMock(return_value=AccountSummary(
@@ -114,6 +174,53 @@ async def test_tool_get_account(ai_risk_tab, mock_engine):
     assert result["account_id"] == "U123456"
     assert result["net_liquidation"] == 250000.0
     assert result["init_margin"] == 25000.0
+
+
+@pytest.mark.asyncio
+async def test_tool_get_account_prefers_live_snapshot_when_connected(ai_risk_tab, mock_engine):
+    mock_engine.is_connected = True
+    mock_engine.account_snapshot = MagicMock(return_value=AccountSummary(
+        account_id="U123456",
+        net_liquidation=123000.0,
+        total_cash=22000.0,
+        init_margin=9000.0,
+        maint_margin=7000.0,
+        buying_power=101000.0,
+        unrealized_pnl=0.0,
+        realized_pnl=0.0,
+    ))
+    mock_engine._db_ok = True
+    mock_engine._db = MagicMock()
+    mock_engine._db.get_cached_account_snapshot = AsyncMock(return_value={"net_liquidation": 999999.0})
+
+    result = await ai_risk_tab._tool_get_account()
+
+    assert result["net_liquidation"] == 123000.0
+    mock_engine._db.get_cached_account_snapshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tool_get_account_uses_cached_db_snapshot(ai_risk_tab, mock_engine):
+    """Test account tool prefers the latest DB snapshot within the short TTL."""
+    mock_engine._db_ok = True
+    mock_engine._db = MagicMock()
+    mock_engine._db.get_cached_account_snapshot = AsyncMock(return_value={
+        "account_id": "U123456",
+        "net_liquidation": 260000.0,
+        "total_cash": 40000.0,
+        "buying_power": 210000.0,
+        "init_margin": 30000.0,
+        "maint_margin": 24000.0,
+        "unrealized_pnl": 6000.0,
+        "realized_pnl": 1500.0,
+    })
+    mock_engine.refresh_account = AsyncMock()
+
+    result = await ai_risk_tab._tool_get_account()
+
+    assert result["net_liquidation"] == 260000.0
+    mock_engine._db.get_cached_account_snapshot.assert_awaited_once()
+    mock_engine.refresh_account.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -242,7 +349,7 @@ async def test_tool_get_trade_bid_ask_aggregates_multi_leg(ai_risk_tab, mock_eng
 
 @pytest.mark.asyncio
 async def test_tool_get_positions_uses_five_minute_cache(ai_risk_tab, mock_engine):
-    """Test repeated position calls reuse the 5-minute snapshot cache."""
+    """Test repeated position calls reuse the snapshot cache within the TTL window."""
     mock_engine.refresh_positions = AsyncMock(return_value=[
         PositionRow(
             conid=123,
@@ -306,6 +413,40 @@ async def test_tool_get_portfolio_greeks_uses_one_minute_cache(ai_risk_tab, mock
     assert first["total_gamma"] == 0.2
     assert second["greeks_coverage"] == 1.0
     mock_engine.refresh_positions.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_tool_get_portfolio_greeks_prefers_cached_db_aggregates(ai_risk_tab, mock_engine):
+    """Test portfolio greeks tool uses DB aggregate snapshots before live refresh."""
+    mock_engine._db_ok = True
+    mock_engine._db = MagicMock()
+    mock_engine._db.get_cached_portfolio_greeks = AsyncMock(return_value={
+        "total_delta": -12.0,
+        "total_gamma": 0.3,
+        "total_theta": -40.0,
+        "total_vega": 18.0,
+        "total_spx_delta": -8.5,
+    })
+    mock_engine._db.get_cached_positions = AsyncMock(return_value=[
+        {
+            "symbol": "MES",
+            "sec_type": "FOP",
+            "quantity": -1,
+            "expiry": "20260320",
+            "delta": -12.0,
+            "gamma": 0.3,
+            "theta": -40.0,
+            "vega": 18.0,
+            "spx_delta": -8.5,
+        }
+    ])
+    mock_engine.refresh_positions = AsyncMock()
+
+    result = await ai_risk_tab._tool_get_portfolio_greeks()
+
+    assert result["total_spx_delta"] == -8.5
+    assert result["options_with_greeks"] == 1
+    mock_engine.refresh_positions.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -373,6 +514,72 @@ async def test_tool_get_portfolio_metrics(ai_risk_tab, mock_engine):
     assert result["stocks_count"] == 1
     assert result["nlv"] == 100000.0
     assert result["top_spx_delta_positions"][0]["symbol"] in {"AAPL", "MES"}
+
+
+@pytest.mark.asyncio
+async def test_tool_get_portfolio_metrics_prefers_cached_db_snapshot(ai_risk_tab, mock_engine):
+    """Test portfolio metrics tool uses DB metrics cache and cached positions before live refresh."""
+    mock_engine._db_ok = True
+    mock_engine._db = MagicMock()
+    mock_engine._db.get_cached_portfolio_metrics = AsyncMock(return_value={
+        "total_positions": 2,
+        "total_value": 12700.0,
+        "total_spx_delta": -2.3,
+        "total_delta": 80.0,
+        "total_gamma": 0.1,
+        "total_theta": -12.0,
+        "total_vega": 8.0,
+        "theta_vega_ratio": -1.5,
+        "gross_exposure": 17300.0,
+        "net_exposure": 12700.0,
+        "options_count": 1,
+        "stocks_count": 1,
+        "nlv": 100000.0,
+        "buying_power": 80000.0,
+        "init_margin": 10000.0,
+        "maint_margin": 8000.0,
+    })
+    mock_engine._db.get_cached_positions = AsyncMock(return_value=[
+        {
+            "symbol": "AAPL",
+            "sec_type": "STK",
+            "quantity": 100,
+            "market_value": 15000.0,
+            "spx_delta": 4.2,
+        },
+        {
+            "symbol": "MES",
+            "sec_type": "FOP",
+            "quantity": -1,
+            "expiry": "20260320",
+            "market_value": -2300.0,
+            "delta": -20.0,
+            "gamma": 0.1,
+            "theta": -12.0,
+            "vega": 8.0,
+            "spx_delta": -6.5,
+        },
+    ])
+    mock_engine._db.get_cached_account_snapshot = AsyncMock(return_value={
+        "account_id": "U123456",
+        "net_liquidation": 100000.0,
+        "total_cash": 20000.0,
+        "buying_power": 80000.0,
+        "init_margin": 10000.0,
+        "maint_margin": 8000.0,
+        "unrealized_pnl": 900.0,
+        "realized_pnl": 0.0,
+    })
+    mock_engine.refresh_positions = AsyncMock()
+    mock_engine.refresh_account = AsyncMock()
+
+    result = await ai_risk_tab._tool_get_portfolio_metrics()
+
+    assert result["total_positions"] == 2
+    assert result["nlv"] == 100000.0
+    assert result["top_spx_delta_positions"][0]["symbol"] == "MES"
+    mock_engine.refresh_positions.assert_not_awaited()
+    mock_engine.refresh_account.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -457,6 +664,33 @@ async def test_tool_get_chain(ai_risk_tab, mock_engine):
     assert all(r["expiry"] == "20260320" for r in result)
     assert result[0]["right"] == "C"
     assert result[1]["right"] == "P"
+
+
+@pytest.mark.asyncio
+async def test_tool_get_chain_fetches_when_snapshot_is_empty(ai_risk_tab, mock_engine):
+    """Test _tool_get_chain falls back to engine.get_chain when the cache is empty."""
+    mock_engine.chain_snapshot = MagicMock(return_value=[])
+    mock_engine.get_chain = AsyncMock(return_value=[
+        SimpleNamespace(underlying="AAPL", expiry="20260320", strike=210.0, right="C", bid=4.2, ask=4.5, delta=0.51),
+        SimpleNamespace(underlying="AAPL", expiry="20260320", strike=210.0, right="P", bid=3.8, ask=4.0, delta=-0.49),
+    ])
+
+    result = await ai_risk_tab._tool_get_chain("AAPL", "20260320")
+
+    assert len(result) == 2
+    assert all(r["underlying"] == "AAPL" for r in result)
+    mock_engine.get_chain.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_tool_log_summary_for_stock_bid_ask_omits_placeholders(ai_risk_tab):
+    """Stock quote log lines should not show fake action/qty placeholders."""
+    summary = ai_risk_tab._summarize_tool_payload(
+        "get_bid_ask",
+        {"symbol": "AAPL", "sec_type": "STK", "exchange": "SMART"},
+    )
+
+    assert summary == "AAPL STK @SMART"
 
 
 @pytest.mark.asyncio
@@ -571,7 +805,7 @@ def test_create_tools_for_session(ai_risk_tab):
     """Test _create_tools_for_session returns list of tool definitions."""
     tools = ai_risk_tab._create_tools_for_session()
 
-    assert len(tools) == 14
+    assert len(tools) == 17  # Updated: 14 original + 3 new strategy tools
     # Copilot SDK returns Tool objects with metadata (not callables)
     assert all(hasattr(tool, "name") for tool in tools)
     assert all(hasattr(tool, "description") for tool in tools)
