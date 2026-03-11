@@ -1,0 +1,207 @@
+openapi: 3.0.3
+info:
+  title: IBKR Trading Bridge Control API
+  version: 0.1.0
+  description: |
+    Operational contract for the bridge daemon. This API is intended for local
+    control/observability and mirrors required feature behaviors.
+servers:
+  - url: http://localhost:8080
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: getHealth
+      responses:
+        "200":
+          description: Service health and mode
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /bridge/start:
+    post:
+      summary: Start bridge loop
+      operationId: startBridge
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartRequest"
+      responses:
+        "202":
+          description: Bridge start accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BridgeStateResponse"
+        "400":
+          description: Invalid configuration (e.g., invalid IB_API_MODE)
+
+  /bridge/stop:
+    post:
+      summary: Stop bridge loop
+      operationId: stopBridge
+      responses:
+        "200":
+          description: Bridge stopped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BridgeStateResponse"
+
+  /bridge/snapshot:
+    post:
+      summary: Trigger immediate portfolio Greeks write
+      operationId: writeSnapshotNow
+      responses:
+        "201":
+          description: Snapshot written or buffered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotWriteResponse"
+
+  /bridge/buffer/flush:
+    post:
+      summary: Force flush circuit-breaker buffer
+      operationId: flushBuffer
+      responses:
+        "200":
+          description: Flush completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FlushResponse"
+
+  /bridge/events:
+    post:
+      summary: Persist API lifecycle event
+      operationId: logApiEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApiLogEventRequest"
+      responses:
+        "201":
+          description: Event persisted or buffered
+
+  /bridge/watchdog/reconnect:
+    post:
+      summary: Trigger watchdog reconnect sequence
+      operationId: watchdogReconnect
+      responses:
+        "202":
+          description: Reconnect sequence scheduled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WatchdogResponse"
+
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status, mode, connected, poll_interval_seconds]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        mode:
+          type: string
+          enum: [SOCKET, PORTAL]
+        connected:
+          type: boolean
+        poll_interval_seconds:
+          type: integer
+          minimum: 1
+        buffer_pending_rows:
+          type: integer
+          minimum: 0
+
+    StartRequest:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [SOCKET, PORTAL]
+        account:
+          type: string
+          description: IBKR account id, optional (auto-detect when omitted)
+
+    BridgeStateResponse:
+      type: object
+      required: [state, mode]
+      properties:
+        state:
+          type: string
+          enum: [starting, running, stopped]
+        mode:
+          type: string
+          enum: [SOCKET, PORTAL]
+
+    SnapshotWriteResponse:
+      type: object
+      required: [result, timestamp, contract, delta, gamma, vega, theta]
+      properties:
+        result:
+          type: string
+          enum: [written, buffered]
+        timestamp:
+          type: string
+          format: date-time
+        contract:
+          type: string
+          enum: [PORTFOLIO]
+        delta:
+          type: number
+        gamma:
+          type: number
+        vega:
+          type: number
+        theta:
+          type: number
+        underlying_price:
+          type: number
+          nullable: true
+
+    FlushResponse:
+      type: object
+      required: [flushed_rows, remaining_rows]
+      properties:
+        flushed_rows:
+          type: integer
+          minimum: 0
+        remaining_rows:
+          type: integer
+          minimum: 0
+
+    ApiLogEventRequest:
+      type: object
+      required: [api_mode, message, status]
+      properties:
+        api_mode:
+          type: string
+          enum: [SOCKET, PORTAL]
+        message:
+          type: string
+          minLength: 1
+        status:
+          type: string
+          enum: [info, warning, error]
+
+    WatchdogResponse:
+      type: object
+      required: [scheduled, strategy]
+      properties:
+        scheduled:
+          type: boolean
+        strategy:
+          type: string
+          enum:
+            - reset-window-wait-until-0005-et
+            - exponential-backoff-5-10-20

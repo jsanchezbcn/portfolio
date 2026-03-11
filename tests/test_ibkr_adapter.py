@@ -1,4 +1,5 @@
 from datetime import date
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -76,3 +77,73 @@ async def test_fetch_greeks_maps_values() -> None:
     assert updated[0].theta == 0.2
     assert updated[0].vega == -0.24
     assert updated[0].iv == 0.25
+
+
+@pytest.mark.asyncio
+async def test_fetch_positions_portal_falls_back_to_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("IB_API_MODE", "PORTAL")
+
+    client = Mock()
+    client.get_positions.side_effect = RuntimeError("portal unauthorized")
+
+    adapter = IBKRAdapter(client=client)
+    socket_positions = [Mock()]
+    adapter._fetch_positions_via_tws_socket = AsyncMock(return_value=socket_positions)
+
+    result = await adapter.fetch_positions("U000000")
+
+    assert result is socket_positions
+    adapter._fetch_positions_via_tws_socket.assert_awaited_once_with("U000000")
+
+
+@pytest.mark.asyncio
+async def test_fetch_greeks_portal_falls_back_to_tws_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("IB_API_MODE", "PORTAL")
+
+    client = Mock()
+    client.get_market_greeks_batch.return_value = {}
+    client.get_spx_price.return_value = 5000.0
+
+    adapter = IBKRAdapter(client=client)
+    adapter.disable_tasty_cache = True
+    adapter.force_refresh_on_miss = False
+    adapter._beta_weighter.compute_spx_equivalent_delta = AsyncMock(
+        return_value=SimpleNamespace(spx_equivalent_delta=1.23, beta_unavailable=False)
+    )
+    adapter._fetch_greeks_via_tws_socket = AsyncMock(
+        return_value={
+            123: {
+                "delta": 0.5,
+                "gamma": 0.1,
+                "theta": -0.2,
+                "vega": 0.3,
+                "iv": 0.25,
+                "source": "tws_socket",
+            }
+        }
+    )
+
+    option = Mock()
+    option.instrument_type = InstrumentType.OPTION
+    option.underlying = "ES"
+    option.expiration = date(2026, 3, 20)
+    option.strike = 6800.0
+    option.option_type = "put"
+    option.quantity = 1.0
+    option.contract_multiplier = 50.0
+    option.market_value = 1000.0
+    option.delta = option.gamma = option.theta = option.vega = 0.0
+    option.iv = None
+    option.spx_delta = 0.0
+    option.greeks_source = "none"
+    option.broker_id = "123"
+    option.underlying_price = None
+    option.beta_unavailable = False
+
+    updated = await adapter.fetch_greeks([option])
+
+    assert updated[0].greeks_source == "tws_socket"
+    assert updated[0].delta == pytest.approx(25.0)
+    assert updated[0].theta == pytest.approx(-10.0)
+    assert updated[0].vega == pytest.approx(15.0)
+    adapter._fetch_greeks_via_tws_socket.assert_awaited_once()

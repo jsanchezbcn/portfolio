@@ -47,62 +47,159 @@ def load_streaming_environment(env_file: str = ".env") -> StreamingEnvironmentCo
     )
 
 AGENT_SYSTEM_PROMPT = """
-You are a portfolio risk assistant grounded in three principles:
+You are a portfolio risk assistant with full access to trading tools, grounded in three principles:
 - Natenberg: compare implied vs historical volatility to identify relative premium edge.
 - Sebastian (insurance model): prioritize stable theta collection with controlled vega.
 - Taleb: treat near-expiration gamma concentration as a nonlinear tail-risk amplifier.
 
+You have access to the full portfolio including per-position Greeks, account capital (NLV, buying power,
+margin), market data (VIX, term structure, macro), options chains, and order submission.
 Always reason from current regime context, portfolio Greek totals, and explicit risk-limit status.
-Offer practical adjustment ideas (size, structure, expiry distribution) without claiming execution.
+Offer practical adjustment ideas (size, structure, expiry distribution) and can pre-fill orders.
+Commission schedule: /ES=$1.40, /MES=$0.47, stock options=$0.65 per contract.
 """.strip()
 
 # GitHub Copilot function-calling schemas used by the dashboard assistant.
-# These are plain JSON-style dictionaries to keep integration simple for MVP.
+# Full tool access for the AI agent — includes portfolio, capital, market data, and order tools.
 TOOL_SCHEMAS = [
     {
         "name": "get_portfolio_summary",
-        "description": "Return aggregated portfolio Greeks and ratio metrics.",
+        "description": "Return aggregated portfolio Greeks (delta, theta, vega, gamma, SPX delta) and ratio metrics (theta/vega).",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_portfolio_positions",
+        "description": "Return all portfolio positions with per-position Greeks, instrument type, strike, expiration, greeks_source, and staleness.",
         "parameters": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "instrument_type": {
+                    "type": "string",
+                    "description": "Filter by type: OPTION, STOCK, FUTURE, or ALL.",
+                    "enum": ["OPTION", "STOCK", "FUTURE", "ALL"],
+                },
+            },
         },
     },
     {
+        "name": "get_account_capital",
+        "description": "Return account capital details: net liquidation value, buying power, maintenance margin, excess liquidity, margin usage %.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
         "name": "check_risk_limits",
-        "description": "Evaluate current portfolio metrics against active regime limits.",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-        },
+        "description": "Evaluate current portfolio metrics against active regime limits. Returns list of violations.",
+        "parameters": {"type": "object", "properties": {}},
     },
     {
         "name": "get_gamma_risk_by_dte",
         "description": "Return portfolio gamma grouped by DTE buckets (0-7, 8-30, 31-60, 60+).",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-        },
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_iv_analysis",
+        "description": "Return IV vs HV analysis for portfolio positions — identifies sell/buy edge candidates.",
+        "parameters": {"type": "object", "properties": {}},
     },
     {
         "name": "get_vix_data",
-        "description": "Return latest VIX term structure context used by regime detection.",
+        "description": "Return latest VIX, VIX3M, term structure, backwardation flag used by regime detection.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_macro_data",
+        "description": "Return macro indicators including recession probability, source, and timestamp.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_options_chain",
+        "description": "Fetch options chain for an underlying symbol and expiration. Returns strikes with bid/ask/mid/delta for puts and calls.",
         "parameters": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "underlying": {
+                    "type": "string",
+                    "description": "Underlying symbol (e.g., ES, MES, SPY).",
+                },
+                "expiry": {
+                    "type": "string",
+                    "description": "Expiration date in YYYY-MM-DD format.",
+                },
+                "strikes_each_side": {
+                    "type": "integer",
+                    "description": "Number of strikes above and below ATM to include.",
+                    "default": 6,
+                },
+            },
+            "required": ["underlying", "expiry"],
         },
     },
     {
+        "name": "get_market_quote",
+        "description": "Get live bid/ask/mid/last quote for a symbol (stock, ETF, or future).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "Ticker symbol (e.g., SPY, ES, MES).",
+                },
+            },
+            "required": ["symbol"],
+        },
+    },
+    {
+        "name": "get_arbitrage_signals",
+        "description": "Return active arbitrage signals sorted by fill probability, with commission-adjusted net edge.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
         "name": "suggest_adjustment",
-        "description": "Propose risk-aware adjustments based on regime and current exposures.",
+        "description": "Propose risk-aware adjustments based on regime and current exposures. Returns specific trade suggestions with legs.",
         "parameters": {
             "type": "object",
             "properties": {
                 "objective": {
                     "type": "string",
-                    "description": "User objective, e.g. reduce SPX delta or cut near-term gamma.",
-                }
+                    "description": "User objective, e.g. 'reduce SPX delta', 'cut near-term gamma', 'improve theta/vega ratio'.",
+                },
             },
             "required": ["objective"],
         },
+    },
+    {
+        "name": "create_order_draft",
+        "description": "Pre-fill the Order Builder with specified legs. User must still approve before submission.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "legs": {
+                    "type": "array",
+                    "description": "Array of order legs.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["BUY", "SELL"]},
+                            "symbol": {"type": "string"},
+                            "quantity": {"type": "integer"},
+                            "strike": {"type": "number"},
+                            "right": {"type": "string", "enum": ["CALL", "PUT"]},
+                            "expiry": {"type": "string", "description": "YYYY-MM-DD"},
+                        },
+                        "required": ["action", "symbol", "quantity"],
+                    },
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "Journal entry explaining the trade rationale.",
+                },
+            },
+            "required": ["legs"],
+        },
+    },
+    {
+        "name": "get_risk_regime",
+        "description": "Return current market regime (low_volatility, neutral_volatility, high_volatility, crisis_mode) with VIX/term-structure context.",
+        "parameters": {"type": "object", "properties": {}},
     },
 ]

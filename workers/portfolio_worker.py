@@ -8,6 +8,13 @@ Supported job types
 fetch_greeks    payload: {"account_id": str, "ibkr_only": bool}
                 result: {"positions": [...], "summary": {...}, "spx_price": float}
 
+generate_trade_proposals
+                payload: {"account_id": str, "summary": {...}, "regime_name": str,
+                          "vix": float, "term_structure": float,
+                          "recession_probability": float|null, "spx_price": float,
+                          "nlv": float|null, "margin_used": float|null}
+                result: {"generated": int, "top": [str], "reason": str|null}
+
 llm_brief       payload: {"vix": float, "vix3m": float, "term_structure": float,
                            "regime_name": str, "recession_probability": float|null,
                            "portfolio_summary": dict|null, "nlv": float|null}
@@ -78,12 +85,21 @@ def _json_default(obj: Any) -> Any:
 
 
 def _positions_to_dicts(positions: list) -> list[dict]:
-    """Serialize a list of UnifiedPosition dataclasses to plain dicts."""
+    """Serialize UnifiedPosition/Pydantic objects to plain dicts."""
     import json
 
     result = []
     for pos in positions:
-        d = dataclasses.asdict(pos)
+        if hasattr(pos, "model_dump"):
+            d = pos.model_dump()
+        elif dataclasses.is_dataclass(pos):
+            if isinstance(pos, type):
+                continue
+            d = dataclasses.asdict(pos)
+        elif hasattr(pos, "dict"):
+            d = pos.dict()
+        else:
+            continue
         # Re-serialize through json to apply our default handler
         d = json.loads(json.dumps(d, default=_json_default))
         result.append(d)
@@ -180,8 +196,88 @@ async def _handle_restart_gateway(_payload: dict[str, Any]) -> dict[str, Any]:
     return {"success": bool(ok)}
 
 
+def _resolve_sqlmodel_db_url() -> str:
+    explicit = (os.getenv("PROPOSER_DB_URL") or "").strip()
+    if explicit:
+        return explicit
+    host = (os.getenv("DB_HOST") or "").split("#")[0].strip()
+    port = (os.getenv("DB_PORT") or "5432").split("#")[0].strip()
+    name = (os.getenv("DB_NAME") or "").split("#")[0].strip()
+    user = (os.getenv("DB_USER") or "").split("#")[0].strip()
+    pwd = (os.getenv("DB_PASS") or "").split("#")[0].strip()
+    if host and name and user:
+        from urllib.parse import quote_plus
+
+        auth = f"{quote_plus(user)}:{quote_plus(pwd)}" if pwd else quote_plus(user)
+        return f"postgresql+psycopg2://{auth}@{host}:{port}/{name}"
+    return ""
+
+
+async def _handle_generate_trade_proposals(payload: dict[str, Any]) -> dict[str, Any]:
+    """Generate and persist top trade proposals from current audited risk state."""
+    from adapters.ibkr_adapter import IBKRAdapter
+    from agents.proposer_engine import BreachDetector, ProposerEngine, RiskRegimeLoader
+    from models.proposed_trade import ProposedTrade
+    from sqlmodel import SQLModel, Session, create_engine
+
+    account_id = str(payload.get("account_id") or "")
+    if not account_id:
+        return {"generated": 0, "top": [], "reason": "missing_account_id"}
+
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    nlv = float(payload.get("nlv") or 100_000.0)
+
+    greeks = {
+        "vix": float(payload.get("vix") or 20.0),
+        "term_structure": float(payload.get("term_structure") or 1.0),
+        "recession_prob": payload.get("recession_probability"),
+        "total_vega": float(summary.get("total_vega") or 0.0),
+        "spx_delta": float(summary.get("total_spx_delta") or 0.0),
+        "total_theta": float(summary.get("total_theta") or 0.0),
+        "total_gamma": float(summary.get("total_gamma") or 0.0),
+        "margin_used": float(payload.get("margin_used") or 0.0),
+        "spx_price": float(payload.get("spx_price") or 0.0),
+        "account_id": account_id,
+    }
+
+    loader = RiskRegimeLoader()
+    detector = BreachDetector(loader)
+    engine = ProposerEngine(adapter=IBKRAdapter(), loader=loader)
+
+    breaches = detector.check(
+        greeks,
+        account_nlv=nlv,
+        account_id=account_id,
+        margin_used=float(greeks["margin_used"]),
+    )
+    if not breaches:
+        return {"generated": 0, "top": [], "reason": "no_breach"}
+
+    candidates = await engine.generate(
+        breaches,
+        account_id=account_id,
+        nlv=nlv,
+        atm_price=float(greeks["spx_price"] or 0.0),
+    )
+    if not candidates:
+        return {"generated": 0, "top": [], "reason": "no_candidates"}
+
+    db_url = _resolve_sqlmodel_db_url()
+    if not db_url:
+        return {"generated": 0, "top": [], "reason": "missing_db_url"}
+
+    eng = create_engine(db_url)
+    SQLModel.metadata.create_all(eng, tables=[ProposedTrade.__table__])
+    with Session(eng) as sess:
+        engine.persist_top3(account_id, candidates, sess)
+
+    top = [str(c.strategy_name) for c in candidates[:3]]
+    return {"generated": len(top), "top": top, "reason": None}
+
+
 _JOB_HANDLERS = {
     "fetch_greeks": _handle_fetch_greeks,
+    "generate_trade_proposals": _handle_generate_trade_proposals,
     "llm_brief": _handle_llm_brief,
     "llm_audit": _handle_llm_audit,
     "restart_gateway": _handle_restart_gateway,

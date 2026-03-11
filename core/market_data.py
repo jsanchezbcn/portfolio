@@ -165,7 +165,33 @@ class MarketDataService:
     # Stock / ETF quotes
     # ------------------------------------------------------------------
 
-    def get_quote(self, symbol: str, sec_type: str = "STK") -> Optional[Quote]:
+    def get_quote_by_conid(self, conid: int, symbol: str = "") -> Optional["Quote"]:
+        """Fetch a real-time bid/ask/last quote using a known IBKR conid.
+
+        Bypasses symbol-resolution step.  Ideal for FOP/OPT contracts where
+        the conid is already known from the position.
+
+        Returns ``None`` on any error (never raises).
+        """
+        try:
+            snapshot = self._ibkr.get_market_snapshot(
+                [conid], fields=_PRICE_FIELDS, subscribe_sleep=1.2
+            )
+            item = snapshot.get(conid)
+            if item is None:
+                return None
+            return Quote(
+                symbol=symbol or str(conid),
+                conid=conid,
+                bid=_parse_price(item.get(_FIELD_BID)),
+                ask=_parse_price(item.get(_FIELD_ASK)),
+                last=_parse_price(item.get(_FIELD_LAST)),
+            )
+        except Exception as exc:
+            logger.debug("get_quote_by_conid(%s) failed: %s", conid, exc)
+            return None
+
+    def get_quote(self, symbol: str, sec_type: str = "STK") -> Optional["Quote"]:
         """Fetch a real-time bid/ask/last quote for a stock or ETF.
 
         Uses IBKR ``/iserver/marketdata/snapshot`` with fields 84 (bid),

@@ -190,6 +190,9 @@ class Order:
     # Rejection / error context
     rejection_reason: Optional[str] = None  # Populated when status == REJECTED
 
+    # Limit price for LIMIT orders (net debit/credit for combos; per-leg for singles)
+    limit_price: Optional[float] = None
+
     # AI context (if trade originated from a suggestion)
     ai_suggestion_id: Optional[str] = None
     ai_rationale: Optional[str] = None

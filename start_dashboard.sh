@@ -62,6 +62,15 @@ nohup "$PYTHON_BIN" "$ROOT_DIR/workers/portfolio_worker.py" --worker-id worker-2
   > /tmp/worker-2.log 2>&1 &
 echo "  Worker-2 started (PID $!)."
 
+# ── Start Trade Proposer (Feature 006) ──────────────────────────────────────
+if [[ -f "$ROOT_DIR/agents/trade_proposer.py" ]]; then
+  pkill -f "agents.trade_proposer" 2>/dev/null || true
+  nohup "$PYTHON_BIN" -m agents.trade_proposer \
+    > /tmp/trade_proposer.log 2>&1 &
+  TRADE_PROPOSER_PID=$!
+  echo "  Trade Proposer started (PID $TRADE_PROPOSER_PID)."
+fi
+
 # ── Start Telegram bot ────────────────────────────────────────────────────────
 if [[ -f "$ROOT_DIR/agents/telegram_bot.py" ]]; then
   nohup "$PYTHON_BIN" "$ROOT_DIR/agents/telegram_bot.py" \
@@ -71,7 +80,19 @@ fi
 
 echo "Starting Streamlit on port $STREAMLIT_PORT..."
 cd "$ROOT_DIR"
-exec "$PYTHON_BIN" -m streamlit run dashboard/app.py \
+
+# Use the new multi-page trading platform entry point by default.
+# Set LEGACY_DASHBOARD=1 to fall back to the original single-page app.
+if [[ "${LEGACY_DASHBOARD:-0}" == "1" ]]; then
+  DASHBOARD_ENTRY="dashboard/app.py"
+  echo "  [legacy] Launching single-page dashboard (dashboard/app.py)"
+else
+  DASHBOARD_ENTRY="dashboard/main.py"
+  echo "  Launching multi-page trading platform (dashboard/main.py)"
+fi
+
+exec "$PYTHON_BIN" -m streamlit run "$DASHBOARD_ENTRY" \
   --server.headless true \
   --server.port "$STREAMLIT_PORT" \
   --server.fileWatcherType none
+

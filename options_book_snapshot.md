@@ -1,0 +1,875 @@
+- generic [active]:
+  - generic [ref=e2]:
+    - generic [ref=e4]:
+      - list [ref=e7]:
+        - generic [ref=e47]:
+          - generic [ref=e49] [cursor=pointer]: Trading
+          - listitem [ref=e50]:
+            - link "Trade" [ref=e52] [cursor=pointer]:
+              - /url: http://localhost:8506/trade
+              - generic [ref=e55]: 📈
+              - generic [ref=e56]: Trade
+          - listitem [ref=e57]:
+            - link "Orders" [ref=e59] [cursor=pointer]:
+              - /url: http://localhost:8506/orders
+              - generic [ref=e62]: 📋
+              - generic [ref=e63]: Orders
+        - generic [ref=e64]:
+          - generic [ref=e66] [cursor=pointer]: Monitor
+          - listitem [ref=e67]:
+            - link "Portfolio" [ref=e69] [cursor=pointer]:
+              - /url: http://localhost:8506/
+              - generic [ref=e72]: 📊
+              - generic [ref=e73]: Portfolio
+          - listitem [ref=e74]:
+            - link "Journal" [ref=e76] [cursor=pointer]:
+              - /url: http://localhost:8506/journal
+              - generic [ref=e79]: 📓
+              - generic [ref=e80]: Journal
+      - generic [ref=e83]:
+        - separator [ref=e88]
+        - generic [ref=e91] [cursor=pointer]:
+          - checkbox "Show account summary"
+          - paragraph [ref=e96]: Show account summary
+        - heading "Inputs" [level=2] [ref=e100]
+        - button "Reload Accounts" [ref=e103] [cursor=pointer]:
+          - paragraph [ref=e107]: Reload Accounts
+        - generic [ref=e109]:
+          - paragraph [ref=e113]: IBKR Account
+          - generic [ref=e115]:
+            - generic [ref=e116]:
+              - generic [ref=e117]: U2052408
+              - combobox "Selected U2052408. IBKR Account" [ref=e119]
+            - img "open" [ref=e121]
+        - button "Refresh" [ref=e125] [cursor=pointer]:
+          - paragraph [ref=e129]: Refresh
+        - generic [ref=e132] [cursor=pointer]:
+          - checkbox "IBKR-style option scaling (x100)"
+          - paragraph [ref=e137]: IBKR-style option scaling (x100)
+        - generic [ref=e140] [cursor=pointer]:
+          - checkbox "Use latest cached portfolio if IBKR unavailable" [checked]
+          - paragraph [ref=e145]: Use latest cached portfolio if IBKR unavailable
+        - generic [ref=e148] [cursor=pointer]:
+          - checkbox "IBKR-only mode (no external Greeks)" [checked]
+          - paragraph [ref=e153]: IBKR-only mode (no external Greeks)
+        - button "🚨 Flatten Risk" [ref=e159] [cursor=pointer]:
+          - paragraph [ref=e163]: 🚨 Flatten Risk
+        - group [ref=e166]:
+          - generic "keyboard_arrow_right 🤖 AI / LLM Settings" [ref=e167] [cursor=pointer]:
+            - generic [ref=e168]:
+              - generic [ref=e170]: keyboard_arrow_right
+              - paragraph [ref=e173]: 🤖 AI / LLM Settings
+        - group [ref=e176]:
+          - generic "keyboard_arrow_right 🔬 Greeks Diagnostics" [ref=e177] [cursor=pointer]:
+            - generic [ref=e178]:
+              - generic [ref=e180]: keyboard_arrow_right
+              - paragraph [ref=e183]: 🔬 Greeks Diagnostics
+        - group [ref=e186]:
+          - generic "keyboard_arrow_right Data Freshness" [ref=e187] [cursor=pointer]:
+            - generic [ref=e188]:
+              - generic [ref=e190]: keyboard_arrow_right
+              - paragraph [ref=e193]: Data Freshness
+    - generic [ref=e31]:
+      - banner [ref=e32]:
+        - generic [ref=e35]:
+          - button "Deploy" [ref=e37] [cursor=pointer]:
+            - generic [ref=e39]: Deploy
+          - button [ref=e41] [cursor=pointer]:
+            - img [ref=e42]
+      - generic [ref=e194]:
+        - heading "Portfolio Risk Manager" [level=1] [ref=e199]:
+          - text: Portfolio Risk Manager
+          - generic [ref=e200]:
+            - link "Link to heading":
+              - /url: "#portfolio-risk-manager"
+              - img
+        - generic [ref=e205]:
+          - generic [ref=e206]: "Regime: Neutral Volatility"
+          - generic [ref=e207]: "VIX: 17.93"
+          - generic [ref=e208]: "Term Structure: 1.136"
+          - generic [ref=e209]: "Recession: N/A"
+          - generic [ref=e210]: 2026-02-26T08:24:42.551879 (polymarket)
+        - paragraph [ref=e215]: "Regime: Neutral Volatility | VIX: 17.93 | Term Structure: 1.136"
+        - paragraph [ref=e220]: "IBKR-only mode: Greeks from IBKR snapshot only."
+        - group [ref=e223]:
+          - generic "keyboard_arrow_right 🔬 Greeks Diagnostics" [ref=e224] [cursor=pointer]:
+            - generic [ref=e225]:
+              - generic [ref=e227]: keyboard_arrow_right
+              - paragraph [ref=e230]: 🔬 Greeks Diagnostics
+        - generic [ref=e232]:
+          - heading "📊 Account & Portfolio Greeks" [level=2] [ref=e237]:
+            - text: 📊 Account & Portfolio Greeks
+            - generic [ref=e238]:
+              - link "Link to heading":
+                - /url: "#account-and-portfolio-greeks"
+                - img
+          - generic [ref=e240]:
+            - generic [ref=e245]:
+              - paragraph [ref=e249]: Net Liquidation
+              - paragraph [ref=e253]: $109,613
+            - generic [ref=e258]:
+              - paragraph [ref=e262]: Buying Power
+              - paragraph [ref=e266]: $104,839
+            - generic [ref=e271]:
+              - paragraph [ref=e275]: Margin Usage
+              - paragraph [ref=e279]: 76.5%
+              - generic [ref=e280]:
+                - img [ref=e281]
+                - paragraph [ref=e286]: High
+            - generic [ref=e291]:
+              - paragraph [ref=e295]: Excess Liquidity
+              - paragraph [ref=e299]: $26,220
+          - generic [ref=e301]:
+            - generic [ref=e306]:
+              - paragraph [ref=e310]: SPX β-Δ
+              - paragraph [ref=e314]: "-32.4"
+              - generic [ref=e315]:
+                - img [ref=e316]
+                - paragraph [ref=e321]: Neutral
+            - generic [ref=e326]:
+              - paragraph [ref=e330]: Delta
+              - paragraph [ref=e334]: "2421.76"
+            - generic [ref=e339]:
+              - paragraph [ref=e343]: Theta
+              - paragraph [ref=e347]: "9117.75"
+            - generic [ref=e352]:
+              - paragraph [ref=e356]: Vega
+              - paragraph [ref=e360]: "-4750.2"
+              - generic [ref=e361]:
+                - img [ref=e362]
+                - paragraph [ref=e367]: Short Vol
+            - generic [ref=e372]:
+              - paragraph [ref=e376]: Gamma
+              - paragraph [ref=e380]: "-90.6523"
+            - generic [ref=e385]:
+              - paragraph [ref=e389]: Θ/V Ratio
+              - paragraph [ref=e393]: "1.919"
+          - paragraph [ref=e398]: "Equity SPX Δ: 21.55 across 20 stock position(s) | beta_unavailable: 4"
+          - generic [ref=e400]:
+            - generic [ref=e405]:
+              - paragraph [ref=e409]: Gross Exposure
+              - paragraph [ref=e413]: $0
+            - generic [ref=e418]:
+              - paragraph [ref=e422]: Net Exposure
+              - paragraph [ref=e426]: $0
+            - generic [ref=e431]:
+              - paragraph [ref=e435]: Top Concentration
+              - paragraph [ref=e439]: ES 0.0%
+            - generic [ref=e444]:
+              - paragraph [ref=e448]: β Missing
+              - paragraph [ref=e452]: "6"
+          - heading "📊 Futures & Stocks (22)" [level=3] [ref=e457]:
+            - text: 📊 Futures & Stocks (22)
+            - generic [ref=e458]:
+              - link "Link to heading":
+                - /url: "#futures-and-stocks-22"
+                - img
+          - generic [ref=e463]:
+            - button "Show/hide columns" [ref=e467] [cursor=pointer]:
+              - img [ref=e468]
+            - button "Download as CSV" [ref=e473] [cursor=pointer]:
+              - img [ref=e474]
+            - button "Search" [ref=e479] [cursor=pointer]:
+              - img [ref=e480]
+            - button "Fullscreen" [ref=e485] [cursor=pointer]:
+              - img [ref=e486]
+          - heading "📋 Options (219)" [level=3] [ref=e501]:
+            - text: 📋 Options (219)
+            - generic [ref=e502]:
+              - link "Link to heading":
+                - /url: "#options-219"
+                - img
+          - generic [ref=e507]:
+            - button "Show/hide columns" [ref=e511] [cursor=pointer]:
+              - img [ref=e512]
+            - button "Download as CSV" [ref=e517] [cursor=pointer]:
+              - img [ref=e518]
+            - button "Search" [ref=e523] [cursor=pointer]:
+              - img [ref=e524]
+            - button "Fullscreen" [ref=e529] [cursor=pointer]:
+              - img [ref=e530]
+          - paragraph [ref=e545]: Select an option row to see Buy / Sell / Roll actions.
+          - paragraph [ref=e550]: "🔄 Metrics auto-refresh every 30s · last update: 08:26:20 UTC"
+        - heading "🛡️ Risk Compliance" [level=3] [ref=e555]:
+          - text: 🛡️ Risk Compliance
+          - generic [ref=e556]:
+            - link "Link to heading":
+              - /url: "#risk-compliance"
+              - img
+        - alert [ref=e559]:
+          - paragraph [ref=e564]: "⚠️ 2 risk limit(s) violated:"
+        - generic [ref=e569]:
+          - button "Show/hide columns" [ref=e573] [cursor=pointer]:
+            - img [ref=e574]
+          - button "Download as CSV" [ref=e579] [cursor=pointer]:
+            - img [ref=e580]
+          - button "Search" [ref=e585] [cursor=pointer]:
+            - img [ref=e586]
+          - button "Fullscreen" [ref=e591] [cursor=pointer]:
+            - img [ref=e592]
+        - generic [ref=e604]:
+          - generic [ref=e609]:
+            - paragraph [ref=e613]: Γ 0-7d
+            - paragraph [ref=e617]: "-4.252"
+          - generic [ref=e622]:
+            - paragraph [ref=e626]: Γ 8-30d
+            - paragraph [ref=e630]: "-80.978"
+          - generic [ref=e635]:
+            - paragraph [ref=e639]: Γ 31-60d
+            - paragraph [ref=e643]: "-5.274"
+          - generic [ref=e648]:
+            - paragraph [ref=e652]: Γ 60+d
+            - paragraph [ref=e656]: "-0.148"
+        - separator [ref=e661]
+        - heading "💡 Suggested Risk-Improving Trades" [level=3] [ref=e667]:
+          - text: 💡 Suggested Risk-Improving Trades
+          - generic [ref=e668]:
+            - link "Link to heading":
+              - /url: "#suggested-risk-improving-trades"
+              - img
+        - paragraph [ref=e673]:
+          - text: Each suggestion aims for the most capital-efficient fix. Click
+          - strong [ref=e674]: Create Trade
+          - text: to pre-fill the Order Builder, then add your rationale.
+        - generic [ref=e678]:
+          - generic [ref=e680]:
+            - paragraph [ref=e685]:
+              - strong [ref=e686]: Vega
+              - text: ": current"
+              - code [ref=e687]: "-4750.18"
+              - text: vs limit
+              - code [ref=e688]: "-1200.00"
+            - paragraph [ref=e693]:
+              - strong [ref=e694]: "Suggestion:"
+              - text: Close one high-vega option leg to reduce vega exposure immediately. This keeps execution capital-efficient and contract-specific.
+            - paragraph [ref=e699]: "Legs: BUY 1x ES CALL 7250.0 exp 2026-04-30"
+            - paragraph [ref=e704]: "Est. commission: $1.40"
+          - generic [ref=e706]:
+            - generic [ref=e708]:
+              - paragraph [ref=e712]: Rationale
+              - textbox "Rationale" [ref=e715]:
+                - /placeholder: Why this trade…
+                - text: Reduce vega by closing a high-vega option leg
+            - button "🚀 Create Trade" [ref=e718] [cursor=pointer]:
+              - paragraph [ref=e722]: 🚀 Create Trade
+        - generic [ref=e726]:
+          - generic [ref=e728]:
+            - paragraph [ref=e733]:
+              - strong [ref=e734]: Gamma
+              - text: ": current"
+              - code [ref=e735]: "-90.65"
+              - text: vs limit
+              - code [ref=e736]: "35.00"
+            - paragraph [ref=e741]:
+              - strong [ref=e742]: "Suggestion:"
+              - text: Close one near-expiry option leg to reduce concentrated gamma risk in the front bucket.
+            - paragraph [ref=e747]: "Legs: BUY 1x ES PUT 6910.0 exp 2026-02-27"
+            - paragraph [ref=e752]: "Est. commission: $1.40"
+          - generic [ref=e754]:
+            - generic [ref=e756]:
+              - paragraph [ref=e760]: Rationale
+              - textbox "Rationale" [ref=e763]:
+                - /placeholder: Why this trade…
+                - text: Reduce front-dated gamma by closing nearest-expiry leg
+            - button "🚀 Create Trade" [ref=e766] [cursor=pointer]:
+              - paragraph [ref=e770]: 🚀 Create Trade
+        - paragraph [ref=e775]:
+          - text: "🔴 Theta/Vega ratio:"
+          - strong [ref=e776]: "1.919"
+          - text: "(target: 0.25–0.40, Sebastian framework)"
+        - heading "🛡️ Trade Proposer Queue" [level=3] [ref=e781]:
+          - text: 🛡️ Trade Proposer Queue
+          - generic [ref=e782]:
+            - link "Link to heading":
+              - /url: "#trade-proposer-queue"
+              - img
+        - generic [ref=e784]:
+          - button "✨ Suggest New Trades" [ref=e789] [cursor=pointer]:
+            - paragraph [ref=e793]: ✨ Suggest New Trades
+          - paragraph [ref=e800]: Uses live Greeks + regime to generate top 3 capital-efficient trades.
+        - paragraph [ref=e805]:
+          - strong [ref=e806]: 2 pending
+          - text: — click 🚀 to stage in Order Builder
+        - generic [ref=e810]:
+          - generic [ref=e812]:
+            - button "🚀 Create Order" [ref=e815] [cursor=pointer]:
+              - paragraph [ref=e819]: 🚀 Create Order
+            - generic [ref=e821]:
+              - button "✅" [ref=e826] [cursor=pointer]:
+                - paragraph [ref=e830]: ✅
+              - button "❌" [ref=e835] [cursor=pointer]:
+                - paragraph [ref=e839]: ❌
+          - generic [ref=e841]:
+            - paragraph [ref=e846]:
+              - strong [ref=e847]: SPX Put Calendar 30/60 DTE
+              - text: "🟢 Pending Score:"
+              - code [ref=e848]: "34.783"
+              - text: "Net:"
+              - code [ref=e849]: $0.00
+              - emphasis [ref=e850]: 2026-02-25 00:26
+            - paragraph [ref=e855]: "📋 Corrects Vega breach (-8000 vs -4800 limit) in neutral_volatility regime. Reduces vega by ~80. Score: 34.78"
+        - generic [ref=e859]:
+          - generic [ref=e861]:
+            - button "🚀 Create Order" [ref=e864] [cursor=pointer]:
+              - paragraph [ref=e868]: 🚀 Create Order
+            - generic [ref=e870]:
+              - button "✅" [ref=e875] [cursor=pointer]:
+                - paragraph [ref=e879]: ✅
+              - button "❌" [ref=e884] [cursor=pointer]:
+                - paragraph [ref=e888]: ❌
+          - generic [ref=e890]:
+            - paragraph [ref=e895]:
+              - strong [ref=e896]: SPX Bear Put Spread 45 DTE
+              - text: "🟢 Pending Score:"
+              - code [ref=e897]: "43.478"
+              - text: "Net:"
+              - code [ref=e898]: $0.00
+              - emphasis [ref=e899]: 2026-02-25 00:26
+            - paragraph [ref=e904]: "📋 Corrects Vega breach (-8000 vs -4800 limit) in neutral_volatility regime. Reduces vega by ~50. Score: 43.48"
+        - group [ref=e907]:
+          - generic "keyboard_arrow_right Previous (5)" [ref=e908] [cursor=pointer]:
+            - generic [ref=e909]:
+              - generic [ref=e911]: keyboard_arrow_right
+              - paragraph [ref=e914]: Previous (5)
+        - heading "📊 Arbitrage Signals" [level=3] [ref=e919]:
+          - text: 📊 Arbitrage Signals
+          - generic [ref=e920]:
+            - link "Link to heading":
+              - /url: "#arbitrage-signals"
+              - img
+        - generic [ref=e922]:
+          - paragraph [ref=e926]: Default underlying symbol
+          - textbox "Default underlying symbol" [ref=e929]:
+            - /placeholder: ""
+            - text: SPX
+        - generic [ref=e934]:
+          - button "Show/hide columns" [ref=e938] [cursor=pointer]:
+            - img [ref=e939]
+          - button "Download as CSV" [ref=e944] [cursor=pointer]:
+            - img [ref=e945]
+          - button "Search" [ref=e950] [cursor=pointer]:
+            - img [ref=e951]
+          - button "Fullscreen" [ref=e956] [cursor=pointer]:
+            - img [ref=e957]
+        - paragraph [ref=e972]:
+          - text: "6 signal(s) sorted by fill probability × net edge after commissions. Commissions: /ES="
+          - generic [ref=e973]:
+            - math [ref=e975]:
+              - generic [ref=e977]:
+                - generic [ref=e978]: "1.40"
+                - generic [ref=e979]: ","
+                - generic [ref=e980]: /
+                - generic [ref=e981]: M
+                - generic [ref=e982]: E
+                - generic [ref=e983]: S
+                - generic [ref=e984]: =
+            - generic [ref=e986]: 1.40, /MES =
+          - text: 0.47, options=$0.65.
+        - generic [ref=e990]:
+          - generic [ref=e992]:
+            - button "🚀 Create Order" [ref=e998] [cursor=pointer]:
+              - paragraph [ref=e1002]: 🚀 Create Order
+            - paragraph [ref=e1007]: "🔴 Fill: 0%"
+          - generic [ref=e1009]:
+            - paragraph [ref=e1014]:
+              - strong [ref=e1015]: Put Call Parity
+              - text: "Fill:"
+              - code [ref=e1016]: 0%
+              - text: "Net edge:"
+              - code [ref=e1017]: $-0.18
+              - text: "Conf:"
+              - code [ref=e1018]: 55%
+              - emphasis [ref=e1019]: 2026-02-18 06:10
+            - paragraph [ref=e1024]:
+              - text: "Commission:"
+              - code [ref=e1025]: "1.30 | Gross:"
+              - text: "1.12"
+            - paragraph [ref=e1030]: "Legs: BUY PUT220.0 | SELL CALL220.0"
+        - generic [ref=e1034]:
+          - generic [ref=e1036]:
+            - button "🚀 Create Order" [ref=e1042] [cursor=pointer]:
+              - paragraph [ref=e1046]: 🚀 Create Order
+            - paragraph [ref=e1051]: "🔴 Fill: 0%"
+          - generic [ref=e1053]:
+            - paragraph [ref=e1058]:
+              - strong [ref=e1059]: Box Spread
+              - text: "Fill:"
+              - code [ref=e1060]: 0%
+              - text: "Net edge:"
+              - code [ref=e1061]: $-1.30
+              - text: "Conf:"
+              - code [ref=e1062]: 61%
+              - emphasis [ref=e1063]: 2026-02-18 06:10
+            - paragraph [ref=e1068]:
+              - text: "Commission:"
+              - code [ref=e1069]: "2.60 | Gross:"
+              - text: "1.30"
+            - paragraph [ref=e1074]: "Legs: BUY CALL5800.0 | SELL CALL5900.0 | SELL PUT5800.0 | BUY PUT5900.0"
+        - generic [ref=e1078]:
+          - generic [ref=e1080]:
+            - button "🚀 Create Order" [ref=e1086] [cursor=pointer]:
+              - paragraph [ref=e1090]: 🚀 Create Order
+            - paragraph [ref=e1095]: "🔴 Fill: 0%"
+          - generic [ref=e1097]:
+            - paragraph [ref=e1102]:
+              - strong [ref=e1103]: Put Call Parity
+              - text: "Fill:"
+              - code [ref=e1104]: 0%
+              - text: "Net edge:"
+              - code [ref=e1105]: $1.15
+              - text: "Conf:"
+              - code [ref=e1106]: 73%
+              - emphasis [ref=e1107]: 2026-02-18 06:10
+            - paragraph [ref=e1112]:
+              - text: "Commission:"
+              - code [ref=e1113]: "1.30 | Gross:"
+              - text: "2.45"
+            - paragraph [ref=e1118]: "Legs: BUY CALL5800.0 | SELL PUT5800.0"
+        - generic [ref=e1122]:
+          - generic [ref=e1124]:
+            - button "🚀 Create Order" [ref=e1130] [cursor=pointer]:
+              - paragraph [ref=e1134]: 🚀 Create Order
+            - paragraph [ref=e1139]: "🔴 Fill: 0%"
+          - generic [ref=e1141]:
+            - paragraph [ref=e1146]:
+              - strong [ref=e1147]: Put Call Parity
+              - text: "Fill:"
+              - code [ref=e1148]: 0%
+              - text: "Net edge:"
+              - code [ref=e1149]: $-0.18
+              - text: "Conf:"
+              - code [ref=e1150]: 55%
+              - emphasis [ref=e1151]: 2026-02-18 06:07
+            - paragraph [ref=e1156]:
+              - text: "Commission:"
+              - code [ref=e1157]: "1.30 | Gross:"
+              - text: "1.12"
+            - paragraph [ref=e1162]: "Legs: BUY PUT220.0 | SELL CALL220.0"
+        - generic [ref=e1166]:
+          - generic [ref=e1168]:
+            - button "🚀 Create Order" [ref=e1174] [cursor=pointer]:
+              - paragraph [ref=e1178]: 🚀 Create Order
+            - paragraph [ref=e1183]: "🔴 Fill: 0%"
+          - generic [ref=e1185]:
+            - paragraph [ref=e1190]:
+              - strong [ref=e1191]: Box Spread
+              - text: "Fill:"
+              - code [ref=e1192]: 0%
+              - text: "Net edge:"
+              - code [ref=e1193]: $-1.30
+              - text: "Conf:"
+              - code [ref=e1194]: 61%
+              - emphasis [ref=e1195]: 2026-02-18 06:07
+            - paragraph [ref=e1200]:
+              - text: "Commission:"
+              - code [ref=e1201]: "2.60 | Gross:"
+              - text: "1.30"
+            - paragraph [ref=e1206]: "Legs: BUY CALL5800.0 | SELL CALL5900.0 | SELL PUT5800.0 | BUY PUT5900.0"
+        - generic [ref=e1210]:
+          - generic [ref=e1212]:
+            - button "🚀 Create Order" [ref=e1218] [cursor=pointer]:
+              - paragraph [ref=e1222]: 🚀 Create Order
+            - paragraph [ref=e1227]: "🔴 Fill: 0%"
+          - generic [ref=e1229]:
+            - paragraph [ref=e1234]:
+              - strong [ref=e1235]: Put Call Parity
+              - text: "Fill:"
+              - code [ref=e1236]: 0%
+              - text: "Net edge:"
+              - code [ref=e1237]: $1.15
+              - text: "Conf:"
+              - code [ref=e1238]: 73%
+              - emphasis [ref=e1239]: 2026-02-18 06:07
+            - paragraph [ref=e1244]:
+              - text: "Commission:"
+              - code [ref=e1245]: "1.30 | Gross:"
+              - text: "2.45"
+            - paragraph [ref=e1250]: "Legs: BUY CALL5800.0 | SELL PUT5800.0"
+        - paragraph [ref=e1255]: Draft creation pre-fills Order Builder. Submission requires simulation + explicit approval.
+        - heading "📚 Options Book" [level=3] [ref=e1260]:
+          - text: 📚 Options Book
+          - generic [ref=e1261]:
+            - link "Link to heading":
+              - /url: "#options-book"
+              - img
+        - generic [ref=e1263]:
+          - paragraph [ref=e1267]: Underlying
+          - generic [ref=e1269]:
+            - generic [ref=e1270]:
+              - generic [ref=e1271]: SPX
+              - combobox "Selected SPX. Underlying" [ref=e1273]
+            - img "open" [ref=e1275]
+        - generic [ref=e1278]:
+          - generic [ref=e1282]:
+            - paragraph [ref=e1286]: Min DTE
+            - generic [ref=e1287]:
+              - spinbutton "Min DTE" [ref=e1290]: "0"
+              - generic [ref=e1291]:
+                - button [disabled] [ref=e1292]:
+                  - img [ref=e1293]
+                - button [ref=e1295] [cursor=pointer]:
+                  - img [ref=e1296]
+          - generic [ref=e1301]:
+            - paragraph [ref=e1305]: Max DTE
+            - generic [ref=e1306]:
+              - spinbutton "Max DTE" [ref=e1309]: "120"
+              - generic [ref=e1310]:
+                - button [ref=e1311] [cursor=pointer]:
+                  - img [ref=e1312]
+                - button [ref=e1314] [cursor=pointer]:
+                  - img [ref=e1315]
+          - generic [ref=e1321]:
+            - paragraph [ref=e1325]: Strikes each side
+            - generic [ref=e1326]:
+              - slider "Strikes each side" [ref=e1330]:
+                - generic:
+                  - generic:
+                    - paragraph: "8"
+              - generic:
+                - generic:
+                  - paragraph: "2"
+                - generic:
+                  - paragraph: "20"
+          - button "🔄 Load Expirations" [ref=e1336] [cursor=pointer]:
+            - paragraph [ref=e1340]: 🔄 Load Expirations
+        - paragraph [ref=e1345]: Load expirations to open the options book tabs.
+        - generic [ref=e1346]:
+          - paragraph
+        - group [ref=e1349]:
+          - generic "keyboard_arrow_right 📋 Order Builder — Pre-Trade Simulation" [ref=e1350] [cursor=pointer]:
+            - generic [ref=e1351]:
+              - generic [ref=e1353]: keyboard_arrow_right
+              - paragraph [ref=e1356]: 📋 Order Builder — Pre-Trade Simulation
+        - heading "📋 Open Orders" [level=3] [ref=e1361]:
+          - text: 📋 Open Orders
+          - generic [ref=e1362]:
+            - link "Link to heading":
+              - /url: "#open-orders"
+              - img
+        - generic [ref=e1364]:
+          - button "🔄 Refresh Orders" [ref=e1369] [cursor=pointer]:
+            - paragraph [ref=e1373]: 🔄 Refresh Orders
+          - paragraph [ref=e1380]:
+            - text: "Account:"
+            - strong [ref=e1381]: U2052408
+        - alert [ref=e1386]:
+          - paragraph [ref=e1391]: No orders found for this account. Use 🔄 Refresh to reload.
+        - heading "⚡ Flatten Risk" [level=3] [ref=e1396]:
+          - text: ⚡ Flatten Risk
+          - generic [ref=e1397]:
+            - link "Link to heading":
+              - /url: "#flatten-risk"
+              - img
+        - button "🚨 Flatten Risk — Buy to Close All Short Options" [ref=e1403] [cursor=pointer]:
+          - paragraph [ref=e1407]: 🚨 Flatten Risk — Buy to Close All Short Options
+        - heading "📓 Trade Journal" [level=3] [ref=e1412]:
+          - text: 📓 Trade Journal
+          - generic [ref=e1413]:
+            - link "Link to heading":
+              - /url: "#trade-journal"
+              - img
+        - group [ref=e1416]:
+          - generic "keyboard_arrow_right 🔍 Filters" [ref=e1417] [cursor=pointer]:
+            - generic [ref=e1418]:
+              - generic [ref=e1420]: keyboard_arrow_right
+              - paragraph [ref=e1423]: 🔍 Filters
+        - alert [ref=e1426]:
+          - paragraph [ref=e1431]: No fills match the current filters.
+        - heading "🤖 AI Assistant" [level=3] [ref=e1436]:
+          - text: 🤖 AI Assistant
+          - generic [ref=e1437]:
+            - link "Link to heading":
+              - /url: "#ai-assistant"
+              - img
+        - generic [ref=e1439]:
+          - generic [ref=e1441]:
+            - paragraph [ref=e1446]:
+              - strong [ref=e1447]: 🔍 Live Risk Audit
+            - alert [ref=e1450]:
+              - paragraph [ref=e1455]: "🚨 URGENT: Gamma exposure is critically high, immediate action required."
+            - paragraph [ref=e1460]:
+              - text: Portfolio gamma is -104.24, breaching the regime limit of 35.00. This level of negative gamma exposes the portfolio to large, nonlinear losses if SPX moves sharply. While theta (
+              - generic [ref=e1461]:
+                - math [ref=e1463]:
+                  - generic [ref=e1465]:
+                    - generic [ref=e1466]: "173.06"
+                    - generic [ref=e1467]: /
+                    - generic [ref=e1468]: d
+                    - generic [ref=e1469]: a
+                    - generic [ref=e1470]: "y"
+                    - generic [ref=e1471]: )
+                    - generic [ref=e1472]: a
+                    - generic [ref=e1473]: "n"
+                    - generic [ref=e1474]: d
+                    - generic [ref=e1475]: v
+                    - generic [ref=e1476]: e
+                    - generic [ref=e1477]: g
+                    - generic [ref=e1478]: a
+                    - generic [ref=e1479]: (
+                - generic [ref=e1481]: 173.06/day)andvega(
+              - text: 772.59) are within neutral ranges, the excessive negative gamma poses a significant risk of rapid P&L swings. The current beta-delta (20.58) is modest, but gamma risk dominates. Immediate reduction of negative gamma is essential to stabilize risk.
+            - list [ref=e1486]:
+              - listitem [ref=e1487]: Buy back short-dated SPX options or spreads to reduce negative gamma by at least 70 points.
+            - list [ref=e1492]:
+              - listitem [ref=e1493]: Add long gamma positions (e.g., buy SPX backspreads or long straddles) with 7-21 DTE.
+            - list [ref=e1498]:
+              - listitem [ref=e1499]: Reduce position count by closing high gamma-risk structures, prioritizing those near the money.
+            - paragraph [ref=e1504]: "Updated: 2026-02-19T02:40:54"
+          - generic [ref=e1506]:
+            - paragraph [ref=e1511]:
+              - strong [ref=e1512]: 📊 Market Brief
+            - alert [ref=e1515]:
+              - paragraph [ref=e1520]: No market brief available.
+        - button "📰 Refresh Brief" [ref=e1526] [cursor=pointer]:
+          - paragraph [ref=e1530]: 📰 Refresh Brief
+        - generic [ref=e1532]:
+          - paragraph [ref=e1536]: Ask for a risk adjustment
+          - textbox "Ask for a risk adjustment" [ref=e1539]:
+            - /placeholder: How should I reduce near-term gamma?
+        - group [ref=e1542]:
+          - generic "keyboard_arrow_right Assistant configuration" [ref=e1543] [cursor=pointer]:
+            - generic [ref=e1544]:
+              - generic [ref=e1546]: keyboard_arrow_right
+              - paragraph [ref=e1549]: Assistant configuration
+        - group [ref=e1552]:
+          - generic "keyboard_arrow_right 📉 IV vs HV Analysis" [ref=e1553] [cursor=pointer]:
+            - generic [ref=e1554]:
+              - generic [ref=e1556]: keyboard_arrow_right
+              - paragraph [ref=e1559]: 📉 IV vs HV Analysis
+        - group [ref=e1562]:
+          - generic "keyboard_arrow_right 📰 Market Intelligence" [ref=e1563] [cursor=pointer]:
+            - generic [ref=e1564]:
+              - generic [ref=e1566]: keyboard_arrow_right
+              - paragraph [ref=e1569]: 📰 Market Intelligence
+        - heading "📈 Historical Portfolio Charts" [level=3] [ref=e1574]:
+          - text: 📈 Historical Portfolio Charts
+          - generic [ref=e1575]:
+            - link "Link to heading":
+              - /url: "#historical-portfolio-charts"
+              - img
+        - generic [ref=e1581]:
+          - paragraph [ref=e1585]: Time Range
+          - generic [ref=e1587]:
+            - generic [ref=e1588]:
+              - generic [ref=e1589]: 1W
+              - combobox "Selected 1W. Time Range" [ref=e1591]
+            - img "open" [ref=e1593]
+        - heading "Net Liquidation vs SPX Beta-Delta" [level=4] [ref=e1602]:
+          - text: Net Liquidation vs SPX Beta-Delta
+          - generic [ref=e1603]:
+            - link "Link to heading":
+              - /url: "#net-liquidation-vs-spx-beta-delta"
+              - img
+        - generic [ref=e1609]:
+          - img:
+            - generic:
+              - generic:
+                - generic:
+                  - generic:
+                    - generic: 00:00Feb 23, 2026
+                  - generic:
+                    - generic: 12:00
+                  - generic:
+                    - generic: 00:00Feb 24, 2026
+                  - generic:
+                    - generic: 12:00
+                  - generic:
+                    - generic: 00:00Feb 25, 2026
+                  - generic:
+                    - generic: 12:00
+                  - generic:
+                    - generic: 00:00Feb 26, 2026
+                - generic:
+                  - generic:
+                    - generic: 100k
+                  - generic:
+                    - generic: 105k
+                  - generic:
+                    - generic: 110k
+                - generic:
+                  - generic:
+                    - generic:
+                      - generic: −150
+                    - generic:
+                      - generic: −100
+                    - generic:
+                      - generic: −50
+                    - generic:
+                      - generic: "0"
+                    - generic:
+                      - generic: "50"
+                    - generic:
+                      - generic: "100"
+          - img:
+            - generic:
+              - generic [ref=e1630]:
+                - generic [ref=e1632]: Net Liquidation ($)
+                - generic [ref=e1635]: SPX Beta-Delta
+              - generic:
+                - generic: Time
+              - generic:
+                - generic: Net Liquidation Value ($)
+              - generic:
+                - generic: SPX Beta-Delta
+          - toolbar [ref=e1637]:
+            - button "Download plot as a PNG" [ref=e1639] [cursor=pointer]:
+              - img [ref=e1640]
+            - generic [ref=e1642]:
+              - button "Zoom" [ref=e1643] [cursor=pointer]:
+                - img [ref=e1644]
+              - button "Pan" [ref=e1646] [cursor=pointer]:
+                - img [ref=e1647]
+            - generic [ref=e1649]:
+              - button "Zoom in" [ref=e1650] [cursor=pointer]:
+                - img [ref=e1651]
+              - button "Zoom out" [ref=e1653] [cursor=pointer]:
+                - img [ref=e1654]
+              - button "Autoscale" [ref=e1656] [cursor=pointer]:
+                - img [ref=e1657]
+              - button "Reset axes" [ref=e1659] [cursor=pointer]:
+                - img [ref=e1660]
+            - button "Fullscreen" [ref=e1663] [cursor=pointer]:
+              - img [ref=e1664]
+          - img
+        - heading "Income-to-Risk Efficiency (Θ/Δ)" [level=4] [ref=e1671]:
+          - text: Income-to-Risk Efficiency (Θ/Δ)
+          - generic [ref=e1672]:
+            - link "Link to heading":
+              - /url: "#income-to-risk-efficiency-th-d"
+              - img
+        - generic [ref=e1678]:
+          - img:
+            - generic:
+              - generic:
+                - generic:
+                  - generic:
+                    - generic: 00:00Feb 23, 2026
+                  - generic:
+                    - generic: 12:00
+                  - generic:
+                    - generic: 00:00Feb 24, 2026
+                  - generic:
+                    - generic: 12:00
+                  - generic:
+                    - generic: 00:00Feb 25, 2026
+                  - generic:
+                    - generic: 12:00
+                  - generic:
+                    - generic: 00:00Feb 26, 2026
+                - generic:
+                  - generic:
+                    - generic: −2000
+                  - generic:
+                    - generic: "0"
+                  - generic:
+                    - generic: "2000"
+                  - generic:
+                    - generic: "4000"
+                  - generic:
+                    - generic: "6000"
+          - img:
+            - generic:
+              - generic:
+                - generic: Time
+              - generic:
+                - generic: Income-to-Risk Efficiency Ratio (Θ/Δ)
+          - toolbar [ref=e1692]:
+            - button "Download plot as a PNG" [ref=e1694] [cursor=pointer]:
+              - img [ref=e1695]
+            - generic [ref=e1697]:
+              - button "Zoom" [ref=e1698] [cursor=pointer]:
+                - img [ref=e1699]
+              - button "Pan" [ref=e1701] [cursor=pointer]:
+                - img [ref=e1702]
+            - generic [ref=e1704]:
+              - button "Zoom in" [ref=e1705] [cursor=pointer]:
+                - img [ref=e1706]
+              - button "Zoom out" [ref=e1708] [cursor=pointer]:
+                - img [ref=e1709]
+              - button "Autoscale" [ref=e1711] [cursor=pointer]:
+                - img [ref=e1712]
+              - button "Reset axes" [ref=e1714] [cursor=pointer]:
+                - img [ref=e1715]
+            - button "Fullscreen" [ref=e1718] [cursor=pointer]:
+              - img [ref=e1719]
+          - img
+        - heading "Sebastian Ratio |Θ|/|V|" [level=4] [ref=e1726]:
+          - text: Sebastian Ratio |Θ|/|V|
+          - generic [ref=e1727]:
+            - link "Link to heading":
+              - /url: "#sebastian-ratio-th-v"
+              - img
+        - generic [ref=e1733]:
+          - img:
+            - generic:
+              - generic:
+                - generic:
+                  - generic:
+                    - generic: 00:00Feb 23, 2026
+                  - generic:
+                    - generic: 12:00
+                  - generic:
+                    - generic: 00:00Feb 24, 2026
+                  - generic:
+                    - generic: 12:00
+                  - generic:
+                    - generic: 00:00Feb 25, 2026
+                  - generic:
+                    - generic: 12:00
+                  - generic:
+                    - generic: 00:00Feb 26, 2026
+                  - generic:
+                    - generic: 12:00
+                - generic:
+                  - generic:
+                    - generic: "0"
+                  - generic:
+                    - generic: "1"
+                  - generic:
+                    - generic: "2"
+                  - generic:
+                    - generic: "3"
+          - img:
+            - generic:
+              - generic:
+                - generic: Time
+              - generic:
+                - generic: Sebastian Ratio (|Θ|/|V|)
+              - generic:
+                - generic:
+                  - generic:
+                    - generic: Target (0.25–0.40)
+              - generic:
+                - generic:
+                  - generic:
+                    - generic: Floor 0.20
+              - generic:
+                - generic:
+                  - generic:
+                    - generic: Cap 0.50
+          - toolbar [ref=e1747]:
+            - button "Download plot as a PNG" [ref=e1749] [cursor=pointer]:
+              - img [ref=e1750]
+            - generic [ref=e1752]:
+              - button "Zoom" [ref=e1753] [cursor=pointer]:
+                - img [ref=e1754]
+              - button "Pan" [ref=e1756] [cursor=pointer]:
+                - img [ref=e1757]
+            - generic [ref=e1759]:
+              - button "Zoom in" [ref=e1760] [cursor=pointer]:
+                - img [ref=e1761]
+              - button "Zoom out" [ref=e1763] [cursor=pointer]:
+                - img [ref=e1764]
+              - button "Autoscale" [ref=e1766] [cursor=pointer]:
+                - img [ref=e1767]
+              - button "Reset axes" [ref=e1769] [cursor=pointer]:
+                - img [ref=e1770]
+            - button "Fullscreen" [ref=e1773] [cursor=pointer]:
+              - img [ref=e1774]
+          - img
+        - paragraph [ref=e1780]:
+          - text: "Current Sebastian Ratio:"
+          - strong [ref=e1781]: "1.919"
+          - text: — 🔴 Outside bounds
+        - paragraph [ref=e1786]: ·
+  - img [ref=e1787]
