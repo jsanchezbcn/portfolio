@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 
 from agents.llm_client import build_session_config
@@ -13,6 +16,13 @@ def test_build_session_config_has_no_openai_provider(monkeypatch):
     cfg = build_session_config("gpt-5-mini")
 
     assert "provider" not in cfg
+
+
+def test_build_session_config_includes_aistudio_provider():
+    cfg = build_session_config("aistudio:gemini-3.1-flash-lite-preview")
+
+    assert cfg["provider"] == "aistudio"
+    assert cfg["model"] == "gemini-3.1-flash-lite-preview"
 
 
 def test_build_session_config_includes_system_message(monkeypatch):
@@ -71,3 +81,46 @@ async def test_async_llm_chat_ignores_token_like_active_account(monkeypatch):
 
     assert text == "ok"
     assert switched == ["jose-antonio-sanchez_hpi"]
+
+
+@pytest.mark.asyncio
+async def test_async_llm_chat_routes_aistudio_models(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_aistudio_chat(*, prompt, model, system, timeout):
+        calls.append(model)
+        return "gemini ok"
+
+    monkeypatch.setattr(llm_client, "_aistudio_chat", fake_aistudio_chat)
+
+    text = await llm_client.async_llm_chat("ping", model="aistudio:gemini-3.1-flash-lite-preview", timeout=1.0)
+
+    assert text == "gemini ok"
+    assert calls == ["gemini-3.1-flash-lite-preview"]
+
+
+@pytest.mark.asyncio
+async def test_async_list_models_keeps_hardcoded_aistudio_entry(monkeypatch):
+    class FakeClient:
+        async def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+        async def list_models(self):
+            return [
+                SimpleNamespace(
+                    id="gpt-5-mini",
+                    name="GPT-5 mini",
+                    policy=SimpleNamespace(state="enabled"),
+                    billing=SimpleNamespace(multiplier=0.0),
+                )
+            ]
+
+    monkeypatch.setitem(sys.modules, "copilot", SimpleNamespace(CopilotClient=lambda _cfg: FakeClient()))
+
+    models = await llm_client.async_list_models()
+
+    assert any(model["id"] == "gpt-5-mini" for model in models)
+    assert any(model["id"] == "aistudio:gemini-3.1-flash-lite-preview" for model in models)

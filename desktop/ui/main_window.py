@@ -19,6 +19,7 @@ Layout:
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import (
@@ -181,9 +182,10 @@ class MainWindow(QMainWindow):
         )
 
     def _setup_auto_refresh(self) -> None:
-        """Auto-refresh positions every 5 minutes while connected."""
+        """Auto-refresh positions every 60 seconds while connected."""
         self._refresh_timer = QTimer(self)
-        self._refresh_timer.setInterval(300_000)  # 5 min
+        refresh_ms = max(5_000, int(os.getenv("DESKTOP_PORTFOLIO_REFRESH_MS", "60000")))
+        self._refresh_timer.setInterval(refresh_ms)
         self._refresh_timer.timeout.connect(self._on_refresh_all)
 
     def _connect_signals(self) -> None:
@@ -250,11 +252,32 @@ class MainWindow(QMainWindow):
         if action == "ROLL":
             rationale = (
                 "Roll requested — current position legs are staged as closing legs. "
-                "Adjust expiry, strikes, or add opening legs before submitting."
+                "The chain tab has been opened on the same underlying with a target expiry about 7 days out so you can pick the opening leg(s)."
             )
         self._order_entry.prefill_from_legs(staged_legs, rationale=rationale, source=f"Portfolio {action.title()}")
+        if action == "ROLL":
+            self._tabs.setCurrentWidget(self._chain_tab)
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._async_focus_roll_chain(rows))
         self._statusbar.showMessage(
             f"Portfolio action staged: {action.title()} {payload.get('description') or 'position'}"
+        )
+
+    async def _async_focus_roll_chain(self, rows: list) -> None:
+        option_rows = [row for row in rows if str(getattr(row, "sec_type", "") or "").upper() in {"OPT", "FOP"}]
+        if not option_rows:
+            return
+        first_row = option_rows[0]
+        underlying = getattr(first_row, "underlying", None) or getattr(first_row, "symbol", "")
+        sec_type = str(getattr(first_row, "sec_type", "OPT") or "OPT").upper()
+        exchange = "CME" if sec_type == "FOP" else "SMART"
+        expiry = getattr(first_row, "expiry", None)
+        await self._chain_tab.focus_roll_target(
+            underlying=str(underlying or ""),
+            sec_type=sec_type,
+            exchange=exchange,
+            current_expiry=str(expiry or ""),
+            min_days_forward=7,
         )
 
     def _build_portfolio_order_legs(self, rows: list, action: str, from_trade_group: bool) -> list[dict]:

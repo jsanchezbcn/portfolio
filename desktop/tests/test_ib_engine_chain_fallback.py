@@ -61,7 +61,7 @@ async def test_get_available_expiries_combines_next_two_futures_months():
 
     async def _secdef(symbol, fut_fop_exchange, sec_type, conid):
         if conid == 101:
-            return [SimpleNamespace(exchange="CME", expirations=["20260309", "20260320"])]
+            return [SimpleNamespace(exchange="CME", expirations=["20260311", "20260320"])]
         if conid == 202:
             return [SimpleNamespace(exchange="CME", expirations=["20260430", "20260529", "20260619"])]
         return []
@@ -70,7 +70,7 @@ async def test_get_available_expiries_combines_next_two_futures_months():
 
     expiries = await engine.get_available_expiries("ES", sec_type="FOP", exchange="CME")
 
-    assert expiries == ["20260309", "20260320", "20260430", "20260529", "20260619"]
+    assert expiries == ["20260311", "20260320", "20260430", "20260529", "20260619"]
 
 
 @pytest.mark.asyncio
@@ -125,6 +125,53 @@ async def test_get_chain_uses_future_month_that_contains_selected_expiry():
 
     assert rows
     assert all(row.expiry == "20260430" for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_get_chain_uses_database_cache_before_refetching_live_chain():
+    engine = IBEngine()
+    engine._ib = MagicMock()
+    engine._db_ok = True
+    engine._db = SimpleNamespace(
+        get_cached_chain=AsyncMock(
+            side_effect=[
+                [
+                    {
+                        "underlying": "ES",
+                        "expiry": date(2026, 3, 11),
+                        "strike": 6800.0,
+                        "option_right": "C",
+                        "conid": 101,
+                        "bid": 12.5,
+                        "ask": 13.0,
+                        "last": 12.75,
+                        "volume": 10,
+                        "open_interest": 20,
+                        "iv": 0.22,
+                        "delta": 0.31,
+                        "gamma": 0.01,
+                        "theta": -0.15,
+                        "vega": 0.85,
+                    }
+                ],
+                [],
+            ]
+        )
+    )
+    engine.cancel_chain_streaming = MagicMock()
+
+    rows = await engine.get_chain(
+        "ES",
+        expiry=date(2026, 3, 11),
+        sec_type="FOP",
+        exchange="CME",
+        max_strikes=1,
+    )
+
+    assert len(rows) == 1
+    assert rows[0].conid == 101
+    assert rows[0].delta == 0.31
+    assert not engine._ib.reqSecDefOptParamsAsync.called
 
 
 @pytest.mark.asyncio

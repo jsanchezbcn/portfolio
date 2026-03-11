@@ -4,6 +4,7 @@ desktop/tests/test_whatif_order.py — Unit tests for WhatIf order simulations.
 Tests the whatif_order() async method with various leg configurations.
 """
 import asyncio
+import logging
 import pytest
 from unittest.mock import MagicMock, AsyncMock
 from types import SimpleNamespace
@@ -121,6 +122,39 @@ class TestWhatIfSingleLeg:
         assert result["maint_margin_change"] == -1200.0
         assert result["equity_with_loan_change"] == 3500.0
         assert ib_engine._ib.whatIfOrderAsync.called
+
+    @pytest.mark.asyncio
+    async def test_whatif_logs_trade_details(self, ib_engine, caplog):
+        option_contract = SimpleNamespace(
+            conId=123456789,
+            symbol="SPY",
+            secType="OPT",
+            exchange="CBOE",
+            currency="USD",
+            strike=450.0,
+            right="C",
+            lastTradeDateOrContractMonth="20260418",
+        )
+        ib_engine._ib.qualifyContractsAsync = AsyncMock(return_value=[option_contract])
+        ib_engine._ib.whatIfOrderAsync = AsyncMock(return_value=MockOrderState())
+
+        with caplog.at_level(logging.INFO):
+            await ib_engine.whatif_order([
+                {
+                    "symbol": "SPY",
+                    "action": "SELL",
+                    "qty": 5,
+                    "strike": 450.0,
+                    "right": "C",
+                    "expiry": "20260418",
+                    "sec_type": "OPT",
+                    "exchange": "CBOE",
+                }
+            ])
+
+        assert "WhatIf start:" in caplog.text
+        assert "SPY" in caplog.text
+        assert "450C" in caplog.text
 
 
 class TestWhatIfMultiLeg:
@@ -252,6 +286,37 @@ class TestWhatIfErrors:
         assert captured["expiry"] == "20260430"
 
     @pytest.mark.asyncio
+    async def test_whatif_normalizes_weekly_fop_aliases_before_qualification(self, ib_engine):
+        captured: dict[str, str] = {}
+
+        async def qualify_capture(*contracts):
+            contract = contracts[0]
+            captured["symbol"] = getattr(contract, "symbol", "")
+            captured["sec_type"] = getattr(contract, "secType", "")
+            captured["exchange"] = getattr(contract, "exchange", "")
+            contract.conId = 654321
+            return [contract]
+
+        ib_engine._ib.qualifyContractsAsync = AsyncMock(side_effect=qualify_capture)
+        ib_engine._ib.whatIfOrderAsync = AsyncMock(return_value=MockOrderState())
+
+        result = await ib_engine.whatif_order([
+            {
+                "symbol": "EWJ6",
+                "sec_type": "OPT",
+                "exchange": "SMART",
+                "action": "BUY",
+                "qty": 2,
+                "strike": 6950.0,
+                "right": "C",
+                "expiry": "20260430",
+            }
+        ])
+
+        assert result["status"] == "success"
+        assert captured == {"symbol": "ES", "sec_type": "FOP", "exchange": "CME"}
+
+    @pytest.mark.asyncio
     async def test_whatif_no_contracts_qualified(self, ib_engine):
         """Test WhatIf when no contracts can be qualified."""
         # Empty return from qualification
@@ -301,6 +366,76 @@ class TestWhatIfErrors:
 
         assert result["status"] == "error"
         assert "Only 1/2" in result.get("error", "")
+
+    @pytest.mark.asyncio
+    async def test_whatif_resolves_missing_legs_after_partial_batch_qualification(self, ib_engine):
+        """Partial batch qualification should still recover missing legs via strict detail lookups."""
+        resolved_es_short = SimpleNamespace(
+            conId=101,
+            symbol="ES",
+            secType="FOP",
+            exchange="CME",
+            currency="USD",
+            strike=5100.0,
+            right="C",
+            lastTradeDateOrContractMonth="20260313",
+        )
+        resolved_mes_short = SimpleNamespace(
+            conId=201,
+            symbol="MES",
+            secType="FOP",
+            exchange="CME",
+            currency="USD",
+            strike=5100.0,
+            right="C",
+            lastTradeDateOrContractMonth="20260313",
+        )
+        resolved_es_long = SimpleNamespace(
+            conId=102,
+            symbol="ES",
+            secType="FOP",
+            exchange="CME",
+            currency="USD",
+            strike=5115.0,
+            right="C",
+            lastTradeDateOrContractMonth="20260313",
+        )
+        resolved_mes_long = SimpleNamespace(
+            conId=202,
+            symbol="MES",
+            secType="FOP",
+            exchange="CME",
+            currency="USD",
+            strike=5110.0,
+            right="C",
+            lastTradeDateOrContractMonth="20260313",
+        )
+
+        ib_engine._ib.qualifyContractsAsync = AsyncMock(return_value=[resolved_es_short, resolved_mes_short])
+
+        async def req_contract_details(contract):
+            strike = float(getattr(contract, "strike", 0.0) or 0.0)
+            symbol = getattr(contract, "symbol", "")
+            if symbol == "ES" and strike == 5115.0:
+                return [SimpleNamespace(contract=resolved_es_long)]
+            if symbol == "MES" and strike == 5110.0:
+                return [SimpleNamespace(contract=resolved_mes_long)]
+            return []
+
+        ib_engine._ib.reqContractDetailsAsync = AsyncMock(side_effect=req_contract_details)
+        ib_engine._ib.whatIfOrderAsync = AsyncMock(return_value=MockOrderState())
+
+        legs = [
+            {"symbol": "ES", "action": "SELL", "qty": 1, "sec_type": "FOP", "exchange": "CME", "strike": 5100.0, "right": "C", "expiry": "20260313"},
+            {"symbol": "ES", "action": "BUY", "qty": 1, "sec_type": "FOP", "exchange": "CME", "strike": 5115.0, "right": "C", "expiry": "20260313"},
+            {"symbol": "MES", "action": "SELL", "qty": 1, "sec_type": "FOP", "exchange": "CME", "strike": 5100.0, "right": "C", "expiry": "20260313"},
+            {"symbol": "MES", "action": "BUY", "qty": 1, "sec_type": "FOP", "exchange": "CME", "strike": 5110.0, "right": "C", "expiry": "20260313"},
+        ]
+
+        result = await ib_engine.whatif_order(legs)
+
+        assert result["status"] == "success"
+        assert ib_engine._ib.reqContractDetailsAsync.await_count == 2
 
 
 class TestWhatIfWithRealValues:

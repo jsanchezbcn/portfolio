@@ -35,6 +35,15 @@ class TestAIRiskTab:
 
         assert _default_trades_model() == "gpt-4.1"
 
+    def test_aistudio_model_skips_tool_session(self, qtbot, mock_engine, monkeypatch):
+        monkeypatch.setenv("LLM_FAST_MODEL", "aistudio:gemini-3.1-flash-lite-preview")
+
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        assert tab.current_model == "aistudio:gemini-3.1-flash-lite-preview"
+        assert tab._model_supports_tool_session() is False
+
     def test_default_model_picker_has_entries(self, qtbot, mock_engine):
         tab = AIRiskTab(mock_engine)
         qtbot.addWidget(tab)
@@ -205,6 +214,117 @@ class TestAIRiskTab:
                 inactivity_timeout=0.05,
                 activity_event=asyncio.Event(),
             )
+
+    @pytest.mark.asyncio
+    async def test_wait_for_session_response_allows_active_tool_to_finish(self, qtbot, mock_engine):
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        class SlowSession:
+            async def send_and_wait(self, payload):
+                await asyncio.sleep(0.12)
+                return {"ok": True, "payload": payload}
+
+        activity_event = asyncio.Event()
+        tab._ai_request_active_tools = {
+            "whatif_order#1": {"name": "whatif_order", "started_at": 0.0, "detail": "SELL 1 MES 20260320 5700C FOP @CME"}
+        }
+
+        async def finish_tool():
+            await asyncio.sleep(0.07)
+            tab._ai_request_active_tools.clear()
+            activity_event.set()
+
+        asyncio.create_task(finish_tool())
+        result = await tab._wait_for_session_response(
+            SlowSession(),
+            {"prompt": "hello"},
+            inactivity_timeout=0.05,
+            max_total_timeout=0.30,
+            activity_event=activity_event,
+        )
+
+        assert result["ok"] is True
+        assert result["payload"]["prompt"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_async_ask_uses_prompt_context_for_aistudio_model(self, qtbot, mock_engine, monkeypatch):
+        monkeypatch.setenv("LLM_FAST_MODEL", "aistudio:gemini-3.1-flash-lite-preview")
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        calls: list[str] = []
+
+        async def fake_prompt_context(question: str) -> None:
+            calls.append(question)
+
+        monkeypatch.setattr(tab, "_async_answer_with_context_prompt", fake_prompt_context)
+
+        await tab._async_ask("propose a hedge")
+
+        assert calls == ["propose a hedge"]
+
+    @pytest.mark.asyncio
+    async def test_async_ask_falls_back_to_prompt_context_after_tool_timeout(self, qtbot, mock_engine):
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        calls: list[str] = []
+
+        async def fake_tool_session(question: str) -> None:
+            raise asyncio.TimeoutError("tool session stalled")
+
+        async def fake_prompt_context(question: str) -> None:
+            calls.append(question)
+
+        tab._async_answer_with_tool_session = fake_tool_session  # type: ignore[method-assign]
+        tab._async_answer_with_context_prompt = fake_prompt_context  # type: ignore[method-assign]
+
+        await tab._async_ask("propose a hedge")
+
+        assert calls == ["propose a hedge"]
+        assert "retrying with direct portfolio-context prompt" in tab._txt_chat.toPlainText().lower()
+
+    @pytest.mark.asyncio
+    async def test_run_logged_tool_records_whatif_detail_and_result(self, qtbot, mock_engine):
+        tab = AIRiskTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        tool_calls: list[str] = []
+        tab._set_ai_request_logging_context(
+            activity_event=asyncio.Event(),
+            tool_calls=tool_calls,
+            debug_tool_calls=True,
+        )
+
+        async def runner():
+            return {"status": "success", "init_margin_change": -1200.0}
+
+        try:
+            result = await tab._run_logged_tool(
+                "whatif_order",
+                {
+                    "legs": [
+                        {
+                            "symbol": "MES",
+                            "action": "SELL",
+                            "qty": 1,
+                            "sec_type": "FOP",
+                            "exchange": "CME",
+                            "expiry": "20260320",
+                            "strike": 5700,
+                            "right": "C",
+                        }
+                    ]
+                },
+                runner,
+            )
+        finally:
+            tab._clear_ai_request_logging_context()
+
+        assert result["status"] == "success"
+        assert any("Calling tool: whatif_order" in line and "MES" in line and "5700C" in line for line in tool_calls)
+        assert any("Tool complete: whatif_order" in line and "status=success" in line for line in tool_calls)
 
 
 class TestGetCopilotAccount:

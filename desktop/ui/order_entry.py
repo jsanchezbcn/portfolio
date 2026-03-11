@@ -34,6 +34,20 @@ if TYPE_CHECKING:
 _TICK = {"FOP": 0.05, "OPT": 0.01, "STK": 0.01, "FUT": 0.25}
 _FUTURES_TICKS = {"ES": 0.25, "MES": 0.25, "NQ": 0.25, "MNQ": 0.25, "RTY": 0.10, "YM": 1.0}
 _DEFAULT_TICK = 0.05
+_INSTRUMENT_ALIASES = {
+    "ES": {"symbol": "ES", "sec_type": "FOP", "exchange": "CME"},
+    "MES": {"symbol": "MES", "sec_type": "FOP", "exchange": "CME"},
+    "NQ": {"symbol": "NQ", "sec_type": "FOP", "exchange": "CME"},
+    "MNQ": {"symbol": "MNQ", "sec_type": "FOP", "exchange": "CME"},
+    "RTY": {"symbol": "RTY", "sec_type": "FOP", "exchange": "CME"},
+    "YM": {"symbol": "YM", "sec_type": "FOP", "exchange": "CBOT"},
+    "SPY": {"symbol": "SPY", "sec_type": "STK", "exchange": "SMART"},
+    "QQQ": {"symbol": "QQQ", "sec_type": "STK", "exchange": "SMART"},
+    "IWM": {"symbol": "IWM", "sec_type": "STK", "exchange": "SMART"},
+    "AAPL": {"symbol": "AAPL", "sec_type": "STK", "exchange": "SMART"},
+    "SPX": {"symbol": "SPX", "sec_type": "OPT", "exchange": "CBOE"},
+    "VIX": {"symbol": "VIX", "sec_type": "OPT", "exchange": "CBOE"},
+}
 
 
 def _tick_for_legs(legs: list[dict]) -> float:
@@ -97,6 +111,7 @@ class OrderEntryPanel(QWidget):
         self._current_tick: float = _DEFAULT_TICK
         self._slider_busy: bool = False
         self._refresh_running: bool = False  # guard: no concurrent auto-refreshes
+        self._price_mode: str = "mid"
         # Auto-refresh bid/ask every 5 seconds while legs are staged
         self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.setInterval(5_000)
@@ -114,8 +129,8 @@ class OrderEntryPanel(QWidget):
         form_box.setMaximumHeight(155)
         h = QHBoxLayout(form_box)
         col1 = QFormLayout(); col1.setSpacing(3)
-        self._txt_symbol = QLineEdit(); self._txt_symbol.setPlaceholderText("ES, SPY…"); self._txt_symbol.setMaximumWidth(80)
-        col1.addRow("Symbol:", self._txt_symbol)
+        self._txt_symbol = QLineEdit(); self._txt_symbol.setPlaceholderText("ES, SPY, /es…"); self._txt_symbol.setMaximumWidth(100)
+        col1.addRow("Symbol/Search:", self._txt_symbol)
         self._cmb_sec_type = QComboBox(); self._cmb_sec_type.addItems(["FOP","OPT","STK","FUT"])
         col1.addRow("SecType:", self._cmb_sec_type)
         self._cmb_exchange = QComboBox(); self._cmb_exchange.addItems(["CME","SMART","CBOE","GLOBEX"])
@@ -216,6 +231,7 @@ class OrderEntryPanel(QWidget):
         self._engine.disconnected.connect(self._on_disconnected)
         self._engine.connected.connect(self._auto_refresh_timer.start)
         self._engine.disconnected.connect(self._auto_refresh_timer.stop)
+        self._txt_symbol.editingFinished.connect(self._on_symbol_search)
 
     # public pre-fill
 
@@ -284,8 +300,38 @@ class OrderEntryPanel(QWidget):
         self._bid_ask.append({"bid": bid, "ask": ask, "mid": mid})
         self._render_table(); self._update_price_controls()
 
+    def _resolve_instrument_search(self, text: str) -> dict | None:
+        query = str(text or "").strip().upper()
+        if not query:
+            return None
+        normalized = query[1:] if query.startswith("/") else query
+        alias = _INSTRUMENT_ALIASES.get(normalized)
+        if alias is None:
+            return None
+        resolved = dict(alias)
+        current_sec_type = self._cmb_sec_type.currentText().upper()
+        if current_sec_type in {"FOP", "FUT"} and resolved["exchange"] in {"CME", "CBOT"}:
+            resolved["sec_type"] = current_sec_type
+        if current_sec_type == "OPT" and resolved["exchange"] == "SMART":
+            resolved["sec_type"] = "OPT"
+        return resolved
+
+    @Slot()
+    def _on_symbol_search(self) -> None:
+        resolved = self._resolve_instrument_search(self._txt_symbol.text())
+        if resolved is None:
+            return
+        self._txt_symbol.setText(resolved["symbol"])
+        self._cmb_sec_type.setCurrentText(resolved["sec_type"])
+        if self._cmb_exchange.findText(resolved["exchange"]) >= 0:
+            self._cmb_exchange.setCurrentText(resolved["exchange"])
+        self._lbl_result.setText(
+            f"Resolved instrument: {resolved['symbol']} {resolved['sec_type']} @ {resolved['exchange']}"
+        )
+
     @Slot()
     def _on_add_leg(self) -> None:
+        self._on_symbol_search()
         sym = self._txt_symbol.text().strip().upper()
         if not sym: return
         right = self._cmb_right.currentText().upper()
@@ -306,6 +352,7 @@ class OrderEntryPanel(QWidget):
     @Slot()
     def _on_clear_legs(self) -> None:
         self._staged_legs.clear(); self._bid_ask.clear()
+        self._price_mode = "mid"
         self._render_table(); self._update_price_controls(); self._lbl_result.setText("")
 
     @Slot()
@@ -374,11 +421,20 @@ class OrderEntryPanel(QWidget):
         self._lbl_bid.setText(f"${lo:+.2f}"); self._lbl_mid.setText(f"${mid:+.2f}"); self._lbl_ask.setText(f"${hi:+.2f}")
         tick = self._current_tick
         lo_t, hi_t, mid_t = round(lo/tick), round(hi/tick), round(mid/tick)
+        current_t = round(self._spn_limit.value() / tick) if tick > 0 else mid_t
+        if self._price_mode == "bid":
+            target_t = lo_t
+        elif self._price_mode == "ask":
+            target_t = hi_t
+        elif self._price_mode == "manual":
+            target_t = min(max(current_t, min(lo_t, hi_t)), max(lo_t, hi_t))
+        else:
+            target_t = mid_t
         self._slider_busy = True
         if lo_t < hi_t:
-            self._slider.setRange(lo_t, hi_t); self._slider.setValue(mid_t); self._slider.setEnabled(True)
+            self._slider.setRange(lo_t, hi_t); self._slider.setValue(target_t); self._slider.setEnabled(True)
         else:
-            self._slider.setRange(lo_t - 20, lo_t + 20); self._slider.setValue(lo_t); self._slider.setEnabled(True)
+            self._slider.setRange(lo_t - 20, lo_t + 20); self._slider.setValue(target_t); self._slider.setEnabled(True)
         self._slider_busy = False
         self._spn_limit.setValue(round(self._slider.value() * tick, 2))
 
@@ -386,12 +442,37 @@ class OrderEntryPanel(QWidget):
     def _on_slider_changed(self) -> None:
         if self._slider_busy: return
         price = round(self._slider.value() * self._current_tick, 2)
+        try:
+            lo, hi, mid = _net_prices(self._staged_legs, self._bid_ask)
+        except Exception:
+            lo = hi = mid = None
+        if lo is not None and abs(price - lo) < 1e-9:
+            self._price_mode = "bid"
+        elif hi is not None and abs(price - hi) < 1e-9:
+            self._price_mode = "ask"
+        elif mid is not None and abs(price - mid) < 1e-9:
+            self._price_mode = "mid"
+        else:
+            self._price_mode = "manual"
         self._slider_busy = True; self._spn_limit.setValue(price); self._slider_busy = False
 
     @Slot()
     def _on_spinbox_changed(self) -> None:
         if self._slider_busy or self._current_tick <= 0: return
         t = round(self._spn_limit.value() / self._current_tick)
+        try:
+            lo, hi, mid = _net_prices(self._staged_legs, self._bid_ask)
+        except Exception:
+            lo = hi = mid = None
+        value = round(self._spn_limit.value(), 2)
+        if lo is not None and abs(value - lo) < 1e-9:
+            self._price_mode = "bid"
+        elif hi is not None and abs(value - hi) < 1e-9:
+            self._price_mode = "ask"
+        elif mid is not None and abs(value - mid) < 1e-9:
+            self._price_mode = "mid"
+        else:
+            self._price_mode = "manual"
         self._slider_busy = True; self._slider.setValue(int(t)); self._slider_busy = False
 
     @Slot(str)

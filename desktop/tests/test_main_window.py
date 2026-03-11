@@ -237,6 +237,7 @@ class TestMainWindowPortfolioActions:
         assert len(win._order_entry._staged_legs) == 2
         assert {leg["action"] for leg in win._order_entry._staged_legs} == {"BUY", "SELL"}
         assert "Roll requested" in win._order_entry._txt_rationale.toPlainText()
+        assert win._tabs.currentWidget() is win._chain_tab
 
 
 class TestMainWindowCompactMode:

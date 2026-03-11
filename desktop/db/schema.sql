@@ -41,6 +41,8 @@ vega DOUBLE PRECISION,
 iv DOUBLE PRECISION,
 
 -- Beta-weighted Greeks
+
+
 spx_delta       DOUBLE PRECISION,
     beta            DOUBLE PRECISION,
 
@@ -259,3 +261,146 @@ CREATE TABLE IF NOT EXISTS risk_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_risk_snap_ts ON risk_snapshots (timestamp DESC);
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- 10. Strategy associations — reconstructed multi-leg strategies
+-- ────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS strategy_groups (
+    association_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    strategy_name TEXT NOT NULL,
+    strategy_family TEXT,
+    underlying TEXT NOT NULL,
+    expiry_label TEXT,
+    matched_by TEXT,
+    leg_count INTEGER NOT NULL DEFAULT 0,
+    net_delta DOUBLE PRECISION,
+    net_gamma DOUBLE PRECISION,
+    net_theta DOUBLE PRECISION,
+    net_vega DOUBLE PRECISION,
+    net_spx_delta DOUBLE PRECISION,
+    market_value DOUBLE PRECISION,
+    unrealized_pnl DOUBLE PRECISION,
+    realized_pnl DOUBLE PRECISION,
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_groups_account ON strategy_groups (
+    account_id,
+    underlying,
+    synced_at DESC
+);
+
+CREATE TABLE IF NOT EXISTS strategy_group_legs (
+    association_id TEXT NOT NULL REFERENCES strategy_groups (association_id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL,
+    leg_index INTEGER NOT NULL,
+    conid BIGINT NOT NULL,
+    symbol TEXT NOT NULL,
+    sec_type TEXT NOT NULL,
+    underlying TEXT,
+    expiry DATE,
+    strike DOUBLE PRECISION,
+    option_right CHAR(1),
+    quantity DOUBLE PRECISION NOT NULL,
+    avg_cost DOUBLE PRECISION,
+    market_price DOUBLE PRECISION,
+    market_value DOUBLE PRECISION,
+    unrealized_pnl DOUBLE PRECISION,
+    realized_pnl DOUBLE PRECISION,
+    delta DOUBLE PRECISION,
+    gamma DOUBLE PRECISION,
+    theta DOUBLE PRECISION,
+    vega DOUBLE PRECISION,
+    iv DOUBLE PRECISION,
+    spx_delta DOUBLE PRECISION,
+    leg_role TEXT,
+    synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (association_id, leg_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_group_legs_account ON strategy_group_legs (
+    account_id,
+    underlying,
+    expiry
+);
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- 11. Positions cache — minute-by-minute snapshots for LLM tools
+-- ────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS positions_cache (
+    id SERIAL PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    snapshot_id TEXT NOT NULL, -- UUID per refresh cycle
+    conid BIGINT NOT NULL,
+    symbol TEXT NOT NULL,
+    sec_type TEXT NOT NULL,
+    underlying TEXT,
+    expiry DATE,
+    strike DOUBLE PRECISION,
+    option_right CHAR(1),
+    quantity DOUBLE PRECISION NOT NULL,
+    avg_cost DOUBLE PRECISION,
+    market_price DOUBLE PRECISION,
+    market_value DOUBLE PRECISION,
+    unrealized_pnl DOUBLE PRECISION,
+    realized_pnl DOUBLE PRECISION,
+    underlying_price DOUBLE PRECISION,
+    delta DOUBLE PRECISION,
+    gamma DOUBLE PRECISION,
+    theta DOUBLE PRECISION,
+    vega DOUBLE PRECISION,
+    iv DOUBLE PRECISION,
+    spx_delta DOUBLE PRECISION,
+    cached_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_positions_cache_account_cached ON positions_cache (account_id, cached_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_positions_cache_snapshot ON positions_cache (snapshot_id);
+
+CREATE INDEX IF NOT EXISTS idx_positions_cache_expiry ON positions_cache (
+    account_id,
+    expiry,
+    cached_at DESC
+);
+
+-- ────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS portfolio_greeks_cache (
+    id SERIAL PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    total_delta DOUBLE PRECISION,
+    total_gamma DOUBLE PRECISION,
+    total_theta DOUBLE PRECISION,
+    total_vega DOUBLE PRECISION,
+    total_spx_delta DOUBLE PRECISION,
+    underlying_price DOUBLE PRECISION,
+    cached_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_greeks_cache_account_cached ON portfolio_greeks_cache (account_id, cached_at DESC);
+
+CREATE TABLE IF NOT EXISTS portfolio_metrics_cache (
+    id SERIAL PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    total_positions INTEGER,
+    total_value DOUBLE PRECISION,
+    total_spx_delta DOUBLE PRECISION,
+    total_delta DOUBLE PRECISION,
+    total_gamma DOUBLE PRECISION,
+    total_theta DOUBLE PRECISION,
+    total_vega DOUBLE PRECISION,
+    theta_vega_ratio DOUBLE PRECISION,
+    gross_exposure DOUBLE PRECISION,
+    net_exposure DOUBLE PRECISION,
+    options_count INTEGER,
+    stocks_count INTEGER,
+    nlv DOUBLE PRECISION,
+    buying_power DOUBLE PRECISION,
+    init_margin DOUBLE PRECISION,
+    maint_margin DOUBLE PRECISION,
+    cached_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_metrics_cache_account_cached ON portfolio_metrics_cache (account_id, cached_at DESC);

@@ -33,6 +33,16 @@ Thumbs.db
 # Local portfolio snapshot and tastytrade cache
 .portfolio_snapshot.json
 .tastytrade_cache.pkl
+.positions_snapshot_*.json
+.stock_option_greeks_cache.json
+.greeks_diag_*.json
+.greeks_*_now.json
+.missing_greeks_*.json
+.missing_greeks_*.csv
+portfolio_export_*.csv
+clientportal/.vertx/
+clientportal-beta/.vertx/
+clientportal_backup_old/.vertx/
 
 # pytest and tooling caches
 .pytest_cache/

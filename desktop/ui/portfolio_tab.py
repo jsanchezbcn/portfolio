@@ -1,13 +1,13 @@
 """desktop/ui/portfolio_tab.py — Portfolio positions table with PnL.
 
 Shows live positions synced from IBKR:
-  Symbol | Type | Qty | Avg Cost | Mkt Price | Unrealized PnL | Greeks…
+    Symbol | Type | Qty | Avg Cost | Mkt Price | Unrealized PnL | Greeks…
 Positions are color-coded: green for gains, red for losses.
 
 Two view modes:
-  Raw    — positions grouped by expiry (original behaviour)
-  Trades — positions grouped into logical trade structures (strangles, spreads …)
-           using the heuristic grouper in desktop/models/trade_groups.py.
+    Raw         — positions grouped by expiry
+    Strategies  — positions re-associated into human-friendly options strategies
+                                using the strategy reconstructor in desktop/models/trade_groups.py.
 """
 from __future__ import annotations
 
@@ -92,7 +92,7 @@ class PortfolioTab(QWidget):
         toolbar.addWidget(self._btn_export_csv)
         toolbar.addWidget(self._btn_export_json)
 
-        # View toggle (Raw | Trades)
+        # View toggle (Raw | Strategies)
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
         sep.setFrameShadow(QFrame.Shadow.Sunken)
@@ -105,7 +105,7 @@ class PortfolioTab(QWidget):
         toolbar.addWidget(view_lbl)
 
         self._btn_raw    = QRadioButton("Raw")
-        self._btn_trades = QRadioButton("Trades")
+        self._btn_trades = QRadioButton("Strategies")
         self._btn_raw.setChecked(True)
         self._btn_raw.setStyleSheet("color:white;")
         self._btn_trades.setStyleSheet("color:white;")
@@ -453,12 +453,6 @@ class PortfolioTab(QWidget):
         descending = bool(self._cmb_sort_order.currentData())
         absolute = self._chk_sort_abs.isChecked()
 
-        # Trade-groups view is intentionally grouped/structured and does not support
-        # numeric metric sorting. When a sort metric is selected, force Raw view.
-        if metric != "none" and self._view_group.checkedId() != 0:
-            self._btn_raw.setChecked(True)
-            self._lbl_status.setText("Sorted view uses Raw mode")
-
         if self._view_group.checkedId() == 0:
             self._raw_model.set_sorting(metric, descending=descending, absolute=absolute)
             self._raw_model.set_data(self._raw_positions)
@@ -466,7 +460,8 @@ class PortfolioTab(QWidget):
             self._table.setModel(self._raw_model)
             return
 
-        self._trades_model.set_data(self._raw_positions)
+        self._trades_model.set_sorting(metric, descending=descending, absolute=absolute)
+        self._trades_model.set_data(self._raw_positions, account_id=getattr(self._engine, "account_id", ""))
         self._model = self._trades_model
         self._table.setModel(self._trades_model)
 

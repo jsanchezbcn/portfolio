@@ -52,7 +52,7 @@ from PySide6.QtCore import QObject, Signal
 logger = logging.getLogger(__name__)
 
 # ── constants ──────────────────────────────────────────────────────────────────
-_RISK_POLL_MARKET_HOURS_S = int(os.getenv("AGENT_RISK_POLL_MARKET_S", "60"))
+_RISK_POLL_MARKET_HOURS_S = int(os.getenv("AGENT_RISK_POLL_MARKET_S", "30"))
 _RISK_POLL_OFF_HOURS_S    = int(os.getenv("AGENT_RISK_POLL_OFF_S", "300"))
 _ARB_SCAN_COOLDOWN_S      = int(os.getenv("AGENT_ARB_SCAN_COOLDOWN_S", "120"))
 _TRADE_SUGGEST_COOLDOWN_S = int(os.getenv("AGENT_TRADE_SUGGEST_S", "300"))

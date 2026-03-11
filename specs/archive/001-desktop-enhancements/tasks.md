@@ -63,3 +63,5 @@
 - [x] T034 Update WhatIf tool schema docs so the LLM reliably calls `whatif_order`
 - [x] T035 Expand the AI model picker to show the full fallback/live model list with cost multipliers
 - [x] T036 Query FOP expiries and chain definitions across multiple active futures months
+- [x] T037 Keep AI risk sessions alive while long-running agentic tool calls are still active
+- [x] T038 Add detailed AI tool request/result logs, including WhatIf leg summaries, and ignore local generated artifacts

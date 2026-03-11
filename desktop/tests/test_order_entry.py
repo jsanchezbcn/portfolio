@@ -160,6 +160,17 @@ class TestOrderEntryBehavior:
         assert hi == 0.11
         assert mid == 0.1
 
+    def test_symbol_search_resolves_slash_alias(self, qtbot, mock_engine):
+        panel = OrderEntryPanel(mock_engine)
+        qtbot.addWidget(panel)
+
+        panel._txt_symbol.setText("/es")
+        panel._on_symbol_search()
+
+        assert panel._txt_symbol.text() == "ES"
+        assert panel._cmb_sec_type.currentText() == "FOP"
+        assert panel._cmb_exchange.currentText() == "CME"
+
 
 class TestOrderEntryPrefill:
     """Test prefill_from_chain populates all fields."""
@@ -263,6 +274,19 @@ class TestOrderEntryAutoRefresh:
         panel = OrderEntryPanel(mock_engine)
         qtbot.addWidget(panel)
         assert panel._refresh_running is False
+
+    def test_selected_bid_price_survives_refresh(self, qtbot, mock_engine):
+        panel = OrderEntryPanel(mock_engine)
+        qtbot.addWidget(panel)
+
+        cr = _make_chain_row(bid=10.0, ask=12.0)
+        panel.prefill_from_chain(cr)
+        panel._spn_limit.setValue(10.0)
+
+        panel._bid_ask = [{"bid": 9.5, "ask": 11.5, "mid": 10.5}]
+        panel._update_price_controls()
+
+        assert panel._spn_limit.value() == 9.5
 
 
 class TestOrderEntryAddChainLeg:

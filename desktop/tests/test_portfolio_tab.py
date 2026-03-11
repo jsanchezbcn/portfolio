@@ -193,6 +193,19 @@ class TestPortfolioTabData:
         first_symbol = model.data(model.index(0, 0))
         assert first_symbol == "ES"
 
+    def test_strategy_view_keeps_group_model_when_sorting(self, qtbot, mock_engine, sample_positions):
+        tab = PortfolioTab(mock_engine)
+        qtbot.addWidget(tab)
+
+        mock_engine.positions_updated.emit(sample_positions)
+        tab._btn_trades.setChecked(True)
+
+        metric_idx = tab._cmb_sort_metric.findData("theta")
+        tab._cmb_sort_metric.setCurrentIndex(metric_idx)
+
+        assert tab._table.model() is tab._trades_model
+        assert str(tab._table.model().data(tab._table.model().index(0, 0))).startswith("🔷")
+
 
 class TestPortfolioTabPositionActions:
     def test_option_payload_exposes_roll_action(self, qtbot, mock_engine, sample_positions):

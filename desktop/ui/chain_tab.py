@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from datetime import date
+from datetime import date, timedelta
 from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import (
@@ -241,6 +241,61 @@ class ChainTab(QWidget):
         """Fetch available expiries from IB and populate the dropdown."""
         loop = asyncio.get_event_loop()
         loop.create_task(self._async_load_expiries())
+
+    async def focus_roll_target(
+        self,
+        *,
+        underlying: str,
+        sec_type: str,
+        exchange: str,
+        current_expiry: str | None,
+        min_days_forward: int = 7,
+    ) -> None:
+        underlying = str(underlying or "").upper()
+        sec_type = str(sec_type or "OPT").upper()
+        exchange = str(exchange or ("CME" if sec_type == "FOP" else "SMART")).upper()
+
+        self._cmb_underlying.blockSignals(True)
+        self._cmb_sec_type.blockSignals(True)
+        self._cmb_exchange.blockSignals(True)
+        self._cmb_underlying.setCurrentText(underlying)
+        self._cmb_sec_type.setCurrentText(sec_type)
+        if self._cmb_exchange.findText(exchange) < 0:
+            self._cmb_exchange.addItem(exchange)
+        self._cmb_exchange.setCurrentText(exchange)
+        self._cmb_underlying.blockSignals(False)
+        self._cmb_sec_type.blockSignals(False)
+        self._cmb_exchange.blockSignals(False)
+
+        await self._async_load_expiries()
+
+        target_date: date | None = None
+        digits = str(current_expiry or "").replace("-", "")[:8]
+        if len(digits) == 8 and digits.isdigit():
+            target_date = date(int(digits[:4]), int(digits[4:6]), int(digits[6:8])) + timedelta(days=min_days_forward)
+
+        raw_expiries = [self._cmb_expiry.itemText(i).split()[0] for i in range(self._cmb_expiry.count())]
+        chosen = ""
+        if target_date is not None:
+            future_expiries: list[tuple[date, str]] = []
+            for expiry in raw_expiries:
+                if len(expiry) != 8 or not expiry.isdigit():
+                    continue
+                exp_date = date(int(expiry[:4]), int(expiry[4:6]), int(expiry[6:8]))
+                if exp_date >= target_date:
+                    future_expiries.append((exp_date, expiry))
+            if future_expiries:
+                future_expiries.sort(key=lambda item: item[0])
+                chosen = future_expiries[0][1]
+        if not chosen and raw_expiries:
+            chosen = raw_expiries[0]
+
+        if chosen:
+            idx = next((i for i in range(self._cmb_expiry.count()) if self._cmb_expiry.itemText(i).startswith(chosen)), -1)
+            if idx >= 0:
+                self._cmb_expiry.setCurrentIndex(idx)
+
+        await self._async_fetch()
 
     async def _async_load_expiries(self) -> None:
         try:

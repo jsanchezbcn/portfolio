@@ -1,9 +1,10 @@
 """agents/llm_client.py — Unified LLM chat helper.
 
-🚨 IMPORTANT: This project uses GITHUB COPILOT SDK ONLY.
-We do NOT use OpenAI API or OPENAI_API_KEY in this module.
+Supported providers:
+1. GitHub Copilot SDK via gh-auth sessions (default).
+2. Google AI Studio via direct Gemini API calls.
 
-Authentication flow:
+Copilot authentication flow:
 1. Resolve active profile (personal/work).
 2. Resolve configured github.com username for that profile.
 3. Switch `gh` active account to that username on github.com.
@@ -33,6 +34,8 @@ import os
 import subprocess
 from typing import Any, cast
 
+import aiohttp
+
 logger = logging.getLogger(__name__)
 
 _PROFILE_ACCOUNT_KEYS: dict[str, str] = {
@@ -41,6 +44,14 @@ _PROFILE_ACCOUNT_KEYS: dict[str, str] = {
 }
 _ACTIVE_PROFILE_ENV = "GITHUB_COPILOT_ACTIVE_PROFILE"
 _ACTIVE_ACCOUNT_ENV = "GITHUB_COPILOT_ACTIVE_TOKEN"
+_LLM_PROVIDER_ENV = "LLM_PROVIDER"
+_AISTUDIO_PROVIDER = "aistudio"
+_COPILOT_PROVIDER = "copilot"
+_AISTUDIO_API_KEY_ENV_VARS = (
+    "AISTUDIO_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+)
 
 
 def _is_token_like(value: str) -> bool:
@@ -93,6 +104,33 @@ def _ordered_profile_accounts() -> list[tuple[str, str]]:
     return result
 
 
+def _resolve_model_provider(model: str) -> tuple[str, str]:
+    raw_model = (model or "").strip()
+    if ":" in raw_model:
+        provider, _, provider_model = raw_model.partition(":")
+        provider = provider.strip().lower()
+        provider_model = provider_model.strip()
+        if provider in {_COPILOT_PROVIDER, _AISTUDIO_PROVIDER} and provider_model:
+            return provider, provider_model
+
+    configured_provider = (os.getenv(_LLM_PROVIDER_ENV) or _COPILOT_PROVIDER).strip().lower()
+    if raw_model.startswith("models/"):
+        raw_model = raw_model.split("/", 1)[1]
+    if raw_model.startswith("gemini-"):
+        return _AISTUDIO_PROVIDER, raw_model
+    if configured_provider == _AISTUDIO_PROVIDER:
+        return _AISTUDIO_PROVIDER, raw_model or "gemini-3.1-flash-lite-preview"
+    return _COPILOT_PROVIDER, raw_model or "gpt-5-mini"
+
+
+def _get_aistudio_api_key() -> str:
+    for env_var in _AISTUDIO_API_KEY_ENV_VARS:
+        value = (os.getenv(env_var) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _switch_gh_account(username: str) -> None:
     """Switch gh active account to `username` on github.com."""
     if not username:
@@ -131,8 +169,31 @@ async def async_llm_chat(
     Returns:
         The assistant's reply text, or ``""`` on failure.
     """
-    profile_accounts = _ordered_profile_accounts()
+    provider, provider_model = _resolve_model_provider(model)
     fallback_model = (os.getenv("LLM_FAST_MODEL") or "gpt-5-mini").strip()
+
+    if provider == _AISTUDIO_PROVIDER:
+        try:
+            return await asyncio.wait_for(
+                _aistudio_chat(
+                    prompt=prompt,
+                    model=provider_model,
+                    system=system,
+                    timeout=timeout,
+                ),
+                timeout=timeout + 10,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("AI Studio request timed out after %.0fs", timeout + 10)
+        except Exception as exc:
+            logger.info("AI Studio request failed (%s: %s)", type(exc).__name__, exc)
+
+        fallback_provider, fallback_provider_model = _resolve_model_provider(fallback_model)
+        if fallback_provider == _AISTUDIO_PROVIDER:
+            return ""
+        provider_model = fallback_provider_model
+
+    profile_accounts = _ordered_profile_accounts()
 
     # --- 1. Try configured profile github.com account(s), active profile first ---
     for label, username in profile_accounts:
@@ -141,7 +202,7 @@ async def async_llm_chat(
             return await asyncio.wait_for(
                 _copilot_chat(
                     prompt=prompt,
-                    model=model,
+                    model=provider_model,
                     system=system,
                     timeout=timeout,
                 ),
@@ -165,7 +226,7 @@ async def async_llm_chat(
             return await asyncio.wait_for(
                 _copilot_chat(
                     prompt=prompt,
-                    model=model,
+                    model=provider_model,
                     system=system,
                     timeout=timeout,
                 ),
@@ -178,7 +239,7 @@ async def async_llm_chat(
 
     # --- 3. Final retry with fast model using active gh account ---
     try:
-        retry_model = fallback_model or model
+        _, retry_model = _resolve_model_provider(fallback_model or model)
         return await asyncio.wait_for(
             _copilot_chat(
                 prompt=prompt,
@@ -198,6 +259,46 @@ async def async_llm_chat(
     return ""
 
 
+async def _aistudio_chat(
+    prompt: str,
+    *,
+    model: str,
+    system: str,
+    timeout: float,
+) -> str:
+    api_key = _get_aistudio_api_key()
+    if not api_key:
+        raise RuntimeError("AI Studio API key not configured")
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    payload: dict[str, Any] = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ]
+    }
+    if system:
+        payload["systemInstruction"] = {"parts": [{"text": system}]}
+
+    client_timeout = aiohttp.ClientTimeout(total=max(timeout, 1.0))
+    async with aiohttp.ClientSession(timeout=client_timeout) as session:
+        async with session.post(url, json=payload) as response:
+            body = await response.json(content_type=None)
+            if response.status >= 400:
+                detail = body.get("error", {}).get("message") if isinstance(body, dict) else None
+                raise RuntimeError(detail or f"AI Studio HTTP {response.status}")
+
+    candidates = body.get("candidates") if isinstance(body, dict) else None
+    if not candidates:
+        return ""
+
+    parts = ((candidates[0] or {}).get("content") or {}).get("parts") or []
+    text_parts = [str(part.get("text") or "") for part in parts if isinstance(part, dict)]
+    return "\n".join(part for part in text_parts if part).strip()
+
+
 # ------------------------------------------------------------------ #
 # Public helper: list available models                                 #
 # ------------------------------------------------------------------ #
@@ -213,11 +314,40 @@ _HARDCODED_MODELS: list[dict] = [
     {"id": "o3-mini",           "name": "o3-mini",            "is_free": False, "cost_multiplier": 0.25},
     {"id": "o1",                "name": "o1",                 "is_free": False, "cost_multiplier": 3.0},
     {"id": "gpt-4.5-preview",   "name": "GPT-4.5 Preview",    "is_free": False, "cost_multiplier": 1.0},
+    {"id": "aistudio:gemini-3.1-flash-lite-preview", "name": "Gemini 3.1 Flash-Lite (AI Studio)", "is_free": False, "cost_multiplier": 1.0},
 ]
 
 _FREE_MODEL_IDS: frozenset[str] = frozenset(
     m["id"] for m in _HARDCODED_MODELS if m["is_free"]
 )
+
+
+def _sort_model_catalog(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _cost(model: dict[str, Any]) -> float:
+        raw = model.get("cost_multiplier")
+        return float(raw) if isinstance(raw, (int, float)) else 999.0
+
+    models.sort(
+        key=lambda x: (
+            not bool(x.get("is_free")),
+            _cost(x),
+            str(x.get("name") or x.get("id") or "").lower(),
+        )
+    )
+    return models
+
+
+def _merge_model_catalog(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for model in models:
+        model_id = str(model.get("id") or "").strip()
+        if model_id:
+            merged[model_id] = dict(model)
+    for model in _HARDCODED_MODELS:
+        model_id = str(model.get("id") or "").strip()
+        if model_id and model_id not in merged:
+            merged[model_id] = dict(model)
+    return _sort_model_catalog(list(merged.values()))
 
 
 async def async_list_models() -> list[dict]:
@@ -257,25 +387,14 @@ async def async_list_models() -> list[dict]:
             })
 
         if result:
-            # Sort: free first, then lower-cost models, then alphabetical by name.
-            def _cost(model: dict) -> float:
-                raw = model.get("cost_multiplier")
-                return float(raw) if isinstance(raw, (int, float)) else 999.0
-
-            result.sort(
-                key=lambda x: (
-                    not x["is_free"],
-                    _cost(x),
-                    x["name"].lower(),
-                )
-            )
-            logger.debug("async_list_models: %d models from SDK", len(result))
-            return result
+            merged = _merge_model_catalog(result)
+            logger.debug("async_list_models: %d models from SDK (%d after merge)", len(result), len(merged))
+            return merged
 
     except Exception as exc:
         logger.info("async_list_models: SDK call failed (%s); using hardcoded list", exc)
 
-    return list(_HARDCODED_MODELS)
+    return _merge_model_catalog([])
 
 
 def get_hardcoded_models() -> list[dict]:
@@ -347,7 +466,10 @@ def build_session_config(model: str, *, system: str = "") -> dict:
     Prefer :func:`async_llm_chat` for simple one-shot calls; use this only
     when you need to manage the session lifecycle yourself.
     """
-    cfg: dict = {"model": model, "infinite_sessions": {"enabled": False}}
+    provider, provider_model = _resolve_model_provider(model)
+    cfg: dict = {"model": provider_model, "infinite_sessions": {"enabled": False}}
+    if provider != _COPILOT_PROVIDER:
+        cfg["provider"] = provider
     if system:
         cfg["system_message"] = {"content": system, "role": "system"}
     return cfg
